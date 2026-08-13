@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Roshdy V47 - Employee Performance UI polish only
+# Fixes wording + Arabic labels + modal popups for all detail buttons.
+# Safety: does NOT touch report_api.py, Elastix, CDR, AMI, queue_log, or watchdog scripts.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+else
+  COMPOSE=(docker-compose)
+fi
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend مش شغال"
+  exit 1
+fi
+bench_exec(){ "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"; }
+
+APP_DIR="$ROOT/apps/$APP"
+WWW_DIR="$APP_DIR/$APP/www"
+EMP_HTML="$WWW_DIR/employee-performance.html"
+EMP_PY="$WWW_DIR/employee-performance.py"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/FIX_V47_EMPLOYEE_PERF_UI_BEFORE_$TS"
+mkdir -p "$BACKUP_DIR/files"
+
+cat <<EOF
+============================================================
+🎨 Roshdy V47: Employee Performance UI Polish
+📦 Backup: $BACKUP_DIR
+🛡️ report_api.py / Elastix / CDR / AMI untouched
+============================================================
+EOF
+
+for f in "$EMP_HTML" "$EMP_PY"; do
+  [[ -e "$f" ]] && cp -a "$f" "$BACKUP_DIR/files/$(basename "$f").before" || true
+done
+
+echo "🧩 Step 1: Rewrite /employee-performance UI text + modal details"
+cat > "$EMP_HTML" <<'HTMLEMP'
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>أداء الموظفين | مطعم رشدي</title>
+<style>
+*{box-sizing:border-box;font-family:Tahoma,Arial}body{margin:0;background:#eef2f7;color:#111827;direction:rtl}.top{background:#20262d;color:white;padding:14px 22px;display:flex;justify-content:space-between;gap:10px;align-items:center;border-bottom:4px solid #1F4E79}.top a{color:white;text-decoration:none;border:1px solid #64748b;border-radius:10px;padding:8px 12px}.wrap{padding:22px;max-width:1700px;margin:auto}.panel{background:#fff;border:1px solid #d8dee9;border-radius:16px;box-shadow:0 10px 28px #0001;margin-bottom:16px;overflow:hidden}.head{padding:14px 16px;border-bottom:1px solid #e5e7eb;display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap}.body{padding:16px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px;align-items:end}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;margin-bottom:16px}.card{background:#fff;border:1px solid #ddd;border-right:5px solid #1F4E79;border-radius:12px;padding:12px;min-height:96px}.card.green{border-right-color:#16a34a}.card.red{border-right-color:#dc2626}.card.orange{border-right-color:#f97316}.card.purple{border-right-color:#6f42c1}.lbl{font-size:12px;color:#64748b;font-weight:800}.num{font-size:28px;color:#1F4E79;font-weight:900;margin-top:6px}.hint{font-size:12px;color:#64748b;margin-top:5px;line-height:1.6}input,select{border:1px solid #cbd5e1;border-radius:10px;padding:9px;min-width:170px}.btn{border:0;border-radius:10px;padding:9px 12px;background:#1F4E79;color:#fff;font-weight:900;cursor:pointer;margin:2px;white-space:nowrap}.btn:hover{filter:brightness(.95)}.btn.green{background:#16a34a}.btn.orange{background:#f97316}.btn.red{background:#dc2626}.btn.gray{background:#64748b}.scroll{overflow:auto}.tbl{width:100%;border-collapse:collapse;min-width:1180px;font-size:13px}.tbl th{background:#111827;color:white;padding:9px;border:1px solid #e5e7eb;text-align:right;white-space:nowrap}.tbl td{padding:8px;border:1px solid #e5e7eb;vertical-align:top}.tag{display:inline-block;border-radius:999px;padding:3px 8px;background:#e0f2fe;color:#075985;font-size:12px;font-weight:800}.muted{color:#64748b}.ltr{direction:ltr;text-align:left}.danger{color:#dc2626;font-weight:900}.ok{color:#16a34a;font-weight:900}.modal-back{position:fixed;inset:0;background:rgba(15,23,42,.62);z-index:999;display:none;align-items:center;justify-content:center;padding:16px}.modal{width:1180px;max-width:100%;max-height:90vh;background:#fff;color:#111827;border-radius:18px;box-shadow:0 35px 90px rgba(0,0,0,.35);overflow:hidden;direction:rtl;text-align:right}.modal-head{background:#111827;color:#fff;padding:13px 16px;display:flex;justify-content:space-between;gap:10px;align-items:center}.modal-head b{font-size:16px}.modal-body{padding:14px;max-height:calc(90vh - 58px);overflow:auto}.xbtn{background:#334155;color:white;border:0;border-radius:10px;padding:7px 12px;cursor:pointer;font-weight:900}.empty{padding:20px;text-align:center;color:#64748b}.note{background:#f8fafc;border:1px solid #e5e7eb;border-radius:12px;padding:10px;color:#475569;font-size:13px;line-height:1.7}@media(max-width:900px){.wrap{padding:12px}.tbl{min-width:980px}.top{align-items:flex-start;flex-direction:column}.modal{max-height:94vh}.modal-body{max-height:calc(94vh - 58px)}}
+</style>
+</head>
+<body>
+<div class="top"><b>📊 أداء الموظفين — آخر يوم تشغيلي مكتمل</b><div><a href="/admin-desk">Admin Desk</a><a href="/call-report">Call Report</a></div></div>
+<div class="wrap">
+ <div class="panel"><div class="head"><b>اختيار التقرير</b><span class="muted" id="msg">جاري التحميل...</span></div><div class="body"><div class="grid"><div><label>التاريخ التشغيلي</label><br><select id="dateSel"></select></div><div><button class="btn green" onclick="load()">تحديث</button><button class="btn orange" onclick="showNewCustomers()">عرض العملاء الجدد</button><button class="btn gray" onclick="exportCsv()">تصدير CSV</button></div><div class="note">يتم عرض الأيام المكتملة فقط لضمان دقة التقييم. اليوم الحالي لا يظهر إلا بعد اكتمال اليوم التشغيلي وانتهاء المعالجة.</div></div></div></div>
+ <div class="cards">
+  <div class="card"><div class="lbl">عدد الموظفين النشطين</div><div class="num" id="cEmployees">0</div></div>
+  <div class="card green"><div class="lbl">مكالمات تم الرد عليها</div><div class="num" id="cAnswered">0</div></div>
+  <div class="card orange"><div class="lbl">متوسط سرعة الرد</div><div class="num" id="cAvgWait">0ث</div></div>
+  <div class="card red"><div class="lbl">أبطأ رد</div><div class="num" id="cSlowest">0ث</div></div>
+  <div class="card purple"><div class="lbl">عملاء جدد مؤكدين</div><div class="num" id="cNew">0</div></div>
+  <div class="card red"><div class="lbl">محاولات رن بدون رد</div><div class="num" id="cRing">0</div></div>
+  <div class="card"><div class="lbl">أقصى عدد تحويلات نشطة صباحي</div><div class="num" id="cMorning">0</div><div class="hint" id="cMorningHint"></div></div>
+  <div class="card"><div class="lbl">أقصى عدد تحويلات نشطة مسائي</div><div class="num" id="cEvening">0</div><div class="hint" id="cEveningHint"></div></div>
+ </div>
+ <div class="panel"><div class="head"><b>جدول أداء الموظفين</b><span class="muted">اضغط على أي زر لفتح التفاصيل في نافذة مستقلة</span></div><div class="body scroll"><table class="tbl"><thead><tr><th>الموظف</th><th>التحويلة</th><th>إجمالي الردود</th><th>طلبات</th><th>شكاوى</th><th>صباحي</th><th>مسائي</th><th>متوسط الرد</th><th>أسرع رد</th><th>أبطأ رد</th><th>متوسط الكلام</th><th>أطول مكالمة</th><th>محاولات رن بدون رد</th><th>حالة التواجد</th><th>إجراءات</th></tr></thead><tbody id="empRows"></tbody></table></div></div>
+</div>
+<div class="modal-back" id="modalBack"><div class="modal"><div class="modal-head"><b id="modalTitle">تفاصيل</b><button class="xbtn" onclick="closeModal()">إغلاق ×</button></div><div class="modal-body" id="modalBody"></div></div></div>
+<script>
+let DATA=null;
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function sec(s){s=Number(s||0); if(s<60)return Math.round(s)+'ث'; let m=Math.floor(s/60), r=Math.round(s%60); if(m<60)return m+'د '+(r?r+'ث':''); let h=Math.floor(m/60); m=m%60; return h+'س '+m+'د'}
+function qs(o){let p=new URLSearchParams();Object.keys(o||{}).forEach(k=>{let v=o[k];if(v!==undefined&&v!==null&&v!=='')p.append(k,v)});return p.toString()}
+async function api(m,args){let r=await fetch('/api/method/'+m+(args?'?'+qs(args):''),{credentials:'same-origin',cache:'no-store'});let j=await r.json();if(j.exc)throw j;return j.message||j}
+async function guard(){let d=await api('restaurant_ops.api.security_api.get_my_access'); if(!d||!d.is_admin){location.replace((d&&d.redirect_target)||'/agent-desk');return false}return true}
+function openModal(title,html){modalTitle.textContent=title;modalBody.innerHTML=html;modalBack.style.display='flex'}
+function closeModal(){modalBack.style.display='none'}
+modalBack.addEventListener('click',function(e){if(e.target.id==='modalBack')closeModal()});
+document.addEventListener('keydown',function(e){if(e.key==='Escape')closeModal()});
+async function init(){if(!await guard())return; let av=await api('restaurant_ops.api.employee_performance_api.get_available_dates'); dateSel.innerHTML=(av.dates||[]).map(d=>'<option value="'+esc(d)+'">'+esc(d)+'</option>').join(''); if(!(av.dates||[]).length){msg.textContent='لا توجد تقارير محفوظة حتى الآن';return} await load();}
+async function load(){msg.textContent='جاري التحميل...'; DATA=await api('restaurant_ops.api.employee_performance_api.get_dashboard',{target_date:dateSel.value}); if(!DATA.success){msg.textContent=DATA.message||'لا توجد بيانات';return} let s=DATA.summary||{}; msg.textContent='آخر تحديث للتقرير: '+(DATA.generated_at||''); cEmployees.textContent=s.employees_count||0; cAnswered.textContent=s.answered_calls||0; cAvgWait.textContent=sec(s.avg_wait_seconds); cSlowest.textContent=sec((s.slowest_answer||{}).wait_seconds); cNew.textContent=s.new_customers||0; cRing.textContent=s.ringnoanswer_attempts||0; cMorning.textContent=((s.morning||{}).peak_online_extensions ?? (s.morning||{}).active_extensions_estimated ?? 0); cEvening.textContent=((s.evening||{}).peak_online_extensions ?? (s.evening||{}).active_extensions_estimated ?? 0); cMorningHint.textContent=(s.morning&&s.morning.peak_online_extensions!=null)?'من قراءات التواجد':'تقدير من نشاط المكالمات'; cEveningHint.textContent=(s.evening&&s.evening.peak_online_extensions!=null)?'من قراءات التواجد':'تقدير من نشاط المكالمات'; renderEmployees();}
+function presenceText(e){if(e.online_minutes_est!=null){return '<span class="ok">متواجد '+sec((e.online_minutes_est||0)*60)+'</span><br><span class="danger">غير متواجد '+sec((e.offline_minutes_est||0)*60)+'</span>'}return '<span class="muted">لا توجد بيانات تواجد لهذا التاريخ</span>'}
+function renderEmployees(){let rows=DATA.employees||[]; empRows.innerHTML=rows.map((e,i)=>'<tr><td><b>'+esc(e.employee||'')+'</b></td><td class="ltr">'+esc(e.extension||'')+'</td><td>'+esc(e.answered_calls||0)+'</td><td>'+esc(e.orders_calls||0)+'</td><td>'+esc(e.complaints_calls||0)+'</td><td>'+esc(e.morning_calls||0)+'</td><td>'+esc(e.evening_calls||0)+'</td><td>'+sec(e.avg_wait_seconds)+'</td><td>'+sec(e.wait_min)+'</td><td>'+sec(e.wait_max)+'</td><td>'+sec(e.avg_talk_seconds)+'</td><td>'+sec(e.talk_max)+'</td><td class="'+((e.ringnoanswer||0)>0?'danger':'ok')+'">'+esc(e.ringnoanswer||0)+'</td><td>'+presenceText(e)+'</td><td><button class="btn" onclick="showEmp('+i+')">تفاصيل</button><button class="btn orange" onclick="showLongest('+i+')">أطول مكالمة</button><button class="btn gray" onclick="showRandom('+i+')">مكالمة عشوائية</button></td></tr>').join('')||'<tr><td colspan="15" class="empty">لا توجد بيانات</td></tr>'}
+function callsTable(rows){return '<div class="scroll"><table class="tbl"><thead><tr><th>الوقت</th><th>النوع</th><th>الرقم الموحد</th><th>الرقم الخام</th><th>سرعة الرد</th><th>مدة المكالمة</th><th>الشيفت</th><th>التسجيل</th></tr></thead><tbody>'+(rows||[]).map(callRow).join('')+'</tbody></table></div>'}
+function callRow(c){let rec=c.recording_url?'<a href="'+esc(c.recording_url)+'" target="_blank">🎧 سماع</a>':'-';return '<tr><td>'+esc(c.enter_time)+'</td><td>'+esc(c.queue_label||c.queue)+'</td><td class="ltr">'+esc(c.caller)+'</td><td>'+esc(c.caller_raw||'')+'</td><td>'+sec(c.wait_seconds)+'</td><td>'+sec(c.talk_seconds)+'</td><td>'+esc(c.shift)+'</td><td>'+rec+'</td></tr>'}
+function showEmp(i){let e=(DATA.employees||[])[i]||{}; let html='<div class="note"><b>'+esc(e.employee)+'</b> — تحويلة '+esc(e.extension)+'<br>إجمالي الردود: '+esc(e.answered_calls||0)+' | محاولات رن بدون رد: '+esc(e.ringnoanswer||0)+'</div><br>'+callsTable(e.calls||[]); openModal('تفاصيل مكالمات الموظف',html)}
+function showLongest(i){let e=(DATA.employees||[])[i]||{}; let c=e.longest_call; if(!c){openModal('أطول مكالمة','<div class="empty">لا توجد مكالمات لهذا الموظف</div>');return} openModal('أطول مكالمة — '+(e.employee||''),callsTable([c]))}
+function showRandom(i){let e=(DATA.employees||[])[i]||{}; let a=e.calls||[]; if(!a.length){openModal('مكالمة عشوائية','<div class="empty">لا توجد مكالمات لهذا الموظف</div>');return} let c=a[Math.floor(Math.random()*a.length)]; openModal('مكالمة عشوائية — '+(e.employee||''),callsTable([c]))}
+function showNewCustomers(){if(!DATA){return} let rows=DATA.new_customers||[]; let html='<div class="note">الأرقام هنا موحدة، والعميل يظهر كجديد فقط إذا لم يكن له مكالمات مجابة قبل هذا اليوم التشغيلي.</div><br>'; html += rows.length ? callsTable(rows) : '<div class="empty">لا يوجد عملاء جدد مؤكدين في هذا التقرير</div>'; openModal('العملاء الجدد المؤكدين',html)}
+function exportCsv(){if(!DATA)return; let h=['employee','extension','answered','orders','complaints','morning','evening','avg_wait','max_wait','avg_talk','no_answer_ring','new_customers']; let lines=[h.join(',')].concat((DATA.employees||[]).map(e=>[e.employee,e.extension,e.answered_calls,e.orders_calls,e.complaints_calls,e.morning_calls,e.evening_calls,e.avg_wait_seconds,e.wait_max,e.avg_talk_seconds,e.ringnoanswer,e.new_customers].map(x=>'"'+String(x??'').replace(/"/g,'""')+'"').join(','))); let blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'}); let a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='employee-performance-'+(DATA.target_date||'')+'.csv';a.click()}
+init();
+</script>
+</body>
+</html>
+HTMLEMP
+
+cat > "$EMP_PY" <<'PYPG'
+no_cache = 1
+PYPG
+
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+[[ -n "$APP_OWNER" ]] && chown "$APP_OWNER" "$EMP_HTML" "$EMP_PY" 2>/dev/null || true
+
+python3 - <<'PYCHECK'
+from pathlib import Path
+p=Path('/opt/frappe_crm/apps/restaurant_ops/restaurant_ops/www/employee-performance.html')
+s=p.read_text(encoding='utf-8')
+for bad in ['RINGNOANSWER','هيبدأ من بعد التركيب','Events:', 'CDR rows:', 'Presence: غير متاح']:
+    if bad in s:
+        raise SystemExit(f'bad text still exists: {bad}')
+print('UI text check OK')
+PYCHECK
+
+echo "🧹 Step 2: Clear cache"
+bench_exec clear-cache || true
+sleep 2
+bench_exec clear-cache || true
+
+echo "🧪 Step 3: Validation"
+VAL_DIR="$BACKUP_DIR/validation"
+mkdir -p "$VAL_DIR"
+set +e
+code="$(curl -k -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/employee-performance" 2>/dev/null || echo 000)"
+echo "employee-performance => $code" | tee "$VAL_DIR/page_smoke_checks.txt"
+bench_exec execute restaurant_ops.api.employee_performance_api.get_available_dates | tee "$VAL_DIR/employee_available_dates.json"
+V1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.employee_performance_api.get_dashboard | tee "$VAL_DIR/employee_dashboard_sample.json"
+V2=${PIPESTATUS[0]}
+set -e
+if [[ "$code" != 2* && "$code" != 3* ]]; then
+  echo "❌ /employee-performance مش راجعة 200/3xx"
+  exit 1
+fi
+if [[ $V1 -ne 0 || $V2 -ne 0 ]]; then
+  echo "❌ API validation failed. راجع $VAL_DIR"
+  exit 1
+fi
+
+cat <<EOF
+============================================================
+✅ DONE V47 UI POLISH
+📦 Backup/log folder: $BACKUP_DIR
+✅ RINGNOANSWER translated to Arabic user-friendly wording
+✅ Technical source line removed from UI
+✅ Presence wording cleaned
+✅ All detail buttons now open popup modal
+🛡️ report_api.py / Elastix / CDR / AMI untouched
+============================================================
+EOF

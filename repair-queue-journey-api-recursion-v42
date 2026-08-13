@@ -1,0 +1,446 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Roshdy V42: Repair queue_journey_api recursion
+# ----------------------------------------------------------------------
+# Problem:
+#   RecursionError in queue_journey_api.get_queue_journey_report after multiple wrapper patches.
+# Fix:
+#   Rewrite queue_journey_api.py as a clean standalone module with no wrapper chaining.
+#   Keeps all final features:
+#   - reads queue_journey JSON cache
+#   - CDR fallback if cache missing
+#   - ring_start_time / ring_end_time / response_time / response_after_text
+#   - handled_by_text column
+#   - debug endpoints expected by previous scripts
+# Safety:
+#   - Backup first.
+#   - Does NOT touch report_api.py.
+#   - Does NOT touch Elastix / CDR / AMI config.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "❌ docker compose/docker-compose مش موجود"
+  exit 1
+fi
+
+APP_DIR="$ROOT/apps/$APP"
+PKG_DIR="$APP_DIR/$APP"
+API_DIR="$PKG_DIR/api"
+WWW_DIR="$PKG_DIR/www"
+QUEUE_API="$API_DIR/queue_journey_api.py"
+PAGE_HTML="$WWW_DIR/queue-journey-report.html"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/REPAIR_QUEUE_JOURNEY_API_RECURSION_V42_BEFORE_$TS"
+mkdir -p "$BACKUP_DIR/files"
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend container مش شغال أو مش لاقيه"
+  exit 1
+fi
+
+bench_exec() { "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"; }
+
+echo "============================================================"
+echo "🧯 Roshdy V42: Repair queue_journey_api recursion"
+echo "📦 Backup: $BACKUP_DIR"
+echo "============================================================"
+
+echo "🧯 Step 1: Backup current files + bench backup"
+[[ -f "$QUEUE_API" ]] && cp -a "$QUEUE_API" "$BACKUP_DIR/files/queue_journey_api.py.before" || true
+[[ -f "$PAGE_HTML" ]] && cp -a "$PAGE_HTML" "$BACKUP_DIR/files/queue-journey-report.html.before" || true
+bench_exec backup --with-files | tee "$BACKUP_DIR/bench_backup_output.txt"
+
+echo "🧩 Step 2: Rewrite queue_journey_api.py clean standalone"
+cat > "$QUEUE_API" <<'PYAPI'
+# -*- coding: utf-8 -*-
+"""Clean Queue Journey API for Roshdy.
+
+Standalone final module. No wrapper chaining.
+Reads parsed /queue_journey/*.json cache; falls back to CDR staff missed attempts if missing.
+"""
+
+import json
+import os
+import re
+from collections import Counter, defaultdict
+from datetime import timedelta
+
+import frappe
+from frappe.utils import today, cstr, cint, flt, get_datetime
+
+
+def _period(date_from=None, date_to=None):
+    df = cstr(date_from or today())[:10]
+    dt = cstr(date_to or df)[:10]
+    return df, dt
+
+
+def _journey_dir():
+    return frappe.get_site_path("private", "files", "queue_journey")
+
+
+def _journey_file(date_from=None, date_to=None):
+    df, dt = _period(date_from, date_to)
+    exact = os.path.join(_journey_dir(), f"queue_journey_{df}_{dt}.json")
+    latest = os.path.join(_journey_dir(), "latest.json")
+    if os.path.exists(exact):
+        return exact, "exact"
+    if os.path.exists(latest):
+        return latest, "latest_fallback"
+    return exact, "missing"
+
+
+def _load_json(date_from=None, date_to=None):
+    path, source = _journey_file(date_from, date_to)
+    if not os.path.exists(path):
+        return None, path, source
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f), path, source
+
+
+def _mask_phone(phone):
+    phone = cstr(phone or "")
+    digits = re.sub(r"\D+", "", phone)
+    if len(digits) <= 4:
+        return phone
+    return phone[:3] + "****" + phone[-4:]
+
+
+def _table_columns(table):
+    try:
+        rows = frappe.db.sql("describe `%s`" % table, as_dict=True)
+        return [r.get("Field") for r in rows]
+    except Exception:
+        return []
+
+
+def _employee_by_extension(ext, event_time=None):
+    ext = cstr(ext or "").strip()
+    if not ext:
+        return ""
+
+    # Direct Employee extension-like DB columns; use DESCRIBE to avoid stale custom meta columns.
+    try:
+        if frappe.db.exists("DocType", "Employee"):
+            cols = _table_columns("tabEmployee")
+            ext_cols = [c for c in cols if c and any(x in c.lower() for x in ("extension", "ext", "sip"))]
+            name_col = "employee_name" if "employee_name" in cols else "name"
+            for col in ext_cols:
+                rows = frappe.db.sql("select `%s` as emp from `tabEmployee` where `%s`=%%s limit 1" % (name_col, col), (ext,), as_dict=True)
+                if rows and rows[0].get("emp"):
+                    return rows[0].get("emp")
+    except Exception:
+        pass
+
+    # Extension Session around event time.
+    try:
+        if event_time and frappe.db.exists("DocType", "Extension Session"):
+            rows = frappe.db.sql("""
+                select coalesce(e.employee_name, s.employee, s.user) employee_name
+                from `tabExtension Session` s
+                left join `tabEmployee` e on e.name=s.employee
+                where s.extension=%s
+                  and (s.started_at is null or s.started_at <= %s)
+                  and (s.released_at is null or s.released_at >= %s)
+                order by s.started_at desc
+                limit 1
+            """, (ext, event_time, event_time), as_dict=True)
+            if rows and rows[0].get("employee_name"):
+                return rows[0].get("employee_name")
+    except Exception:
+        pass
+    return ""
+
+
+def _public_employee_label(ext, event_time=None):
+    emp = _employee_by_extension(ext, event_time)
+    if emp:
+        return emp
+    if ext:
+        return f"غير محدد (تحويلة {ext})"
+    return "غير محدد"
+
+
+def _fmt_dt(dt):
+    try:
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return ""
+
+
+def _parse_dt(v):
+    try:
+        if not v:
+            return None
+        return get_datetime(v)
+    except Exception:
+        return None
+
+
+def _duration_text(seconds):
+    try:
+        seconds = int(round(float(seconds or 0)))
+    except Exception:
+        return ""
+    if seconds < 0:
+        seconds = 0
+    if seconds < 60:
+        return f"بعد {seconds} ثانية"
+    m, s = divmod(seconds, 60)
+    if s:
+        return f"بعد {m} دقيقة و {s} ثانية"
+    return f"بعد {m} دقيقة"
+
+
+def _fate_label(fate, answered_ext=None, answered_employee=None):
+    if fate == "answered_later_same_extension":
+        if answered_employee:
+            return answered_employee + " (نفس التحويلة)"
+        if answered_ext:
+            return "نفس التحويلة " + answered_ext
+        return "تم الرد لاحقًا من نفس التحويلة"
+    if fate == "answered_later_other_extension":
+        if answered_employee:
+            return answered_employee
+        if answered_ext:
+            return "تحويلة " + answered_ext
+        return "تم الرد لاحقًا"
+    if fate == "customer_abandoned_after_attempt":
+        return "العميل أغلق بعد المحاولة"
+    if fate in ("timeout_after_attempt_no_final_connect_seen", "completed_after_attempt_connect_missing", "unknown_after_attempt"):
+        return "مصير غير محسوم"
+    if fate == "journey_unavailable":
+        return "مصير غير متاح"
+    return "مصير غير محسوم"
+
+
+def _handled_by_text(row):
+    return _fate_label(row.get("fate"), row.get("answered_extension"), row.get("answered_employee"))
+
+
+def _enrich_row(row):
+    row = dict(row or {})
+    ring_end = _parse_dt(row.get("attempt_time"))
+    ring_seconds = flt(row.get("ring_seconds") or 0)
+    ring_start = ring_end - timedelta(seconds=ring_seconds) if ring_end else None
+    fate = cstr(row.get("fate") or "")
+    fate_time = _parse_dt(row.get("fate_time"))
+    answered = fate.startswith("answered_later")
+
+    missed_ext = cstr(row.get("missed_extension") or "")
+    ans_ext = cstr(row.get("answered_extension") or "")
+    row["missed_employee"] = _public_employee_label(missed_ext, row.get("attempt_time"))
+    row["answered_employee"] = _employee_by_extension(ans_ext, row.get("fate_time")) if ans_ext else ""
+    if ans_ext and not row.get("answered_employee"):
+        row["answered_employee"] = f"غير محدد (تحويلة {ans_ext})"
+    row["ring_start_time"] = _fmt_dt(ring_start)
+    row["ring_end_time"] = _fmt_dt(ring_end) or cstr(row.get("attempt_time") or "")
+    row["response_time"] = _fmt_dt(fate_time) if answered else ""
+    row["response_after_seconds"] = int(max((fate_time - ring_end).total_seconds(), 0)) if answered and fate_time and ring_end else None
+    row["response_after_text"] = _duration_text(row.get("response_after_seconds")) if answered and row.get("response_after_seconds") is not None else ""
+    row["fate_label"] = _fate_label(fate, row.get("answered_extension"), row.get("answered_employee"))
+    row["handled_by_text"] = _handled_by_text(row)
+    return row
+
+
+def _fallback_cdr(date_from=None, date_to=None, threshold=15, mask_phones=False):
+    try:
+        from restaurant_ops.api.report_api import get_staff_missed_attempts
+        d = get_staff_missed_attempts(date_from or today(), date_to or date_from or today(), threshold) or {}
+    except Exception as e:
+        d = {"success": False, "error": cstr(e), "details": [], "grouped": [], "total_attempts": 0}
+    rows = []
+    for r in (d.get("details") or [])[:500]:
+        ext = cstr(r.get("extension") or "")
+        emp = r.get("employee_name")
+        if not emp or emp == "غير مربوط وقت المكالمة":
+            emp = _public_employee_label(ext, r.get("calldate"))
+        row = {
+            "attempt_time": cstr(r.get("calldate") or ""),
+            "queue": "",
+            "caller": _mask_phone(r.get("src")) if mask_phones else cstr(r.get("src") or ""),
+            "missed_extension": ext,
+            "missed_employee": emp,
+            "ring_seconds": r.get("duration") or 0,
+            "fate": "journey_unavailable",
+            "fate_time": "",
+            "answered_extension": "",
+            "answered_employee": "",
+            "callid": cstr(r.get("uniqueid") or ""),
+        }
+        rows.append(_enrich_row(row))
+    total = cint(d.get("total_attempts") or len(rows) or 0)
+    return {
+        "success": True,
+        "journey_available": False,
+        "source": "cdr_fallback_get_staff_missed_attempts",
+        "summary": {
+            "attempts_total": total,
+            "answered_later_total": None,
+            "customer_abandoned_after_attempt": None,
+            "unknown_or_timeout": total,
+            "attempts_by_fate": {"journey_unavailable": total},
+            "attempts_by_missed_extension": [],
+        },
+        "rows": rows,
+        "grouped": d.get("grouped") or [],
+        "raw": d,
+    }
+
+
+@frappe.whitelist()
+def get_queue_journey_report(date_from=None, date_to=None, threshold=15, queues=None, mask_phones=0, limit_rows=500):
+    df, dt = _period(date_from, date_to)
+    mask_phones = bool(cint(mask_phones or 0))
+    threshold = flt(threshold or 15)
+    data, path, source = _load_json(df, dt)
+    if not data:
+        out = _fallback_cdr(df, dt, threshold=threshold, mask_phones=mask_phones)
+        out.update({"date_from": df, "date_to": dt, "cache_path": path, "cache_source": source})
+        return out
+
+    raw_rows = data.get("attempts") or data.get("attempt_rows_sample") or []
+    qset = {x.strip() for x in cstr(queues or "").split(",") if x.strip()}
+    rows = []
+    for r in raw_rows:
+        ring = flt(r.get("ring_seconds") or 0)
+        if ring < threshold:
+            continue
+        if qset and cstr(r.get("queue")) not in qset:
+            continue
+        row = dict(r)
+        if mask_phones:
+            row["caller"] = _mask_phone(row.get("caller"))
+        rows.append(_enrich_row(row))
+
+    by_fate = Counter([r["fate"] for r in rows])
+    answered_later = sum(v for k, v in by_fate.items() if k.startswith("answered_later"))
+    abandoned = by_fate.get("customer_abandoned_after_attempt", 0)
+    unknown = len(rows) - answered_later - abandoned
+    by_ext = defaultdict(lambda: {"extension": "", "employee": "", "attempts": 0, "answered_later": 0, "customer_abandoned_after_attempt": 0, "unknown_or_timeout": 0})
+    for r in rows:
+        ext = r.get("missed_extension") or "غير محدد"
+        be = by_ext[ext]
+        be["extension"] = ext
+        be["employee"] = r.get("missed_employee")
+        be["attempts"] += 1
+        if r["fate"].startswith("answered_later"):
+            be["answered_later"] += 1
+        elif r["fate"] == "customer_abandoned_after_attempt":
+            be["customer_abandoned_after_attempt"] += 1
+        else:
+            be["unknown_or_timeout"] += 1
+
+    return {
+        "success": True,
+        "journey_available": True,
+        "source": "elastix_queue_log_cache",
+        "date_from": df,
+        "date_to": dt,
+        "threshold_seconds": threshold,
+        "cache_path": path,
+        "cache_source": source,
+        "generated_at": data.get("generated_at"),
+        "summary": {
+            "attempts_total": len(rows),
+            "answered_later_total": answered_later,
+            "customer_abandoned_after_attempt": abandoned,
+            "unknown_or_timeout": unknown,
+            "attempts_by_fate": dict(by_fate),
+            "attempts_by_missed_extension": sorted(by_ext.values(), key=lambda x: x["attempts"], reverse=True),
+        },
+        "rows": rows[:cint(limit_rows or 500)],
+        "raw_event_counts": data.get("event_counts"),
+    }
+
+
+@frappe.whitelist()
+def debug_queue_journey_status(date_from=None, date_to=None):
+    df, dt = _period(date_from, date_to)
+    path, source = _journey_file(df, dt)
+    return {
+        "success": True,
+        "date_from": df,
+        "date_to": dt,
+        "journey_dir": _journey_dir(),
+        "selected_path": path,
+        "selected_source": source,
+        "exists": os.path.exists(path),
+        "files": sorted(os.listdir(_journey_dir())) if os.path.exists(_journey_dir()) else [],
+    }
+
+
+@frappe.whitelist()
+def debug_queue_journey_time_columns_v40(date_from=None, date_to=None):
+    d = get_queue_journey_report(date_from=date_from or today(), date_to=date_to or date_from or today(), threshold=15, limit_rows=20)
+    return {"success": True, "summary": d.get("summary"), "rows_sample": d.get("rows", [])[:5]}
+
+
+@frappe.whitelist()
+def debug_queue_journey_handled_column_v41(date_from=None, date_to=None):
+    d = get_queue_journey_report(date_from=date_from or today(), date_to=date_to or date_from or today(), threshold=15, limit_rows=20)
+    return {"success": True, "summary": d.get("summary"), "rows_sample": d.get("rows", [])[:10]}
+PYAPI
+
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+[[ -n "$APP_OWNER" ]] && chown "$APP_OWNER" "$QUEUE_API" 2>/dev/null || true
+python3 -m py_compile "$QUEUE_API"
+
+echo "🧹 Clear cache + restart backend/frontend"
+bench_exec clear-cache || true
+"${COMPOSE[@]}" restart backend frontend websocket >/dev/null
+sleep 8
+bench_exec clear-cache || true
+
+echo "🧪 Validate clean API"
+set +e
+bench_exec execute restaurant_ops.api.queue_journey_api.debug_queue_journey_status | tee "$BACKUP_DIR/debug_queue_journey_status_v42.txt"
+V1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_journey_api.get_queue_journey_report | tee "$BACKUP_DIR/get_queue_journey_report_v42.txt"
+V2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_journey_api.debug_queue_journey_time_columns_v40 | tee "$BACKUP_DIR/debug_queue_journey_time_columns_v42.txt"
+V3=${PIPESTATUS[0]}
+for p in queue-journey-report email-report-customizer call-report; do
+  code="$(curl -k -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$p" 2>/dev/null || echo 000)"
+  echo "$p => $code" | tee -a "$BACKUP_DIR/page_smoke_checks_v42.txt"
+done
+set -e
+
+if [[ $V1 -ne 0 || $V2 -ne 0 || $V3 -ne 0 ]]; then
+  echo "❌ Validation failed. راجع: $BACKUP_DIR"
+  exit 1
+fi
+
+echo "🏥 Health Check - Elastix/CDR/AMI + Queue + Call Report"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$BACKUP_DIR/health_asterisk_bridge.txt"
+H1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status | tee "$BACKUP_DIR/health_queue_status.txt"
+H2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' | tee "$BACKUP_DIR/health_call_report.txt"
+H3=${PIPESTATUS[0]}
+set -e
+
+if [[ $H1 -ne 0 || $H2 -ne 0 || $H3 -ne 0 ]]; then
+  echo "⚠️ Health returned non-zero. راجع: $BACKUP_DIR"
+else
+  echo "✅ Health checks OK"
+fi
+
+echo "============================================================"
+echo "✅ DONE V42"
+echo "📦 Backup folder: $BACKUP_DIR"
+echo "🔁 queue_journey_api recursion repaired with clean standalone module"
+echo "🛡️ report_api.py / Elastix / CDR / AMI untouched"
+echo "============================================================"

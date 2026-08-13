@@ -1,0 +1,308 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Roshdy V25: Fix duplicated users in User Management/Admin Desk user list
+# ---------------------------------------------------------------------
+# Problem:
+#   /user-management or admin desk user list shows the same user/name repeated.
+# Likely cause:
+#   Backend list_all_users query joins User with Has Role / Employee and returns one row per role or duplicate Employee mapping.
+# Fix:
+#   Override restaurant_ops.api.admin_api.list_all_users to return ONE row per User,
+#   with unique roles and one linked employee name.
+# Also adds a small frontend safety de-duplication in /user-management.
+# Safety:
+# - Backup first.
+# - Does NOT touch report_api.py / Elastix / CDR / AMI config.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "❌ docker compose/docker-compose مش موجود"
+  exit 1
+fi
+
+APP_DIR="$ROOT/apps/$APP"
+PKG_DIR="$APP_DIR/$APP"
+API_DIR="$PKG_DIR/api"
+WWW_DIR="$PKG_DIR/www"
+ADMIN_API="$API_DIR/admin_api.py"
+USER_MGMT_HTML="$WWW_DIR/user-management.html"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/FIX_DUPLICATE_USERS_V25_BEFORE_$TS"
+mkdir -p "$BACKUP_DIR"
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend container مش شغال أو مش لاقيه"
+  exit 1
+fi
+
+bench_exec() {
+  "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"
+}
+
+echo "============================================================"
+echo "🔧 Roshdy V25: Fix duplicated users list"
+echo "📦 Backup: $BACKUP_DIR"
+echo "============================================================"
+
+if [[ ! -f "$ADMIN_API" ]]; then
+  echo "❌ مش لاقي admin_api.py: $ADMIN_API"
+  exit 1
+fi
+
+echo "🧯 Backup files + bench backup"
+cp -a "$ADMIN_API" "$BACKUP_DIR/admin_api.py.before"
+[[ -f "$USER_MGMT_HTML" ]] && cp -a "$USER_MGMT_HTML" "$BACKUP_DIR/user-management.html.before"
+bench_exec backup --with-files | tee "$BACKUP_DIR/bench_backup_output.txt"
+
+echo "🧩 Patch admin_api.py and user-management.html"
+export ADMIN_API USER_MGMT_HTML
+python3 - <<'PY'
+# -*- coding: utf-8 -*-
+from pathlib import Path
+import os
+
+admin_api = Path(os.environ["ADMIN_API"])
+user_page = Path(os.environ["USER_MGMT_HTML"])
+
+s = admin_api.read_text(encoding="utf-8", errors="ignore")
+start = "# BEGIN ROSHDY UNIQUE USERS LIST V25"
+end = "# END ROSHDY UNIQUE USERS LIST V25"
+patch = r'''
+# BEGIN ROSHDY UNIQUE USERS LIST V25
+# Final override: return one row per User only, roles unique, employee mapping unique.
+try:
+    import frappe
+    from frappe.utils import cint, cstr
+except Exception:
+    frappe = None
+
+
+def _v25_admin_allowed():
+    try:
+        if frappe.session.user == "Administrator":
+            return True
+        roles = set(frappe.get_roles(frappe.session.user))
+        return bool(roles.intersection({"System Manager", "Call Center Admin", "Restaurant Manager"}))
+    except Exception:
+        return False
+
+
+def _v25_user_roles(user):
+    try:
+        roles = frappe.get_all("Has Role", filters={"parent": user, "parenttype": "User"}, pluck="role", limit_page_length=500)
+    except Exception:
+        roles = []
+    # de-duplicate while preserving sort/readability
+    out = []
+    for r in roles:
+        if r and r not in out:
+            out.append(r)
+    return sorted(out)
+
+
+def _v25_employee_for_user(user):
+    # returns one best employee mapping only
+    try:
+        if not frappe.db.exists("DocType", "Employee"):
+            return {"employee": "", "employee_name": ""}
+        rows = frappe.get_all(
+            "Employee",
+            filters={"user_id": user},
+            fields=["name", "employee_name", "status"],
+            order_by="case when status='Active' then 0 else 1 end, modified desc",
+            limit_page_length=5,
+        )
+        if rows:
+            return {"employee": rows[0].get("name") or "", "employee_name": rows[0].get("employee_name") or rows[0].get("name") or ""}
+    except Exception:
+        pass
+    return {"employee": "", "employee_name": ""}
+
+
+@frappe.whitelist()
+def list_all_users(search=None, role=None, enabled=None):
+    """User Management list with one row per user.
+
+    Important: Do not join Has Role directly in SQL, otherwise each role duplicates the user.
+    """
+    if not _v25_admin_allowed():
+        frappe.throw("غير مسموح")
+
+    filters = {"name": ["not in", ["Guest"]]}
+    if enabled not in (None, "", "All", "الكل"):
+        filters["enabled"] = cint(enabled)
+
+    fields = ["name", "email", "full_name", "first_name", "last_name", "enabled", "user_type", "creation", "last_login"]
+    users = frappe.get_all("User", filters=filters, fields=fields, order_by="enabled desc, full_name asc, name asc", limit_page_length=2000)
+
+    search_l = cstr(search or "").strip().lower()
+    role_filter = cstr(role or "").strip()
+    result = []
+    seen = set()
+    current = frappe.session.user
+
+    for u in users:
+        username = u.get("name") or u.get("email") or ""
+        if not username or username in seen:
+            continue
+        seen.add(username)
+        roles = _v25_user_roles(username)
+        if role_filter and role_filter not in ("All", "الكل") and role_filter not in roles:
+            continue
+        emp = _v25_employee_for_user(username)
+        display_name = u.get("full_name") or username
+        hay = " ".join([username, u.get("email") or "", display_name, emp.get("employee_name") or "", " ".join(roles)]).lower()
+        if search_l and search_l not in hay:
+            continue
+        is_protected = username in ("Administrator", current)
+        result.append({
+            "name": username,
+            "email": u.get("email") or username,
+            "full_name": display_name,
+            "employee": emp.get("employee"),
+            "employee_name": emp.get("employee_name"),
+            "enabled": 1 if cint(u.get("enabled")) else 0,
+            "user_type": u.get("user_type") or "",
+            "roles": roles,
+            "roles_text": ", ".join(roles),
+            "can_disable": 0 if is_protected else 1,
+            "can_reset_password": 0 if username == "Administrator" else 1,
+            "last_login": cstr(u.get("last_login") or ""),
+        })
+    return result
+
+
+@frappe.whitelist()
+def debug_duplicate_users_check():
+    rows = list_all_users()
+    counts = {}
+    for r in rows:
+        counts[r.get("name")] = counts.get(r.get("name"), 0) + 1
+    dupes = {k: v for k, v in counts.items() if v > 1}
+    return {"success": True, "total_rows": len(rows), "unique_users": len(counts), "duplicates": dupes, "sample": rows[:20]}
+# END ROSHDY UNIQUE USERS LIST V25
+'''
+if start in s and end in s:
+    i = s.index(start)
+    j = s.index(end, i) + len(end)
+    s = s[:i] + patch.strip() + s[j:]
+else:
+    s = s.rstrip() + "\n\n" + patch.strip() + "\n"
+compile(s, str(admin_api), "exec")
+admin_api.write_text(s, encoding="utf-8")
+
+# Frontend safety dedupe in user-management page, without rebuilding the whole page.
+if user_page.exists():
+    txt = user_page.read_text(encoding="utf-8", errors="ignore")
+    marker_a = "<!-- BEGIN ROSHDY USER MANAGEMENT DEDUPE V25 -->"
+    marker_b = "<!-- END ROSHDY USER MANAGEMENT DEDUPE V25 -->"
+    while marker_a in txt and marker_b in txt:
+        i = txt.index(marker_a)
+        j = txt.index(marker_b, i) + len(marker_b)
+        txt = txt[:i] + "\n" + txt[j:]
+    block = r'''
+<!-- BEGIN ROSHDY USER MANAGEMENT DEDUPE V25 -->
+<script>
+(function(){
+  if(window.RoshdyUserDedupeV25) return;
+  window.RoshdyUserDedupeV25 = true;
+  function dedupeRows(rows){
+    var seen = {}, out = [];
+    (rows || []).forEach(function(u){
+      var key = String((u && (u.name || u.email)) || '').toLowerCase();
+      if(!key || seen[key]) return;
+      seen[key] = true;
+      if(u && Array.isArray(u.roles)){
+        var rs = {}, clean=[];
+        u.roles.forEach(function(r){ if(r && !rs[r]){ rs[r]=1; clean.push(r); } });
+        u.roles = clean;
+      }
+      out.push(u);
+    });
+    return out;
+  }
+  var oldApi = window.api;
+  if(typeof oldApi === 'function' && !oldApi.__dedupeV25){
+    window.api = async function(m,args){
+      var res = await oldApi(m,args);
+      if(String(m).indexOf('list_all_users') >= 0 && Array.isArray(res)) return dedupeRows(res);
+      return res;
+    };
+    window.api.__dedupeV25 = true;
+  }
+})();
+</script>
+<!-- END ROSHDY USER MANAGEMENT DEDUPE V25 -->
+'''
+    low = txt.lower()
+    if "</body>" in low:
+        idx = low.rindex("</body>")
+        txt = txt[:idx] + "\n" + block + "\n" + txt[idx:]
+    else:
+        txt = txt.rstrip() + "\n" + block + "\n"
+    user_page.write_text(txt, encoding="utf-8")
+PY
+
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+[[ -n "$APP_OWNER" ]] && chown "$APP_OWNER" "$ADMIN_API" "$USER_MGMT_HTML" 2>/dev/null || true
+
+echo "🧹 Clear cache + restart app services"
+bench_exec clear-cache || true
+"${COMPOSE[@]}" restart backend frontend websocket queue-short queue-long scheduler >/dev/null
+sleep 8
+bench_exec clear-cache || true
+
+echo "🧪 Validation"
+set +e
+bench_exec execute restaurant_ops.api.admin_api.debug_duplicate_users_check | tee "$BACKUP_DIR/debug_duplicate_users_check_v25.txt"
+V1=${PIPESTATUS[0]}
+for p in user-management admin-desk; do
+  code="$(curl -k -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$p" 2>/dev/null || echo 000)"
+  echo "$p => $code" | tee -a "$BACKUP_DIR/page_smoke_checks_v25.txt"
+done
+set -e
+
+if [[ $V1 -ne 0 ]]; then
+  echo "❌ Validation failed. راجع: $BACKUP_DIR/debug_duplicate_users_check_v25.txt"
+  exit 1
+fi
+
+if grep -q '"duplicates": {}' "$BACKUP_DIR/debug_duplicate_users_check_v25.txt"; then
+  echo "✅ No duplicate users returned by API"
+else
+  echo "⚠️ Check duplicate validation output: $BACKUP_DIR/debug_duplicate_users_check_v25.txt"
+fi
+
+echo "🏥 Health Check - Elastix/CDR/AMI + Queue + Call Report"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$BACKUP_DIR/health_asterisk_bridge.txt"
+H1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status | tee "$BACKUP_DIR/health_queue_status.txt"
+H2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' | tee "$BACKUP_DIR/health_call_report.txt"
+H3=${PIPESTATUS[0]}
+set -e
+
+if [[ $H1 -ne 0 || $H2 -ne 0 || $H3 -ne 0 ]]; then
+  echo "⚠️ Health returned non-zero. راجع: $BACKUP_DIR"
+else
+  echo "✅ Health checks OK"
+fi
+
+echo "============================================================"
+echo "✅ DONE V25"
+echo "📦 Backup folder: $BACKUP_DIR"
+echo "👥 /user-management now receives one row per user"
+echo "🛡️ report_api.py / Elastix / CDR / AMI untouched"
+echo "============================================================"

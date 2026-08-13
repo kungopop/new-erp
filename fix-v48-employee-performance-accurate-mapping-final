@@ -1,0 +1,542 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Roshdy V48 - Employee Performance accurate session mapping + cleaner presence wording
+# Fixes:
+# 1) Historical employee/extension mapping: one employee is treated as one active extension at a time.
+#    If an old Extension Session was left open, its effective end becomes the next extension selection by the same employee.
+# 2) Report aggregates by employee when the employee is known, not by extension only.
+# 3) If no historical SIP presence samples exist, UI shows selected-extension duration or a dash, not confusing wording.
+# 4) Rebuilds yesterday snapshot.
+# Safety: no report_api.py edits, no Elastix writes, no CDR/AMI config edits, no log delete/compress/rotate.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+else
+  COMPOSE=(docker-compose)
+fi
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend مش شغال"
+  exit 1
+fi
+bench_exec(){ "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"; }
+
+APP_DIR="$ROOT/apps/$APP"
+PKG_DIR="$APP_DIR/$APP"
+API_DIR="$PKG_DIR/api"
+WWW_DIR="$PKG_DIR/www"
+EMP_API="$API_DIR/employee_performance_api.py"
+EMP_HTML="$WWW_DIR/employee-performance.html"
+EMP_SCRIPT="$ROOT/scripts/roshdy_employee_performance_generate_v46"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/FIX_V48_EMPLOYEE_MAPPING_BEFORE_$TS"
+mkdir -p "$BACKUP_DIR/files"
+
+cat <<EOF
+============================================================
+🔧 Roshdy V48: Accurate Employee/Extension Mapping
+📦 Backup: $BACKUP_DIR
+🛡️ report_api.py / Elastix / CDR / AMI untouched
+============================================================
+EOF
+
+for f in "$EMP_API" "$EMP_HTML" "$EMP_SCRIPT"; do
+  [[ -e "$f" ]] && cp -a "$f" "$BACKUP_DIR/files/$(basename "$f").before" || true
+done
+
+echo "🧩 Step 1: Append accurate session-mapping builder override"
+python3 - <<'PYPATCH'
+from pathlib import Path
+p=Path('/opt/frappe_crm/apps/restaurant_ops/restaurant_ops/api/employee_performance_api.py')
+s=p.read_text(encoding='utf-8',errors='ignore')
+a='# BEGIN ROSHDY EMP PERF ACCURATE SESSION V48'
+b='# END ROSHDY EMP PERF ACCURATE SESSION V48'
+while a in s and b in s:
+    i=s.index(a); j=s.index(b,i)+len(b); s=s[:i]+'\n'+s[j:]
+block=r'''
+# BEGIN ROSHDY EMP PERF ACCURATE SESSION V48
+# This block intentionally overrides build_snapshot_from_queue_events only.
+# It fixes historical employee-extension attribution when old sessions remain open.
+
+from collections import defaultdict as _v48_defaultdict, Counter as _v48_Counter
+from datetime import datetime as _v48_datetime, timedelta as _v48_timedelta
+import json as _v48_json
+import os as _v48_os
+import re as _v48_re
+
+
+def _v48_key_text(emp, ext):
+    emp = cstr(emp or '').strip()
+    ext = cstr(ext or '').strip()
+    if emp and not emp.startswith('تحويلة '):
+        return 'emp|' + emp
+    return 'ext|' + ext
+
+
+def _v48_emp_label(emp, ext):
+    emp = cstr(emp or '').strip()
+    ext = cstr(ext or '').strip()
+    if emp:
+        return emp
+    return ('تحويلة ' + ext) if ext else 'غير محدد'
+
+
+def _v48_session_rows(start_dt, end_dt):
+    """Load Extension Session rows and infer effective release times.
+
+    Important rule: if the same employee/user chooses a new extension while an old session is still open,
+    the old session effectively ends at the new session start. This prevents one employee being shown on
+    multiple extensions because of stale released_at.
+    """
+    try:
+        if not frappe.db.exists('DocType', 'Extension Session'):
+            return []
+    except Exception:
+        return []
+    cols = _table_columns('tabExtension Session')
+    if not isinstance(cols, list) or 'extension' not in cols:
+        return []
+    start_col = 'started_at' if 'started_at' in cols else 'creation'
+    end_col = 'released_at' if 'released_at' in cols else None
+    emp_col = 'employee' if 'employee' in cols else None
+    user_col = 'user' if 'user' in cols else None
+    fields = [
+        's.name',
+        's.extension',
+        ('s.`%s` as start_dt' % start_col),
+        ('s.`%s` as end_dt' % end_col) if end_col else 'NULL as end_dt',
+        ('s.`%s` as employee' % emp_col) if emp_col else 'NULL as employee',
+        ('s.`%s` as user' % user_col) if user_col else 'NULL as user',
+        's.creation',
+    ]
+    # Pull a wider range to correctly close stale sessions by the next selection.
+    q_start = (_parse_dt(start_dt) or _v48_datetime.now()) - _v48_timedelta(days=3)
+    q_end = (_parse_dt(end_dt) or _v48_datetime.now()) + _v48_timedelta(days=2)
+    try:
+        rows = frappe.db.sql("""
+            select {fields}, coalesce(e.employee_name, {emp_expr}, {user_expr}, s.name) as employee_name
+            from `tabExtension Session` s
+            left join `tabEmployee` e on ({emp_join}) or ({user_join})
+            where s.extension is not null and s.extension != ''
+              and coalesce(s.`{start_col}`, s.creation) < %s
+              and ({end_cond})
+            order by coalesce(s.`{start_col}`, s.creation) asc
+        """.format(
+            fields=', '.join(fields),
+            emp_expr=('s.`%s`' % emp_col) if emp_col else 'NULL',
+            user_expr=('s.`%s`' % user_col) if user_col else 'NULL',
+            emp_join=('e.name=s.`%s`' % emp_col) if emp_col else '1=0',
+            user_join=('e.user_id=s.`%s`' % user_col) if user_col else '1=0',
+            start_col=start_col,
+            end_cond=("s.`%s` is null or s.`%s` > %%s" % (end_col, end_col)) if end_col else '1=1'
+        ), (q_end.strftime('%Y-%m-%d %H:%M:%S'), q_start.strftime('%Y-%m-%d %H:%M:%S')), as_dict=True)
+    except Exception:
+        return []
+
+    sessions=[]
+    for r in rows:
+        st=_parse_dt(r.get('start_dt') or r.get('creation'))
+        en=_parse_dt(r.get('end_dt'))
+        if not st:
+            continue
+        emp_key = cstr(r.get('employee') or r.get('user') or r.get('employee_name') or '').strip()
+        if not emp_key:
+            emp_key = cstr(r.get('employee_name') or '').strip()
+        sessions.append({
+            'name': cstr(r.get('name')),
+            'extension': cstr(r.get('extension')).strip(),
+            'employee': cstr(r.get('employee_name') or r.get('employee') or r.get('user') or '').strip(),
+            'employee_key': emp_key,
+            'start': st,
+            'end_raw': en,
+            'end': en,
+        })
+
+    # Infer end by next session for same employee/user.
+    by_emp=_v48_defaultdict(list)
+    for s in sessions:
+        by_emp[s.get('employee_key') or s.get('employee')].append(s)
+    for emp, arr in by_emp.items():
+        arr.sort(key=lambda x: x['start'])
+        for i, sess in enumerate(arr[:-1]):
+            nxt=arr[i+1]
+            if not sess.get('end') or sess['end'] > nxt['start']:
+                sess['end'] = nxt['start']
+    # If still open, cap much later; actual overlap calculator caps to report window.
+    for sess in sessions:
+        if not sess.get('end'):
+            sess['end'] = q_end
+    return sessions
+
+
+def _v48_session_context(target_date, start_dt, split_dt, end_dt):
+    start=_parse_dt(start_dt); split=_parse_dt(split_dt); end=_parse_dt(end_dt)
+    all_sessions=_v48_session_rows(start_dt, end_dt)
+    active=[]
+    for s in all_sessions:
+        if not s.get('extension'):
+            continue
+        if s['start'] < end and s['end'] > start:
+            x=dict(s)
+            x['ov_start']=max(s['start'], start)
+            x['ov_end']=min(s['end'], end)
+            if x['ov_end'] > x['ov_start']:
+                active.append(x)
+
+    def emp_at(ext, when):
+        dt=_parse_dt(when)
+        ext=cstr(ext or '').strip()
+        if not dt or not ext:
+            return ''
+        candidates=[s for s in active if s['extension']==ext and s['start'] <= dt < s['end']]
+        if not candidates:
+            return ''
+        candidates.sort(key=lambda x: x['start'], reverse=True)
+        return candidates[0].get('employee') or ''
+
+    by_key=_v48_defaultdict(lambda:{'session_minutes_est':0,'session_morning_minutes_est':0,'session_evening_minutes_est':0,'extensions':set(),'employee':''})
+    for s in active:
+        emp=_v48_emp_label(s.get('employee'), s.get('extension'))
+        key=_v48_key_text(emp, s.get('extension'))
+        minutes=max(0, int((s['ov_end']-s['ov_start']).total_seconds()/60))
+        by_key[key]['session_minutes_est'] += minutes
+        by_key[key]['extensions'].add(s.get('extension'))
+        by_key[key]['employee']=emp
+        # split minutes
+        m1=max(0, int((min(s['ov_end'], split)-s['ov_start']).total_seconds()/60)) if s['ov_start'] < split else 0
+        m2=max(0, int((s['ov_end']-max(s['ov_start'], split)).total_seconds()/60)) if s['ov_end'] > split else 0
+        by_key[key]['session_morning_minutes_est'] += m1
+        by_key[key]['session_evening_minutes_est'] += m2
+
+    def peak_between(a,b):
+        points=[]
+        for s in active:
+            st=max(s['ov_start'],a); en=min(s['ov_end'],b)
+            if en>st:
+                points.append((st,1,s['extension'])); points.append((en,-1,s['extension']))
+        points.sort(key=lambda x:(x[0], -x[1]))
+        cur=set(); peak=0
+        for t,typ,ext in points:
+            if typ>0: cur.add(ext)
+            else: cur.discard(ext)
+            peak=max(peak,len(cur))
+        return peak
+
+    return {'sessions':active,'by_key':by_key,'emp_at':emp_at,'peak_morning':peak_between(start,split),'peak_evening':peak_between(split,end)}
+
+
+def _v48_add_call_to_bucket(buckets, call, ext, emp):
+    ext=cstr(ext or '').strip()
+    emp=_v48_emp_label(emp, ext)
+    key=_v48_key_text(emp, ext)
+    b=buckets[key]
+    b['key']=key
+    b['employee']=emp
+    if ext:
+        b['extensions'].add(ext)
+    b['answered_calls'] += 1
+    if call.get('queue') == '1234': b['orders_calls'] += 1
+    elif call.get('queue') == '123': b['complaints_calls'] += 1
+    if call.get('shift') == 'صباحي': b['morning_calls'] += 1
+    elif call.get('shift') == 'مسائي': b['evening_calls'] += 1
+    w=cint(call.get('wait_seconds') or 0); t=cint(call.get('talk_seconds') or 0)
+    b['wait_total'] += w
+    b['wait_min'] = w if b['wait_min'] is None else min(b['wait_min'], w)
+    b['wait_max'] = max(b['wait_max'], w)
+    b['talk_total'] += t
+    b['talk_max'] = max(b['talk_max'], t)
+    if call.get('new_customer'): b['new_customers'] += 1
+    b['calls'].append(call)
+    return key
+
+
+@frappe.whitelist()
+def build_snapshot_from_queue_events(target_date=None, events_rel_path=None):
+    """V48 accurate build: employee attribution is based on Extension Session at call time.
+
+    It does not use a current/latest session for historical calls if no valid session exists at that time.
+    """
+    target_date = cstr(target_date or _last_complete_date().isoformat())[:10]
+    d, start, split, end = _operational_bounds(target_date)
+    start_s = start.strftime('%Y-%m-%d %H:%M:%S')
+    split_s = split.strftime('%Y-%m-%d %H:%M:%S')
+    end_s = end.strftime('%Y-%m-%d %H:%M:%S')
+    session_ctx=_v48_session_context(target_date,start_s,split_s,end_s)
+    emp_at=session_ctx['emp_at']
+
+    events = _read_events(events_rel_path)
+    by_call = _v48_defaultdict(list)
+    event_counts = _v48_Counter(); queue_counts=_v48_Counter()
+    for e in events:
+        event_counts[cstr(e.get('event'))]+=1; queue_counts[cstr(e.get('queue'))]+=1
+        cid=cstr(e.get('callid') or '')
+        if cid: by_call[cid].append(e)
+    for cid in by_call:
+        by_call[cid].sort(key=lambda x: flt(x.get('time_epoch') or 0))
+
+    cdr_rows, cdr_error = _cdr_rows(start_s, end_s)
+    cdr_by_uid={cstr(r.get('uniqueid')):r for r in cdr_rows if r.get('uniqueid')}
+    calls={}
+    for cid, evs in by_call.items():
+        phone=''; did=''; queue=''; enter_time=None
+        for e in evs:
+            if not queue and e.get('queue'): queue=cstr(e.get('queue'))
+            if e.get('event')=='DID' and e.get('data'): did=cstr((e.get('data') or [''])[0])
+            if e.get('event')=='ENTERQUEUE':
+                enter_time=_parse_dt(e.get('time_text')) or enter_time
+                for x in (e.get('data') or []):
+                    if _v48_re.search(r'\d{5,}', cstr(x)): phone=cstr(x); break
+        connects=[e for e in evs if e.get('event')=='CONNECT']
+        completes=[e for e in evs if e.get('event') in ('COMPLETEAGENT','COMPLETECALLER')]
+        abandons=[e for e in evs if e.get('event')=='ABANDON']
+        ring_misses=[e for e in evs if e.get('event') in ('RINGNOANSWER','RINGCANCELED','AGENTDUMP')]
+        outcome='answered' if connects else ('abandoned' if abandons else 'unknown')
+        ans=connects[0] if connects else None
+        answer_time=_parse_dt(ans.get('time_text')) if ans else None
+        ans_ext=cstr(ans.get('agent_ext') or _ext_from_agent(ans.get('agent'))) if ans else ''
+        wait_seconds=None
+        if ans:
+            try: wait_seconds=int(float((ans.get('data') or [0])[0] or 0))
+            except Exception: wait_seconds=int((answer_time-enter_time).total_seconds()) if answer_time and enter_time else 0
+        talk_seconds=0
+        if completes:
+            comp=completes[-1]
+            try: talk_seconds=int(float((comp.get('data') or [0,0])[1] or 0))
+            except Exception: talk_seconds=0
+        cdr=cdr_by_uid.get(cid) or {}
+        if not phone: phone=cstr(cdr.get('src') or cdr.get('cnum') or '')
+        if not queue: queue=cstr(cdr.get('dst') or '')
+        if not ans_ext: ans_ext=_actual_ext_from_cdr(cdr)
+        if not talk_seconds: talk_seconds=cint(cdr.get('billsec') or cdr.get('duration') or 0)
+        if not enter_time: enter_time=_parse_dt(cdr.get('calldate'))
+        when=_fmt_dt(answer_time or enter_time)
+        emp=emp_at(ans_ext, when) if ans_ext else ''
+        shift=_shift_name(enter_time or answer_time, target_date)
+        calls[cid]={
+            'callid':cid,'queue':queue,'queue_label':QUEUES.get(queue,queue),'did':did or cstr(cdr.get('did') or ''),
+            'caller_raw':phone,'caller':normalize_phone(phone),'enter_time':_fmt_dt(enter_time),'answer_time':_fmt_dt(answer_time),
+            'answered_extension':ans_ext,'answered_employee':_v48_emp_label(emp, ans_ext) if ans_ext else '',
+            'wait_seconds':wait_seconds if wait_seconds is not None else 0,'talk_seconds':talk_seconds,
+            'duration_seconds':cint(cdr.get('duration') or 0) or talk_seconds,'outcome':outcome,'shift':shift,
+            'recording_url':cstr(cdr.get('recording_url') or ''),'recordingfile':cstr(cdr.get('recordingfile') or ''),
+            'employee_resolution':'session_at_call_time' if emp else 'extension_only',
+            'ring_misses':[], 'cdr_found':bool(cdr),
+        }
+        for x in ring_misses:
+            mx=cstr(x.get('agent_ext') or _ext_from_agent(x.get('agent')))
+            memp=emp_at(mx, x.get('time_text')) if mx else ''
+            raw=((x.get('data') or [0])[0] or 0)
+            ring=round(flt(raw)/1000.0,1) if flt(raw)>100 else flt(raw)
+            calls[cid]['ring_misses'].append({'time':_fmt_dt(x.get('time_text')),'extension':mx,'employee':_v48_emp_label(memp,mx),'employee_resolution':'session_at_call_time' if memp else 'extension_only','ring_seconds':ring})
+
+    for r in cdr_rows:
+        cid=cstr(r.get('uniqueid') or '')
+        if not cid or cid in calls: continue
+        ext=_actual_ext_from_cdr(r)
+        if not ext: continue
+        dt=_parse_dt(r.get('calldate'))
+        phone=cstr(r.get('src') or r.get('cnum') or '')
+        emp=emp_at(ext, _fmt_dt(dt))
+        calls[cid]={
+            'callid':cid,'queue':cstr(r.get('dst') or ''),'queue_label':QUEUES.get(cstr(r.get('dst') or ''),cstr(r.get('dst') or '')),
+            'did':'','caller_raw':phone,'caller':normalize_phone(phone),'enter_time':_fmt_dt(dt),'answer_time':_fmt_dt(dt),
+            'answered_extension':ext,'answered_employee':_v48_emp_label(emp,ext),'wait_seconds':0,
+            'talk_seconds':cint(r.get('billsec') or r.get('duration') or 0),'duration_seconds':cint(r.get('duration') or r.get('billsec') or 0),
+            'outcome':'answered' if cstr(r.get('disposition')).upper()=='ANSWERED' else 'other','shift':_shift_name(dt,target_date),
+            'recording_url':cstr(r.get('recording_url') or ''),'recordingfile':cstr(r.get('recordingfile') or ''),'ring_misses':[],
+            'employee_resolution':'session_at_call_time' if emp else 'extension_only','cdr_found':True,
+        }
+
+    answered_calls=[c for c in calls.values() if c.get('outcome')=='answered' and c.get('answered_extension')]
+    phones=sorted({c.get('caller') for c in answered_calls if c.get('caller')})
+    seen_map=_historical_seen_map(phones,start_s)
+    for c in answered_calls:
+        h=seen_map.get(c.get('caller') or '') or {}
+        c['new_customer']=bool(c.get('caller') and not h.get('seen_before'))
+        c['customer_first_seen_before']=h.get('first_seen') or ''
+        c['customer_previous_count']=h.get('previous_count') or 0
+
+    buckets=_v48_defaultdict(lambda:{'key':'','employee':'','extension':'','extensions':set(),'answered_calls':0,'orders_calls':0,'complaints_calls':0,'morning_calls':0,'evening_calls':0,'wait_total':0,'wait_min':None,'wait_max':0,'talk_total':0,'talk_max':0,'ringnoanswer':0,'new_customers':0,'calls':[]})
+    for c in answered_calls:
+        ext=c.get('answered_extension') or ''
+        emp=c.get('answered_employee') or _v48_emp_label('',ext)
+        _v48_add_call_to_bucket(buckets,c,ext,emp)
+    for c in calls.values():
+        for m in c.get('ring_misses') or []:
+            ext=m.get('extension') or ''
+            emp=m.get('employee') or _v48_emp_label('',ext)
+            key=_v48_key_text(emp,ext)
+            b=buckets[key]
+            b['key']=key; b['employee']=emp
+            if ext: b['extensions'].add(ext)
+            b['ringnoanswer']+=1
+
+    # Merge session-selected durations into buckets. Create row even if employee selected extension but had no calls.
+    for key, sv in (session_ctx.get('by_key') or {}).items():
+        b=buckets[key]
+        b['key']=key
+        if sv.get('employee'): b['employee']=sv.get('employee')
+        b['extensions'].update(sv.get('extensions') or [])
+        b['session_minutes_est']=sv.get('session_minutes_est') or 0
+        b['session_morning_minutes_est']=sv.get('session_morning_minutes_est') or 0
+        b['session_evening_minutes_est']=sv.get('session_evening_minutes_est') or 0
+
+    presence=_load_presence(target_date,start_s,split_s,end_s)
+    # If presence exists, it is extension-based; attach to matching buckets containing that extension.
+    for ext,pv in (presence.get('by_extension') or {}).items():
+        for b in buckets.values():
+            if ext in (b.get('extensions') or set()):
+                b['online_minutes_est']=b.get('online_minutes_est',0)+(pv.get('online_minutes_est') or 0)
+                b['offline_minutes_est']=b.get('offline_minutes_est',0)+(pv.get('offline_minutes_est') or 0)
+
+    employees=[]
+    for key,b in buckets.items():
+        n=cint(b.get('answered_calls') or 0)
+        b['avg_wait_seconds']=round(flt(b.get('wait_total') or 0)/n,2) if n else 0
+        b['avg_talk_seconds']=round(flt(b.get('talk_total') or 0)/n,2) if n else 0
+        b['wait_min']=b['wait_min'] if b['wait_min'] is not None else 0
+        b['longest_call']=max(b.get('calls') or [], key=lambda x:cint(x.get('talk_seconds') or 0), default=None)
+        b['calls']=sorted(b.get('calls') or [], key=lambda x:cstr(x.get('enter_time') or ''), reverse=True)
+        exts=sorted([x for x in (b.get('extensions') or set()) if x])
+        b['extensions']=exts
+        b['extension']=', '.join(exts) if exts else ''
+        if not b.get('employee'):
+            b['employee']=_v48_emp_label('', exts[0] if exts else '')
+        employees.append(dict(b))
+    employees.sort(key=lambda x:(-(cint(x.get('answered_calls') or 0)), -(cint(x.get('ringnoanswer') or 0)), cstr(x.get('employee')), cstr(x.get('extension'))))
+
+    new_customer_calls=[c for c in answered_calls if c.get('new_customer')]
+    total_wait=sum(cint(c.get('wait_seconds') or 0) for c in answered_calls)
+    total_talk=sum(cint(c.get('talk_seconds') or 0) for c in answered_calls)
+    slowest=max(answered_calls,key=lambda x:cint(x.get('wait_seconds') or 0),default=None)
+    fastest=min(answered_calls,key=lambda x:cint(x.get('wait_seconds') or 999999),default=None)
+    longest=max(answered_calls,key=lambda x:cint(x.get('talk_seconds') or 0),default=None)
+    abandoned_count=len([c for c in calls.values() if c.get('outcome')=='abandoned'])
+    ring_total=sum(len(c.get('ring_misses') or []) for c in calls.values())
+    morning_keys={_v48_key_text(c.get('answered_employee'),c.get('answered_extension')) for c in answered_calls if c.get('shift')=='صباحي'}
+    evening_keys={_v48_key_text(c.get('answered_employee'),c.get('answered_extension')) for c in answered_calls if c.get('shift')=='مسائي'}
+
+    snapshot={
+        'success':True,'version':'V48','generated_at':now_datetime().strftime('%Y-%m-%d %H:%M:%S'),'target_date':target_date,
+        'start_dt':start_s,'split_dt':split_s,'end_dt':end_s,
+        'source':{'events_rel_path':events_rel_path,'events_loaded':len(events),'event_counts':dict(event_counts),'queue_event_counts':dict(queue_counts),'cdr_rows':len(cdr_rows),'cdr_error':cdr_error,'presence_available':presence.get('available'),'presence_samples':presence.get('samples'),'session_rows_used':len(session_ctx.get('sessions') or [])},
+        'summary':{
+            'employees_count':len([e for e in employees if cint(e.get('answered_calls') or 0) or cint(e.get('ringnoanswer') or 0)]),
+            'answered_calls':len(answered_calls),'orders_calls':len([c for c in answered_calls if c.get('queue')=='1234']),'complaints_calls':len([c for c in answered_calls if c.get('queue')=='123']),
+            'abandoned_calls':abandoned_count,'ringnoanswer_attempts':ring_total,'new_customers':len(new_customer_calls),
+            'avg_wait_seconds':round(total_wait/len(answered_calls),2) if answered_calls else 0,'avg_talk_seconds':round(total_talk/len(answered_calls),2) if answered_calls else 0,
+            'fastest_answer':fastest,'slowest_answer':slowest,'longest_call':longest,
+            'morning':{'from':start_s,'to':split_s,'answered_calls':len([c for c in answered_calls if c.get('shift')=='صباحي']),'active_extensions_estimated':len(morning_keys),'peak_online_extensions':presence.get('peak_online_morning'),'peak_selected_extensions':session_ctx.get('peak_morning')},
+            'evening':{'from':split_s,'to':end_s,'answered_calls':len([c for c in answered_calls if c.get('shift')=='مسائي']),'active_extensions_estimated':len(evening_keys),'peak_online_extensions':presence.get('peak_online_evening'),'peak_selected_extensions':session_ctx.get('peak_evening')},
+        },
+        'employees':employees,
+        'new_customers':sorted(new_customer_calls,key=lambda x:cstr(x.get('enter_time') or '')),
+        'calls':sorted(answered_calls,key=lambda x:cstr(x.get('enter_time') or ''), reverse=True),
+    }
+    path=_save_snapshot(snapshot,target_date)
+    frappe.db.commit()
+    return {'success':True,'target_date':target_date,'path':path,'summary':snapshot['summary'],'version':'V48'}
+
+# END ROSHDY EMP PERF ACCURATE SESSION V48
+'''
+s=s.rstrip()+"\n\n"+block+"\n"
+p.write_text(s,encoding='utf-8')
+print('patched', p)
+PYPATCH
+
+echo "🧩 Step 2: Patch UI presence wording"
+python3 - <<'PYUI'
+from pathlib import Path
+p=Path('/opt/frappe_crm/apps/restaurant_ops/restaurant_ops/www/employee-performance.html')
+s=p.read_text(encoding='utf-8',errors='ignore')
+old="""function presenceText(e){if(e.online_minutes_est!=null){return '<span class=\"ok\">متواجد '+sec((e.online_minutes_est||0)*60)+'</span><br><span class=\"danger\">غير متواجد '+sec((e.offline_minutes_est||0)*60)+'</span>'}return '<span class=\"muted\">لا توجد بيانات تواجد لهذا التاريخ</span>'}"""
+new="""function presenceText(e){if(e.online_minutes_est!=null){return '<span class=\"ok\">متواجد '+sec((e.online_minutes_est||0)*60)+'</span><br><span class=\"danger\">غير متواجد '+sec((e.offline_minutes_est||0)*60)+'</span>'}if(Number(e.session_minutes_est||0)>0){return '<span class=\"ok\">تسجيل التحويلة '+sec((e.session_minutes_est||0)*60)+'</span>'}return '<span class=\"muted\">—</span>'}"""
+if old in s:
+    s=s.replace(old,new,1)
+else:
+    import re
+    s=re.sub(r"function presenceText\(e\)\{.*?\}\nfunction renderEmployees", new+"\nfunction renderEmployees", s, count=1, flags=re.S)
+# use selected peak if no SIP presence peak
+s=s.replace("cMorning.textContent=((s.morning||{}).peak_online_extensions ?? (s.morning||{}).active_extensions_estimated ?? 0); cEvening.textContent=((s.evening||{}).peak_online_extensions ?? (s.evening||{}).active_extensions_estimated ?? 0);", "cMorning.textContent=((s.morning||{}).peak_online_extensions ?? (s.morning||{}).peak_selected_extensions ?? (s.morning||{}).active_extensions_estimated ?? 0); cEvening.textContent=((s.evening||{}).peak_online_extensions ?? (s.evening||{}).peak_selected_extensions ?? (s.evening||{}).active_extensions_estimated ?? 0);")
+s=s.replace("cMorningHint.textContent=(s.morning&&s.morning.peak_online_extensions!=null)?'من قراءات التواجد':'تقدير من نشاط المكالمات'; cEveningHint.textContent=(s.evening&&s.evening.peak_online_extensions!=null)?'من قراءات التواجد':'تقدير من نشاط المكالمات';", "cMorningHint.textContent=(s.morning&&s.morning.peak_online_extensions!=null)?'من قراءات التواجد':((s.morning&&s.morning.peak_selected_extensions!=null)?'من تسجيل التحويلات':'تقدير من نشاط المكالمات'); cEveningHint.textContent=(s.evening&&s.evening.peak_online_extensions!=null)?'من قراءات التواجد':((s.evening&&s.evening.peak_selected_extensions!=null)?'من تسجيل التحويلات':'تقدير من نشاط المكالمات');")
+p.write_text(s,encoding='utf-8')
+print('patched',p)
+PYUI
+
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+[[ -n "$APP_OWNER" ]] && chown "$APP_OWNER" "$EMP_API" "$EMP_HTML" 2>/dev/null || true
+
+echo "🧪 Step 3: Syntax validation"
+python3 -m py_compile "$EMP_API"
+bash -n "$EMP_SCRIPT"
+
+echo "🧹 Step 4: Restart ERP services only for new API code"
+bench_exec clear-cache || true
+SERVICES="$(${COMPOSE[@]} ps --services 2>/dev/null || true)"
+for svc in backend frontend websocket queue-short queue-long scheduler; do
+  if grep -qx "$svc" <<< "$SERVICES"; then
+    echo "restart $svc"
+    "${COMPOSE[@]}" restart "$svc" >/dev/null
+  fi
+done
+sleep 10
+bench_exec clear-cache || true
+
+echo "🧩 Step 5: Rebuild yesterday employee-performance snapshot using V48 logic"
+TARGET_DATE="$(date -d 'yesterday' +%F)" "$EMP_SCRIPT" 2>&1 | tee "$BACKUP_DIR/rebuild_yesterday_v48.txt"
+
+echo "🧪 Step 6: Validation"
+VAL_DIR="$BACKUP_DIR/validation"
+mkdir -p "$VAL_DIR"
+set +e
+code="$(curl -k -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/employee-performance" 2>/dev/null || echo 000)"
+echo "employee-performance => $code" | tee "$VAL_DIR/page_smoke_checks.txt"
+bench_exec execute restaurant_ops.api.employee_performance_api.get_dashboard | tee "$VAL_DIR/employee_dashboard_v48.json"
+V1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.employee_performance_api.debug_status | tee "$VAL_DIR/employee_debug_status.json"
+V2=${PIPESTATUS[0]}
+set -e
+if [[ "$code" != 2* && "$code" != 3* ]]; then
+  echo "❌ /employee-performance مش راجعة 200/3xx"
+  exit 1
+fi
+if [[ $V1 -ne 0 || $V2 -ne 0 ]]; then
+  echo "❌ API validation failed. راجع $VAL_DIR"
+  exit 1
+fi
+
+# Lightweight health checks. Do not edit sensitive modules.
+echo "🏥 Step 7: Health check"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$VAL_DIR/health_asterisk_bridge.json"
+H1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status | tee "$VAL_DIR/health_queue_status.json"
+H2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' | tee "$VAL_DIR/health_call_report.json"
+H3=${PIPESTATUS[0]}
+set -e
+if [[ $H1 -ne 0 || $H2 -ne 0 || $H3 -ne 0 ]]; then
+  echo "⚠️ Health check فيه تحذير/فشل. راجع $VAL_DIR"
+  exit 1
+fi
+
+cat <<EOF
+============================================================
+✅ DONE V48
+📦 Backup/log folder: $BACKUP_DIR
+✅ employee-extension mapping now uses session at call time only
+✅ stale old sessions are ended automatically at next employee extension selection for reporting
+✅ report rows aggregate by employee when employee is known
+✅ no confusing historical presence text
+✅ yesterday snapshot rebuilt
+🛡️ report_api.py / Elastix / CDR / AMI untouched
+============================================================
+EOF

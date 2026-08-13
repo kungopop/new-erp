@@ -1,0 +1,1350 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Roshdy V46 FINAL - Employee Performance + Hidden Watchdog
+# Safety:
+# - Backup first.
+# - Does NOT edit report_api.py.
+# - Does NOT write to Elastix. Reads Elastix logs/AMI only via SSH/AMI.
+# - Does NOT delete/compress/rotate Elastix logs.
+# - Stores snapshots/caches under ERP site private files only.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+else
+  COMPOSE=(docker-compose)
+fi
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend مش شغال"
+  exit 1
+fi
+
+bench_exec(){ "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"; }
+
+APP_DIR="$ROOT/apps/$APP"
+PKG_DIR="$APP_DIR/$APP"
+API_DIR="$PKG_DIR/api"
+WWW_DIR="$PKG_DIR/www"
+SCRIPTS_DIR="$ROOT/scripts"
+SITE_PRIVATE="$ROOT/sites/$SITE/private/files"
+CONTAINER_SITE_PRIVATE="/home/frappe/frappe-bench/sites/$SITE/private/files"
+
+EMP_API="$API_DIR/employee_performance_api.py"
+WATCHDOG_API="$API_DIR/system_watchdog_api.py"
+EMP_HTML="$WWW_DIR/employee-performance.html"
+EMP_PY="$WWW_DIR/employee-performance.py"
+WATCHDOG_HTML="$WWW_DIR/watchdog.html"
+WATCHDOG_PY="$WWW_DIR/watchdog.py"
+ADMIN_HTML="$WWW_DIR/admin-desk.html"
+EMP_SCRIPT="$SCRIPTS_DIR/roshdy_employee_performance_generate_v46"
+WATCHDOG_SCRIPT="$SCRIPTS_DIR/roshdy_system_watchdog_collect_v46"
+CRON_EMP="/etc/cron.d/roshdy_employee_performance_v46"
+CRON_WATCHDOG="/etc/cron.d/roshdy_system_watchdog_v46"
+
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/FIX_V46_EMPLOYEE_PERF_WATCHDOG_BEFORE_$TS"
+mkdir -p "$BACKUP_DIR/files" "$SCRIPTS_DIR" "$SITE_PRIVATE/employee_performance" "$SITE_PRIVATE/system_watchdog"
+
+cat <<EOF
+============================================================
+🚀 Roshdy V46: Employee Performance + Hidden Watchdog
+📦 Backup: $BACKUP_DIR
+🛡️ report_api.py / Elastix config / CDR config / AMI config: untouched
+============================================================
+EOF
+
+echo "🧯 Step 1: Backup files + bench backup"
+for f in "$EMP_API" "$WATCHDOG_API" "$EMP_HTML" "$EMP_PY" "$WATCHDOG_HTML" "$WATCHDOG_PY" "$ADMIN_HTML" "$EMP_SCRIPT" "$WATCHDOG_SCRIPT" "$CRON_EMP" "$CRON_WATCHDOG"; do
+  [[ -e "$f" ]] && cp -a "$f" "$BACKUP_DIR/files/$(basename "$f").before" || true
+done
+bench_exec backup --with-files | tee "$BACKUP_DIR/bench_backup_output.txt"
+
+# -----------------------------------------------------------------------------
+# Employee Performance API
+# -----------------------------------------------------------------------------
+echo "🧩 Step 2: Install employee_performance_api.py"
+cat > "$EMP_API" <<'PYEMP'
+# -*- coding: utf-8 -*-
+"""Roshdy Employee Performance V46.
+
+Reads daily snapshots generated after the operational day ends.
+No same-day live heavy calculation is exposed to the page.
+Does not edit/touch report_api.py, Elastix, CDR or AMI config.
+"""
+
+import json
+import os
+import re
+from collections import Counter, defaultdict
+from datetime import datetime, date, time, timedelta
+
+import frappe
+from frappe.utils import cstr, cint, flt, get_datetime, now_datetime
+
+QUEUES = {"1234": "طلبات", "123": "شكاوى"}
+BASE_DIR = ("private", "files", "employee_performance")
+
+
+def _is_admin():
+    try:
+        if frappe.session.user == "Administrator":
+            return True
+        return bool(set(frappe.get_roles(frappe.session.user)).intersection({"System Manager", "Call Center Admin", "Restaurant Manager"}))
+    except Exception:
+        return False
+
+
+def _ensure_admin():
+    if not _is_admin():
+        frappe.throw("غير مسموح", frappe.PermissionError)
+
+
+def _base_path(*parts):
+    p = frappe.get_site_path(*BASE_DIR, *parts)
+    os.makedirs(os.path.dirname(p) if os.path.splitext(p)[1] else p, exist_ok=True)
+    return p
+
+
+def _html_escape(s):
+    return cstr(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&#39;")
+
+
+def normalize_phone(phone):
+    """Normalize Egyptian mobile/landline variants.
+
+    Examples:
+    01028567017, +201028567017, 201028567017 -> 01028567017
+    0502727789, +20502727789, 20502727789 -> 0502727789
+    """
+    s = re.sub(r"\D+", "", cstr(phone or ""))
+    if not s:
+        return ""
+    if s.startswith("00"):
+        s = s[2:]
+    if s.startswith("20") and len(s) >= 11:
+        s = "0" + s[2:]
+    if len(s) == 10 and s[:2] in ("10", "11", "12", "15"):
+        s = "0" + s
+    # Most Egyptian landline local forms are 0 + area code + number.
+    if len(s) == 9 and s[:2] in ("50", "55", "57", "48", "45", "40", "47", "46", "64", "66", "68", "82", "84", "86", "88", "92", "93", "95", "96", "97"):
+        s = "0" + s
+    return s
+
+
+def _phone_variants(norm):
+    norm = normalize_phone(norm)
+    if not norm:
+        return []
+    digits = re.sub(r"\D+", "", norm)
+    variants = {norm, digits}
+    if digits.startswith("0") and len(digits) >= 9:
+        variants.add("20" + digits[1:])
+        variants.add("+20" + digits[1:])
+        variants.add("0020" + digits[1:])
+    return sorted(v for v in variants if v)
+
+
+def _parse_dt(v):
+    try:
+        if not v:
+            return None
+        if isinstance(v, datetime):
+            return v
+        return get_datetime(v)
+    except Exception:
+        return None
+
+
+def _fmt_dt(v):
+    d = _parse_dt(v)
+    return d.strftime("%Y-%m-%d %H:%M:%S") if d else ""
+
+
+def _seconds_text(sec):
+    try:
+        sec = int(round(float(sec or 0)))
+    except Exception:
+        sec = 0
+    if sec < 60:
+        return f"{sec} ث"
+    m, s = divmod(sec, 60)
+    if m < 60:
+        return f"{m} د {s} ث" if s else f"{m} د"
+    h, m = divmod(m, 60)
+    return f"{h} س {m} د"
+
+
+def _operational_bounds(target_date):
+    d = target_date if isinstance(target_date, date) else datetime.strptime(cstr(target_date)[:10], "%Y-%m-%d").date()
+    start = datetime.combine(d, time(10, 0, 0))
+    split = datetime.combine(d, time(20, 0, 0))
+    end = datetime.combine(d + timedelta(days=1), time(5, 0, 0))
+    return d, start, split, end
+
+
+def _last_complete_date():
+    now = now_datetime()
+    today = now.date()
+    if now.time() < time(5, 0, 0):
+        return today - timedelta(days=2)
+    return today - timedelta(days=1)
+
+
+def _shift_name(dt, target_date):
+    if not dt:
+        return "غير محدد"
+    d, start, split, end = _operational_bounds(target_date)
+    return "صباحي" if start <= dt < split else "مسائي"
+
+
+def _agent_label(ext, event_time=None):
+    ext = cstr(ext or "").strip()
+    if not ext:
+        return "غير محدد"
+    emp = _employee_by_extension(ext, event_time)
+    return emp or ("تحويلة " + ext)
+
+
+def _table_columns(table):
+    try:
+        rows = frappe.db.sql("describe `%s`" % table, as_dict=True)
+        return [r.get("Field") for r in rows]
+    except Exception:
+        return []
+
+
+def _employee_by_extension(ext, event_time=None):
+    ext = cstr(ext or "").strip()
+    if not ext:
+        return ""
+    # Active Extension Session at call time.
+    try:
+        if frappe.db.exists("DocType", "Extension Session"):
+            cols = _table_columns("tabExtension Session")
+            if "extension" in cols:
+                if event_time:
+                    rows = frappe.db.sql("""
+                        select coalesce(e.employee_name, s.employee, s.user) employee_name
+                        from `tabExtension Session` s
+                        left join `tabEmployee` e on e.name=s.employee or e.user_id=s.user
+                        where s.extension=%s
+                          and (s.started_at is null or s.started_at <= %s)
+                          and (s.released_at is null or s.released_at >= %s)
+                        order by s.started_at desc
+                        limit 1
+                    """, (ext, event_time, event_time), as_dict=True)
+                    if rows and rows[0].get("employee_name"):
+                        return rows[0].get("employee_name")
+                rows = frappe.db.sql("""
+                    select coalesce(e.employee_name, s.employee, s.user) employee_name
+                    from `tabExtension Session` s
+                    left join `tabEmployee` e on e.name=s.employee or e.user_id=s.user
+                    where s.extension=%s
+                    order by coalesce(s.released_at, s.modified, s.creation) desc
+                    limit 1
+                """, (ext,), as_dict=True)
+                if rows and rows[0].get("employee_name"):
+                    return rows[0].get("employee_name")
+    except Exception:
+        pass
+    # Direct custom field on Employee.
+    try:
+        cols = _table_columns("tabEmployee")
+        name_col = "employee_name" if "employee_name" in cols else "name"
+        for col in [c for c in cols if c and any(x in c.lower() for x in ("extension", "ext", "sip"))]:
+            rows = frappe.db.sql("select `%s` as emp from `tabEmployee` where `%s`=%%s limit 1" % (name_col, col), (ext,), as_dict=True)
+            if rows and rows[0].get("emp"):
+                return rows[0].get("emp")
+    except Exception:
+        pass
+    return ""
+
+
+def _ext_from_agent(agent):
+    agent = cstr(agent or "")
+    for pat in (r"(?:Local|SIP|PJSIP|Agent)/(\d{3,6})", r"^(\d{3,6})$", r"\b(\d{3,6})\b"):
+        m = re.search(pat, agent, re.I)
+        if m and m.group(1) not in ("123", "1234"):
+            return m.group(1)
+    return ""
+
+
+def _actual_ext_from_cdr(row):
+    for key in ("actual_ext", "dstchannel", "dst", "lastdata"):
+        val = cstr(row.get(key) or "")
+        m = re.search(r"Local/(\d{3,6})@from-queue", val)
+        if m:
+            return m.group(1)
+        if key in ("actual_ext", "dst") and re.fullmatch(r"\d{3,6}", val) and val not in ("123", "1234"):
+            return val
+    return ""
+
+
+def _read_events(rel_path):
+    if not rel_path:
+        return []
+    rel_path = rel_path.lstrip("/")
+    p = frappe.get_site_path("private", "files", rel_path)
+    if not os.path.exists(p):
+        return []
+    with open(p, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, dict):
+        return data.get("events") or []
+    if isinstance(data, list):
+        return data
+    return []
+
+
+def _sql_quote(s):
+    return "'" + cstr(s).replace("\\", "\\\\").replace("'", "''") + "'"
+
+
+def _cdr_rows(start_dt, end_dt):
+    try:
+        from restaurant_ops.api.asterisk_bridge import query_asterisk_cdr, build_recording_url
+    except Exception:
+        return [], None
+    sql = """
+        SELECT calldate, src, cnum, clid, dst, dcontext, channel, dstchannel,
+               lastapp, lastdata, duration, billsec, disposition, uniqueid, recordingfile
+        FROM cdr
+        WHERE calldate >= {start} AND calldate < {end}
+          AND lastapp='Queue'
+          AND dst IN ('123','1234')
+        ORDER BY calldate ASC
+    """.format(start=_sql_quote(start_dt), end=_sql_quote(end_dt))
+    rows = query_asterisk_cdr(sql) or []
+    for r in rows:
+        try:
+            r["recording_url"] = build_recording_url(r.get("recordingfile")) if r.get("recordingfile") else ""
+        except Exception:
+            r["recording_url"] = ""
+    return rows, None
+
+
+def _historical_seen_map(phones, start_dt):
+    phones = sorted({normalize_phone(p) for p in phones if normalize_phone(p)})
+    out = {p: {"seen_before": False, "first_seen": "", "previous_count": 0} for p in phones}
+    if not phones:
+        return out
+    variants = []
+    variant_to_norm = {}
+    for p in phones:
+        for v in _phone_variants(p):
+            variants.append(v)
+            variant_to_norm[v] = p
+    variants = sorted(set(variants))
+    if not variants:
+        return out
+    try:
+        from restaurant_ops.api.asterisk_bridge import query_asterisk_cdr
+        chunks = [variants[i:i+700] for i in range(0, len(variants), 700)]
+        for ch in chunks:
+            in_list = ",".join(_sql_quote(x) for x in ch)
+            sql = """
+                SELECT src, cnum, MIN(calldate) first_seen, COUNT(*) cnt
+                FROM cdr
+                WHERE calldate < {start}
+                  AND disposition='ANSWERED'
+                  AND (src IN ({vals}) OR cnum IN ({vals}))
+                GROUP BY src, cnum
+                LIMIT 50000
+            """.format(start=_sql_quote(start_dt), vals=in_list)
+            for r in (query_asterisk_cdr(sql) or []):
+                for raw in (r.get("src"), r.get("cnum")):
+                    n = normalize_phone(raw)
+                    if n in out:
+                        out[n]["seen_before"] = True
+                        out[n]["previous_count"] += cint(r.get("cnt") or 0)
+                        fs = cstr(r.get("first_seen") or "")
+                        if fs and (not out[n]["first_seen"] or fs < out[n]["first_seen"]):
+                            out[n]["first_seen"] = fs
+    except Exception as e:
+        for p in out:
+            out[p]["history_error"] = cstr(e)
+    return out
+
+
+def _load_presence(target_date, start_dt, split_dt, end_dt):
+    base = frappe.get_site_path(*BASE_DIR, "presence")
+    out = {
+        "available": False,
+        "peak_online_morning": None,
+        "peak_online_evening": None,
+        "by_extension": {},
+        "samples": 0,
+    }
+    if not os.path.isdir(base):
+        return out
+    start = _parse_dt(start_dt); split = _parse_dt(split_dt); end = _parse_dt(end_dt)
+    files = [os.path.join(base, cstr(target_date)[:10] + ".jsonl")]
+    try:
+        nd = (datetime.strptime(cstr(target_date)[:10], "%Y-%m-%d").date() + timedelta(days=1)).isoformat()
+        files.append(os.path.join(base, nd + ".jsonl"))
+    except Exception:
+        pass
+    by_ext = defaultdict(lambda: {"online_samples": 0, "offline_samples": 0, "online_minutes_est": 0, "offline_minutes_est": 0})
+    peak_m = 0; peak_e = 0; samples = 0
+    for fp in files:
+        if not os.path.exists(fp):
+            continue
+        with open(fp, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    j = json.loads(line)
+                except Exception:
+                    continue
+                ts = _parse_dt(j.get("timestamp"))
+                if not ts or not (start <= ts < end):
+                    continue
+                exts = j.get("extensions") or {}
+                online = set(j.get("online") or [])
+                samples += 1
+                if start <= ts < split:
+                    peak_m = max(peak_m, len(online))
+                else:
+                    peak_e = max(peak_e, len(online))
+                for ext, st in exts.items():
+                    if cstr(ext) in online or "OK" in cstr(st).upper():
+                        by_ext[cstr(ext)]["online_samples"] += 1
+                    else:
+                        by_ext[cstr(ext)]["offline_samples"] += 1
+    if samples:
+        out["available"] = True
+        out["peak_online_morning"] = peak_m
+        out["peak_online_evening"] = peak_e
+        out["samples"] = samples
+        for ext, v in by_ext.items():
+            v["online_minutes_est"] = v["online_samples"] * 5
+            v["offline_minutes_est"] = v["offline_samples"] * 5
+            out["by_extension"][ext] = dict(v)
+    return out
+
+
+def _save_snapshot(data, target_date):
+    base = frappe.get_site_path(*BASE_DIR)
+    os.makedirs(base, exist_ok=True)
+    path = os.path.join(base, f"employee_performance_{target_date}.json")
+    latest = os.path.join(base, "latest.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2, default=str)
+    with open(latest, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2, default=str)
+    return path
+
+
+@frappe.whitelist()
+def build_snapshot_from_queue_events(target_date=None, events_rel_path=None):
+    """Build one operational-day snapshot.
+
+    Intended to be called by the host cron script after 05:00.
+    events_rel_path is relative to site private/files.
+    """
+    target_date = cstr(target_date or _last_complete_date().isoformat())[:10]
+    d, start, split, end = _operational_bounds(target_date)
+    start_s = start.strftime("%Y-%m-%d %H:%M:%S")
+    split_s = split.strftime("%Y-%m-%d %H:%M:%S")
+    end_s = end.strftime("%Y-%m-%d %H:%M:%S")
+
+    events = _read_events(events_rel_path)
+    by_call = defaultdict(list)
+    event_counts = Counter()
+    queue_counts = Counter()
+    for e in events:
+        event_counts[cstr(e.get("event"))] += 1
+        queue_counts[cstr(e.get("queue"))] += 1
+        cid = cstr(e.get("callid") or "")
+        if cid:
+            by_call[cid].append(e)
+    for cid in by_call:
+        by_call[cid].sort(key=lambda x: flt(x.get("time_epoch") or 0))
+
+    cdr_rows, cdr_error = _cdr_rows(start_s, end_s)
+    cdr_by_uid = {cstr(r.get("uniqueid")): r for r in cdr_rows if r.get("uniqueid")}
+
+    calls = {}
+    # First: from queue_log events.
+    for cid, evs in by_call.items():
+        phone = ""; did = ""; queue = ""; enter_time = None
+        for e in evs:
+            if not queue and e.get("queue"):
+                queue = cstr(e.get("queue"))
+            if e.get("event") == "DID" and e.get("data"):
+                did = cstr((e.get("data") or [""])[0])
+            if e.get("event") == "ENTERQUEUE":
+                enter_time = _parse_dt(e.get("time_text")) or enter_time
+                for x in (e.get("data") or []):
+                    if re.search(r"\d{5,}", cstr(x)):
+                        phone = cstr(x); break
+        connects = [e for e in evs if e.get("event") == "CONNECT"]
+        completes = [e for e in evs if e.get("event") in ("COMPLETEAGENT", "COMPLETECALLER")]
+        abandons = [e for e in evs if e.get("event") == "ABANDON"]
+        ring_misses = [e for e in evs if e.get("event") in ("RINGNOANSWER", "RINGCANCELED", "AGENTDUMP")]
+        outcome = "answered" if connects else ("abandoned" if abandons else "unknown")
+        ans = connects[0] if connects else None
+        answer_time = _parse_dt(ans.get("time_text")) if ans else None
+        ans_ext = cstr(ans.get("agent_ext") or _ext_from_agent(ans.get("agent"))) if ans else ""
+        wait_seconds = None
+        if ans:
+            try:
+                wait_seconds = int(float((ans.get("data") or [0])[0] or 0))
+            except Exception:
+                wait_seconds = int((answer_time - enter_time).total_seconds()) if answer_time and enter_time else 0
+        talk_seconds = 0
+        if completes:
+            comp = completes[-1]
+            try:
+                talk_seconds = int(float((comp.get("data") or [0, 0])[1] or 0))
+            except Exception:
+                talk_seconds = 0
+        cdr = cdr_by_uid.get(cid) or {}
+        if not phone:
+            phone = cstr(cdr.get("src") or cdr.get("cnum") or "")
+        if not queue:
+            queue = cstr(cdr.get("dst") or "")
+        if not ans_ext:
+            ans_ext = _actual_ext_from_cdr(cdr)
+        if not talk_seconds:
+            talk_seconds = cint(cdr.get("billsec") or cdr.get("duration") or 0)
+        if not enter_time:
+            enter_time = _parse_dt(cdr.get("calldate"))
+        shift = _shift_name(enter_time or answer_time, target_date)
+        calls[cid] = {
+            "callid": cid,
+            "queue": queue,
+            "queue_label": QUEUES.get(queue, queue),
+            "did": did or cstr(cdr.get("did") or ""),
+            "caller_raw": phone,
+            "caller": normalize_phone(phone),
+            "enter_time": _fmt_dt(enter_time),
+            "answer_time": _fmt_dt(answer_time),
+            "answered_extension": ans_ext,
+            "answered_employee": _agent_label(ans_ext, _fmt_dt(answer_time or enter_time)) if ans_ext else "",
+            "wait_seconds": wait_seconds if wait_seconds is not None else 0,
+            "talk_seconds": talk_seconds,
+            "duration_seconds": cint(cdr.get("duration") or 0) or (int(((_parse_dt(completes[-1].get("time_text")) if completes else answer_time) - enter_time).total_seconds()) if enter_time and (completes or answer_time) else talk_seconds),
+            "outcome": outcome,
+            "shift": shift,
+            "recording_url": cstr(cdr.get("recording_url") or ""),
+            "recordingfile": cstr(cdr.get("recordingfile") or ""),
+            "ring_misses": [
+                {
+                    "time": _fmt_dt(x.get("time_text")),
+                    "extension": cstr(x.get("agent_ext") or _ext_from_agent(x.get("agent"))),
+                    "employee": _agent_label(cstr(x.get("agent_ext") or _ext_from_agent(x.get("agent"))), x.get("time_text")),
+                    "ring_seconds": round(flt(((x.get("data") or [0])[0] or 0)) / 1000.0, 1) if flt(((x.get("data") or [0])[0] or 0)) > 100 else flt(((x.get("data") or [0])[0] or 0)),
+                }
+                for x in ring_misses
+            ],
+            "cdr_found": bool(cdr),
+        }
+
+    # Add CDR answered queue rows missed by queue_log cache.
+    for r in cdr_rows:
+        cid = cstr(r.get("uniqueid") or "")
+        if not cid or cid in calls:
+            continue
+        ext = _actual_ext_from_cdr(r)
+        if not ext:
+            continue
+        dt = _parse_dt(r.get("calldate"))
+        phone = cstr(r.get("src") or r.get("cnum") or "")
+        calls[cid] = {
+            "callid": cid,
+            "queue": cstr(r.get("dst") or ""),
+            "queue_label": QUEUES.get(cstr(r.get("dst") or ""), cstr(r.get("dst") or "")),
+            "did": "",
+            "caller_raw": phone,
+            "caller": normalize_phone(phone),
+            "enter_time": _fmt_dt(dt),
+            "answer_time": _fmt_dt(dt),
+            "answered_extension": ext,
+            "answered_employee": _agent_label(ext, _fmt_dt(dt)),
+            "wait_seconds": 0,
+            "talk_seconds": cint(r.get("billsec") or r.get("duration") or 0),
+            "duration_seconds": cint(r.get("duration") or r.get("billsec") or 0),
+            "outcome": "answered" if cstr(r.get("disposition")).upper() == "ANSWERED" else "other",
+            "shift": _shift_name(dt, target_date),
+            "recording_url": cstr(r.get("recording_url") or ""),
+            "recordingfile": cstr(r.get("recordingfile") or ""),
+            "ring_misses": [],
+            "cdr_found": True,
+        }
+
+    answered_calls = [c for c in calls.values() if c.get("outcome") == "answered" and c.get("answered_extension")]
+    phones = sorted({c.get("caller") for c in answered_calls if c.get("caller")})
+    seen_map = _historical_seen_map(phones, start_s)
+    for c in answered_calls:
+        h = seen_map.get(c.get("caller") or "") or {}
+        c["new_customer"] = bool(c.get("caller") and not h.get("seen_before"))
+        c["customer_first_seen_before"] = h.get("first_seen") or ""
+        c["customer_previous_count"] = h.get("previous_count") or 0
+
+    by_ext = defaultdict(lambda: {
+        "extension": "", "employee": "", "answered_calls": 0,
+        "orders_calls": 0, "complaints_calls": 0,
+        "morning_calls": 0, "evening_calls": 0,
+        "wait_total": 0, "wait_min": None, "wait_max": 0,
+        "talk_total": 0, "talk_max": 0,
+        "ringnoanswer": 0,
+        "new_customers": 0,
+        "calls": [],
+    })
+    for c in answered_calls:
+        ext = c.get("answered_extension") or ""
+        be = by_ext[ext]
+        be["extension"] = ext
+        be["employee"] = c.get("answered_employee") or _agent_label(ext, c.get("answer_time") or c.get("enter_time"))
+        be["answered_calls"] += 1
+        if c.get("queue") == "1234":
+            be["orders_calls"] += 1
+        elif c.get("queue") == "123":
+            be["complaints_calls"] += 1
+        if c.get("shift") == "صباحي":
+            be["morning_calls"] += 1
+        elif c.get("shift") == "مسائي":
+            be["evening_calls"] += 1
+        w = cint(c.get("wait_seconds") or 0); t = cint(c.get("talk_seconds") or 0)
+        be["wait_total"] += w
+        be["wait_min"] = w if be["wait_min"] is None else min(be["wait_min"], w)
+        be["wait_max"] = max(be["wait_max"], w)
+        be["talk_total"] += t
+        be["talk_max"] = max(be["talk_max"], t)
+        if c.get("new_customer"):
+            be["new_customers"] += 1
+        be["calls"].append(c)
+    for c in calls.values():
+        for m in c.get("ring_misses") or []:
+            ext = m.get("extension") or ""
+            if not ext:
+                continue
+            be = by_ext[ext]
+            be["extension"] = ext
+            if not be["employee"]:
+                be["employee"] = m.get("employee") or _agent_label(ext, m.get("time"))
+            be["ringnoanswer"] += 1
+
+    presence = _load_presence(target_date, start_s, split_s, end_s)
+    for ext, p in (presence.get("by_extension") or {}).items():
+        if ext in by_ext:
+            by_ext[ext].update(p)
+        else:
+            by_ext[ext].update({"extension": ext, "employee": _agent_label(ext)})
+            by_ext[ext].update(p)
+
+    employees = []
+    for ext, be in by_ext.items():
+        n = cint(be.get("answered_calls") or 0)
+        be["avg_wait_seconds"] = round(flt(be.get("wait_total") or 0) / n, 2) if n else 0
+        be["avg_talk_seconds"] = round(flt(be.get("talk_total") or 0) / n, 2) if n else 0
+        be["wait_min"] = be["wait_min"] if be["wait_min"] is not None else 0
+        be["longest_call"] = max(be.get("calls") or [], key=lambda x: cint(x.get("talk_seconds") or 0), default=None)
+        be["calls"] = sorted(be.get("calls") or [], key=lambda x: cstr(x.get("enter_time") or ""), reverse=True)
+        be["grade_note"] = ""
+        employees.append(dict(be))
+    employees.sort(key=lambda x: (-(cint(x.get("answered_calls") or 0)), -(cint(x.get("ringnoanswer") or 0)), cstr(x.get("extension"))))
+
+    morning_exts = {c.get("answered_extension") for c in answered_calls if c.get("shift") == "صباحي" and c.get("answered_extension")}
+    evening_exts = {c.get("answered_extension") for c in answered_calls if c.get("shift") == "مسائي" and c.get("answered_extension")}
+    new_customer_calls = [c for c in answered_calls if c.get("new_customer")]
+    total_wait = sum(cint(c.get("wait_seconds") or 0) for c in answered_calls)
+    total_talk = sum(cint(c.get("talk_seconds") or 0) for c in answered_calls)
+    slowest = max(answered_calls, key=lambda x: cint(x.get("wait_seconds") or 0), default=None)
+    fastest = min(answered_calls, key=lambda x: cint(x.get("wait_seconds") or 999999), default=None)
+    longest = max(answered_calls, key=lambda x: cint(x.get("talk_seconds") or 0), default=None)
+    abandoned_count = len([c for c in calls.values() if c.get("outcome") == "abandoned"])
+    ring_total = sum(len(c.get("ring_misses") or []) for c in calls.values())
+
+    snapshot = {
+        "success": True,
+        "version": "V46",
+        "generated_at": now_datetime().strftime("%Y-%m-%d %H:%M:%S"),
+        "target_date": target_date,
+        "start_dt": start_s,
+        "split_dt": split_s,
+        "end_dt": end_s,
+        "source": {
+            "events_rel_path": events_rel_path,
+            "events_loaded": len(events),
+            "event_counts": dict(event_counts),
+            "queue_event_counts": dict(queue_counts),
+            "cdr_rows": len(cdr_rows),
+            "cdr_error": cdr_error,
+            "presence_available": presence.get("available"),
+            "presence_samples": presence.get("samples"),
+        },
+        "summary": {
+            "employees_count": len([e for e in employees if cint(e.get("answered_calls") or 0) or cint(e.get("ringnoanswer") or 0)]),
+            "answered_calls": len(answered_calls),
+            "orders_calls": len([c for c in answered_calls if c.get("queue") == "1234"]),
+            "complaints_calls": len([c for c in answered_calls if c.get("queue") == "123"]),
+            "abandoned_calls": abandoned_count,
+            "ringnoanswer_attempts": ring_total,
+            "new_customers": len(new_customer_calls),
+            "avg_wait_seconds": round(total_wait / len(answered_calls), 2) if answered_calls else 0,
+            "avg_talk_seconds": round(total_talk / len(answered_calls), 2) if answered_calls else 0,
+            "fastest_answer": fastest,
+            "slowest_answer": slowest,
+            "longest_call": longest,
+            "morning": {
+                "from": start_s,
+                "to": split_s,
+                "answered_calls": len([c for c in answered_calls if c.get("shift") == "صباحي"]),
+                "active_extensions_estimated": len(morning_exts),
+                "peak_online_extensions": presence.get("peak_online_morning"),
+            },
+            "evening": {
+                "from": split_s,
+                "to": end_s,
+                "answered_calls": len([c for c in answered_calls if c.get("shift") == "مسائي"]),
+                "active_extensions_estimated": len(evening_exts),
+                "peak_online_extensions": presence.get("peak_online_evening"),
+            },
+        },
+        "employees": employees,
+        "new_customers": sorted(new_customer_calls, key=lambda x: cstr(x.get("enter_time") or "")),
+        "calls": sorted(answered_calls, key=lambda x: cstr(x.get("enter_time") or ""), reverse=True),
+    }
+    path = _save_snapshot(snapshot, target_date)
+    frappe.db.commit()
+    return {"success": True, "target_date": target_date, "path": path, "summary": snapshot["summary"]}
+
+
+@frappe.whitelist()
+def get_available_dates():
+    _ensure_admin()
+    base = frappe.get_site_path(*BASE_DIR)
+    if not os.path.isdir(base):
+        return {"success": True, "dates": [], "latest_date": ""}
+    dates = []
+    for fn in os.listdir(base):
+        m = re.match(r"employee_performance_(\d{4}-\d{2}-\d{2})\.json$", fn)
+        if m:
+            dates.append(m.group(1))
+    dates = sorted(set(dates), reverse=True)
+    return {"success": True, "dates": dates, "latest_date": dates[0] if dates else ""}
+
+
+@frappe.whitelist()
+def get_dashboard(target_date=None):
+    _ensure_admin()
+    if not target_date:
+        av = get_available_dates()
+        target_date = (av.get("dates") or [""])[0]
+    target_date = cstr(target_date or "")[:10]
+    if not target_date:
+        return {"success": False, "message": "لا توجد snapshots بعد. هتظهر بعد تشغيل توليد التقرير بعد 05:00."}
+    # Hard guard: do not expose current incomplete operational day.
+    try:
+        if datetime.strptime(target_date, "%Y-%m-%d").date() > _last_complete_date():
+            return {"success": False, "message": "بيانات اليوم الحالي لا تظهر إلا بعد نهاية اليوم التشغيلي 05:00."}
+    except Exception:
+        pass
+    path = frappe.get_site_path(*BASE_DIR, f"employee_performance_{target_date}.json")
+    if not os.path.exists(path):
+        return {"success": False, "message": f"لا توجد بيانات محفوظة لتاريخ {target_date}"}
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    data["success"] = True
+    return data
+
+
+@frappe.whitelist()
+def debug_status():
+    _ensure_admin()
+    return {
+        "success": True,
+        "base": frappe.get_site_path(*BASE_DIR),
+        "available_dates": get_available_dates(),
+        "last_complete_date": _last_complete_date().isoformat(),
+        "phone_examples": {
+            "01028567017": normalize_phone("01028567017"),
+            "+201028567017": normalize_phone("+201028567017"),
+            "201028567017": normalize_phone("201028567017"),
+            "0502727789": normalize_phone("0502727789"),
+            "+20502727789": normalize_phone("+20502727789"),
+            "20502727789": normalize_phone("20502727789"),
+        },
+    }
+PYEMP
+
+# -----------------------------------------------------------------------------
+# Hidden watchdog API
+# -----------------------------------------------------------------------------
+echo "🧩 Step 3: Install system_watchdog_api.py"
+cat > "$WATCHDOG_API" <<'PYWATCH'
+# -*- coding: utf-8 -*-
+"""Roshdy hidden system watchdog V46.
+Reads snapshots generated by host script every 5 minutes.
+System Manager only.
+"""
+
+import json
+import os
+from datetime import datetime
+
+import frappe
+from frappe.utils import cstr
+
+BASE_DIR = ("private", "files", "system_watchdog")
+
+
+def _is_system_manager():
+    try:
+        return frappe.session.user == "Administrator" or "System Manager" in set(frappe.get_roles(frappe.session.user))
+    except Exception:
+        return False
+
+
+def _ensure_system_manager():
+    if not _is_system_manager():
+        frappe.throw("System Manager فقط", frappe.PermissionError)
+
+
+def _base(*parts):
+    return frappe.get_site_path(*BASE_DIR, *parts)
+
+
+@frappe.whitelist()
+def get_access():
+    return {"success": True, "is_system_manager": _is_system_manager(), "user": frappe.session.user}
+
+
+@frappe.whitelist()
+def get_dashboard(limit=60):
+    _ensure_system_manager()
+    latest_path = _base("latest.json")
+    if not os.path.exists(latest_path):
+        return {"success": False, "message": "لا توجد قراءة Watchdog V46 بعد. انتظر أول تشغيل للكرون أو شغل السكريبت يدويًا."}
+    with open(latest_path, "r", encoding="utf-8") as f:
+        latest = json.load(f)
+    history = []
+    hist_dir = _base("history")
+    try:
+        if os.path.isdir(hist_dir):
+            files = sorted([x for x in os.listdir(hist_dir) if x.endswith(".jsonl")], reverse=True)[:3]
+            for fn in files:
+                p = os.path.join(hist_dir, fn)
+                with open(p, "r", encoding="utf-8", errors="ignore") as hf:
+                    lines = hf.readlines()[-int(limit or 60):]
+                for line in lines:
+                    try:
+                        history.append(json.loads(line))
+                    except Exception:
+                        pass
+            history = sorted(history, key=lambda x: cstr(x.get("generated_at") or x.get("timestamp") or ""), reverse=True)[:int(limit or 60)]
+    except Exception as e:
+        latest["history_error"] = cstr(e)
+    latest.update({"success": True, "history": history})
+    return latest
+PYWATCH
+
+# -----------------------------------------------------------------------------
+# Employee Performance page
+# -----------------------------------------------------------------------------
+echo "🧩 Step 4: Install /employee-performance page"
+cat > "$EMP_HTML" <<'HTMLEMP'
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>أداء الموظفين | مطعم رشدي</title>
+<style>
+*{box-sizing:border-box;font-family:Tahoma,Arial}body{margin:0;background:#eef2f7;color:#111827;direction:rtl}.top{background:#20262d;color:white;padding:14px 22px;display:flex;justify-content:space-between;gap:10px;align-items:center;border-bottom:4px solid #1F4E79}.top a{color:white;text-decoration:none;border:1px solid #64748b;border-radius:10px;padding:8px 12px}.wrap{padding:22px;max-width:1700px;margin:auto}.panel{background:#fff;border:1px solid #d8dee9;border-radius:16px;box-shadow:0 10px 28px #0001;margin-bottom:16px;overflow:hidden}.head{padding:14px 16px;border-bottom:1px solid #e5e7eb;display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap}.body{padding:16px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;margin-bottom:16px}.card{background:#fff;border:1px solid #ddd;border-right:5px solid #1F4E79;border-radius:12px;padding:12px;min-height:96px}.card.green{border-right-color:#16a34a}.card.red{border-right-color:#dc2626}.card.orange{border-right-color:#f97316}.card.purple{border-right-color:#6f42c1}.lbl{font-size:12px;color:#64748b;font-weight:800}.num{font-size:28px;color:#1F4E79;font-weight:900;margin-top:6px}.hint{font-size:12px;color:#64748b;margin-top:5px}input,select{border:1px solid #cbd5e1;border-radius:10px;padding:9px}.btn{border:0;border-radius:10px;padding:9px 12px;background:#1F4E79;color:#fff;font-weight:900;cursor:pointer;margin:2px}.btn.green{background:#16a34a}.btn.orange{background:#f97316}.btn.red{background:#dc2626}.btn.gray{background:#64748b}.scroll{overflow:auto}.tbl{width:100%;border-collapse:collapse;min-width:1150px;font-size:13px}.tbl th{background:#111827;color:white;padding:9px;border:1px solid #e5e7eb;text-align:right;white-space:nowrap}.tbl td{padding:8px;border:1px solid #e5e7eb;vertical-align:top}.details{display:none;background:#f8fafc;border:1px solid #dbeafe;border-radius:12px;padding:10px;margin-top:8px}.tag{display:inline-block;border-radius:999px;padding:3px 8px;background:#e0f2fe;color:#075985;font-size:12px;font-weight:800}.muted{color:#64748b}.ltr{direction:ltr;text-align:left}.danger{color:#dc2626;font-weight:900}.ok{color:#16a34a;font-weight:900}@media(max-width:900px){.wrap{padding:12px}.tbl{min-width:950px}.top{align-items:flex-start;flex-direction:column}}
+</style>
+</head>
+<body>
+<div class="top"><b>📊 أداء الموظفين — آخر يوم تشغيلي مكتمل</b><div><a href="/admin-desk">Admin Desk</a><a href="/call-report">Call Report</a></div></div>
+<div class="wrap">
+ <div class="panel"><div class="head"><b>الفلاتر</b><span class="muted" id="msg">جاري التحميل...</span></div><div class="body"><div class="grid"><div><label>التاريخ التشغيلي</label><br><select id="dateSel"></select></div><div style="align-self:end"><button class="btn green" onclick="load()">تحديث</button><button class="btn orange" onclick="toggleNewCustomers()">إظهار تفاصيل العملاء الجدد</button><button class="btn gray" onclick="exportCsv()">CSV الموظفين</button></div><div><label>ملاحظة</label><div class="hint">الصفحة لا تعرض بيانات اليوم الحالي إلا بعد 05:00 وتوليد snapshot.</div></div></div></div></div>
+ <div class="cards">
+  <div class="card"><div class="lbl">عدد الموظفين/التحويلات اللي اشتغلوا</div><div class="num" id="cEmployees">0</div></div>
+  <div class="card green"><div class="lbl">مكالمات تم الرد عليها</div><div class="num" id="cAnswered">0</div></div>
+  <div class="card orange"><div class="lbl">متوسط سرعة الرد</div><div class="num" id="cAvgWait">0ث</div></div>
+  <div class="card red"><div class="lbl">أبطأ رد</div><div class="num" id="cSlowest">0ث</div></div>
+  <div class="card purple"><div class="lbl">عملاء جدد مؤكدين</div><div class="num" id="cNew">0</div></div>
+  <div class="card red"><div class="lbl">RINGNOANSWER</div><div class="num" id="cRing">0</div></div>
+  <div class="card"><div class="lbl">أقصى تقدير Active صباحي</div><div class="num" id="cMorning">0</div><div class="hint" id="cMorningHint"></div></div>
+  <div class="card"><div class="lbl">أقصى تقدير Active مسائي</div><div class="num" id="cEvening">0</div><div class="hint" id="cEveningHint"></div></div>
+ </div>
+ <div class="panel"><div class="head"><b>جدول أداء الموظفين</b><span class="muted" id="srcInfo"></span></div><div class="body scroll"><table class="tbl"><thead><tr><th>الموظف</th><th>التحويلة</th><th>إجمالي الردود</th><th>طلبات</th><th>شكاوى</th><th>صباحي</th><th>مسائي</th><th>متوسط الرد</th><th>أسرع رد</th><th>أبطأ رد</th><th>متوسط الكلام</th><th>أطول مكالمة</th><th>RINGNOANSWER</th><th>Online/Offline تقديري</th><th>إجراءات</th></tr></thead><tbody id="empRows"></tbody></table></div></div>
+ <div class="panel" id="newPanel" style="display:none"><div class="head"><b>العملاء الجدد المؤكدين</b><span class="muted">لا تظهر إلا عند الضغط على الزر</span></div><div class="body scroll"><table class="tbl"><thead><tr><th>الوقت</th><th>الرقم الموحد</th><th>الرقم الخام</th><th>النوع</th><th>الموظف</th><th>التحويلة</th><th>مدة المكالمة</th><th>التسجيل</th></tr></thead><tbody id="newRows"></tbody></table></div></div>
+ <div class="panel"><div class="head"><b>تفاصيل مختارة</b><button class="btn gray" onclick="clearDetails()">تفريغ</button></div><div class="body" id="detailsBox"><span class="muted">اضغط على تفاصيل موظف أو أطول مكالمة أو عشوائي.</span></div></div>
+</div>
+<script>
+let DATA=null;
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function sec(s){s=Number(s||0); if(s<60)return Math.round(s)+'ث'; let m=Math.floor(s/60), r=Math.round(s%60); if(m<60)return m+'د '+(r?r+'ث':''); let h=Math.floor(m/60); m=m%60; return h+'س '+m+'د'}
+function qs(o){let p=new URLSearchParams();Object.keys(o||{}).forEach(k=>{let v=o[k];if(v!==undefined&&v!==null&&v!=='')p.append(k,v)});return p.toString()}
+async function api(m,args){let r=await fetch('/api/method/'+m+(args?'?'+qs(args):''),{credentials:'same-origin',cache:'no-store'});let j=await r.json();if(j.exc)throw j;return j.message||j}
+async function guard(){let d=await api('restaurant_ops.api.security_api.get_my_access'); if(!d||!d.is_admin){location.replace((d&&d.redirect_target)||'/agent-desk');return false}return true}
+async function init(){if(!await guard())return; let av=await api('restaurant_ops.api.employee_performance_api.get_available_dates'); dateSel.innerHTML=(av.dates||[]).map(d=>'<option value="'+esc(d)+'">'+esc(d)+'</option>').join(''); if(!(av.dates||[]).length){msg.textContent='لا توجد snapshots بعد — هتظهر بعد 05:00';return} await load();}
+async function load(){msg.textContent='جاري التحميل...'; DATA=await api('restaurant_ops.api.employee_performance_api.get_dashboard',{target_date:dateSel.value}); if(!DATA.success){msg.textContent=DATA.message||'لا توجد بيانات';return} let s=DATA.summary||{}; msg.textContent='آخر توليد: '+(DATA.generated_at||''); cEmployees.textContent=s.employees_count||0; cAnswered.textContent=s.answered_calls||0; cAvgWait.textContent=sec(s.avg_wait_seconds); cSlowest.textContent=sec((s.slowest_answer||{}).wait_seconds); cNew.textContent=s.new_customers||0; cRing.textContent=s.ringnoanswer_attempts||0; cMorning.textContent=((s.morning||{}).peak_online_extensions ?? (s.morning||{}).active_extensions_estimated ?? 0); cEvening.textContent=((s.evening||{}).peak_online_extensions ?? (s.evening||{}).active_extensions_estimated ?? 0); cMorningHint.textContent=(s.morning&&s.morning.peak_online_extensions!=null)?'من sampler كل 5 دقايق':'تقدير من المكالمات'; cEveningHint.textContent=(s.evening&&s.evening.peak_online_extensions!=null)?'من sampler كل 5 دقايق':'تقدير من المكالمات'; srcInfo.textContent='Events: '+((DATA.source||{}).events_loaded||0)+' | CDR rows: '+((DATA.source||{}).cdr_rows||0)+' | Presence: '+(((DATA.source||{}).presence_available)?'متاح':'غير متاح/هيبدأ من بعد التركيب'); renderEmployees(); renderNew();}
+function renderEmployees(){let rows=DATA.employees||[]; empRows.innerHTML=rows.map((e,i)=>{let online=e.online_minutes_est!=null?('<span class="ok">ON '+sec((e.online_minutes_est||0)*60)+'</span><br><span class="danger">OFF '+sec((e.offline_minutes_est||0)*60)+'</span>'):'<span class="muted">هيبدأ من بعد التركيب</span>'; let longest=e.longest_call||{}; return '<tr><td><b>'+esc(e.employee||'')+'</b></td><td class="ltr">'+esc(e.extension||'')+'</td><td>'+esc(e.answered_calls||0)+'</td><td>'+esc(e.orders_calls||0)+'</td><td>'+esc(e.complaints_calls||0)+'</td><td>'+esc(e.morning_calls||0)+'</td><td>'+esc(e.evening_calls||0)+'</td><td>'+sec(e.avg_wait_seconds)+'</td><td>'+sec(e.wait_min)+'</td><td>'+sec(e.wait_max)+'</td><td>'+sec(e.avg_talk_seconds)+'</td><td>'+sec(e.talk_max)+'</td><td class="'+((e.ringnoanswer||0)>0?'danger':'ok')+'">'+esc(e.ringnoanswer||0)+'</td><td>'+online+'</td><td><button class="btn" onclick="showEmp('+i+')">تفاصيل</button><button class="btn orange" onclick="showLongest('+i+')">أطول</button><button class="btn gray" onclick="showRandom('+i+')">عشوائي</button></td></tr>'}).join('')||'<tr><td colspan="15" class="muted">لا توجد بيانات</td></tr>'}
+function callRow(c){let rec=c.recording_url?'<a href="'+esc(c.recording_url)+'" target="_blank">🎧 سماع</a>':'-';return '<tr><td>'+esc(c.enter_time)+'</td><td>'+esc(c.queue_label||c.queue)+'</td><td class="ltr">'+esc(c.caller)+'</td><td>'+esc(c.caller_raw||'')+'</td><td>'+sec(c.wait_seconds)+'</td><td>'+sec(c.talk_seconds)+'</td><td>'+esc(c.shift)+'</td><td>'+rec+'</td></tr>'}
+function showEmp(i){let e=(DATA.employees||[])[i]||{}; detailsBox.innerHTML='<h3>'+esc(e.employee)+' — '+esc(e.extension)+'</h3><div class="scroll"><table class="tbl"><thead><tr><th>الوقت</th><th>النوع</th><th>الرقم الموحد</th><th>الرقم الخام</th><th>سرعة الرد</th><th>مدة الكلام</th><th>الشيفت</th><th>التسجيل</th></tr></thead><tbody>'+(e.calls||[]).map(callRow).join('')+'</tbody></table></div>'}
+function showLongest(i){let e=(DATA.employees||[])[i]||{}; let c=e.longest_call; if(!c){detailsBox.innerHTML='لا توجد مكالمات';return} detailsBox.innerHTML='<h3>أطول مكالمة — '+esc(e.employee)+'</h3><div class="scroll"><table class="tbl"><tbody>'+callRow(c)+'</tbody></table></div>'}
+function showRandom(i){let e=(DATA.employees||[])[i]||{}; let a=e.calls||[]; if(!a.length){detailsBox.innerHTML='لا توجد مكالمات';return} let c=a[Math.floor(Math.random()*a.length)]; detailsBox.innerHTML='<h3>مكالمة عشوائية — '+esc(e.employee)+'</h3><div class="scroll"><table class="tbl"><tbody>'+callRow(c)+'</tbody></table></div>'}
+function clearDetails(){detailsBox.innerHTML='<span class="muted">اضغط على تفاصيل موظف أو أطول مكالمة أو عشوائي.</span>'}
+function toggleNewCustomers(){newPanel.style.display=(newPanel.style.display==='none'?'block':'none')}
+function renderNew(){let rows=DATA.new_customers||[]; newRows.innerHTML=rows.map(c=>'<tr><td>'+esc(c.enter_time)+'</td><td class="ltr">'+esc(c.caller)+'</td><td>'+esc(c.caller_raw||'')+'</td><td>'+esc(c.queue_label||c.queue)+'</td><td>'+esc(c.answered_employee)+'</td><td class="ltr">'+esc(c.answered_extension)+'</td><td>'+sec(c.talk_seconds)+'</td><td>'+(c.recording_url?'<a target="_blank" href="'+esc(c.recording_url)+'">🎧 سماع</a>':'-')+'</td></tr>').join('')||'<tr><td colspan="8" class="muted">لا يوجد عملاء جدد مؤكدين</td></tr>'}
+function exportCsv(){if(!DATA)return; let h=['employee','extension','answered','orders','complaints','morning','evening','avg_wait','max_wait','avg_talk','ringnoanswer','new_customers']; let lines=[h.join(',')].concat((DATA.employees||[]).map(e=>[e.employee,e.extension,e.answered_calls,e.orders_calls,e.complaints_calls,e.morning_calls,e.evening_calls,e.avg_wait_seconds,e.wait_max,e.avg_talk_seconds,e.ringnoanswer,e.new_customers].map(x=>'"'+String(x??'').replace(/"/g,'""')+'"').join(','))); let blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'}); let a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='employee-performance-'+(DATA.target_date||'')+'.csv';a.click()}
+init();
+</script>
+</body>
+</html>
+HTMLEMP
+cat > "$EMP_PY" <<'PYPG'
+no_cache = 1
+PYPG
+
+# -----------------------------------------------------------------------------
+# Hidden Watchdog page
+# -----------------------------------------------------------------------------
+echo "🧩 Step 5: Install hidden /watchdog page"
+cat > "$WATCHDOG_HTML" <<'HTMLWATCH'
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Watchdog | Roshdy</title>
+<style>
+*{box-sizing:border-box;font-family:Tahoma,Arial}body{margin:0;background:#0f172a;color:#e5e7eb;direction:rtl}.top{background:#020617;color:white;padding:14px 22px;display:flex;justify-content:space-between;align-items:center;border-bottom:4px solid #38bdf8}.top a{color:white;text-decoration:none;border:1px solid #334155;border-radius:10px;padding:8px 12px}.wrap{padding:22px;max-width:1600px;margin:auto}.panel{background:#111827;border:1px solid #334155;border-radius:16px;margin-bottom:16px;overflow:hidden;box-shadow:0 12px 35px #0004}.head{padding:14px 16px;border-bottom:1px solid #334155;display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap}.body{padding:16px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px}.card{background:#020617;border:1px solid #334155;border-right:5px solid #38bdf8;border-radius:12px;padding:12px}.card.ok{border-right-color:#22c55e}.card.warn{border-right-color:#f97316}.card.bad{border-right-color:#ef4444}.lbl{font-size:12px;color:#94a3b8;font-weight:800}.num{font-size:26px;font-weight:900;color:#e0f2fe;margin-top:6px}.btn{border:0;border-radius:10px;padding:9px 12px;background:#0284c7;color:#fff;font-weight:900;cursor:pointer}.tbl{width:100%;border-collapse:collapse;min-width:900px}.tbl th{background:#020617;color:#fff;padding:9px;border:1px solid #334155;text-align:right}.tbl td{padding:8px;border:1px solid #334155}.scroll{overflow:auto}.oktxt{color:#22c55e;font-weight:900}.warntxt{color:#f97316;font-weight:900}.badtxt{color:#ef4444;font-weight:900}.muted{color:#94a3b8}.ltr{direction:ltr;text-align:left}pre{direction:ltr;text-align:left;white-space:pre-wrap;background:#020617;border:1px solid #334155;border-radius:12px;padding:12px;max-height:340px;overflow:auto}
+</style>
+</head>
+<body>
+<div class="top"><b>🛡️ Watchdog — System Manager Only</b><div><a href="/admin-desk">Admin Desk</a></div></div>
+<div class="wrap">
+ <div class="panel"><div class="head"><b>آخر حالة</b><button class="btn" onclick="load()">تحديث الآن</button></div><div class="body"><div class="cards">
+  <div class="card" id="statusCard"><div class="lbl">Overall</div><div class="num" id="overall">...</div><div class="muted" id="gen"></div></div>
+  <div class="card"><div class="lbl">SIP Retransmissions آخر 60 دقيقة</div><div class="num" id="retrans">0</div></div>
+  <div class="card"><div class="lbl">Missing audio warnings</div><div class="num" id="audio">0</div></div>
+  <div class="card"><div class="lbl">CDR/AMI/Queue القديم</div><div class="num" id="oldStatus">...</div></div>
+ </div></div></div>
+ <div class="panel"><div class="head"><b>الترانكات</b><span class="muted">قراءة من full log كل 5 دقايق — Read Only</span></div><div class="body scroll"><table class="tbl"><thead><tr><th>Trunk</th><th>آخر حالة</th><th>Reachable</th><th>Lagged</th><th>Unreachable</th><th>آخر حدث</th></tr></thead><tbody id="trunks"></tbody></table></div></div>
+ <div class="panel"><div class="head"><b>ملفات الصوت / IVR</b></div><div class="body scroll"><table class="tbl"><thead><tr><th>Pattern</th><th>Count آخر 60 دقيقة</th></tr></thead><tbody id="audios"></tbody></table></div></div>
+ <div class="panel"><div class="head"><b>History</b><span class="muted">آخر قراءات محفوظة</span></div><div class="body scroll"><table class="tbl"><thead><tr><th>الوقت</th><th>Status</th><th>Retrans</th><th>Audio</th><th>Old Watchdog</th></tr></thead><tbody id="hist"></tbody></table></div></div>
+ <div class="panel"><div class="head"><b>Raw</b></div><div class="body"><pre id="raw"></pre></div></div>
+</div>
+<script>
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+async function api(m){let r=await fetch('/api/method/'+m,{credentials:'same-origin',cache:'no-store'});let j=await r.json();if(j.exc)throw j;return j.message||j}
+async function guard(){let d=await api('restaurant_ops.api.system_watchdog_api.get_access'); if(!d.is_system_manager){document.body.innerHTML='<div style="padding:30px">غير مسموح — System Manager فقط</div>';return false}return true}
+function cls(st){st=String(st||'').toUpperCase();return st==='OK'?'oktxt':(st==='CRITICAL'?'badtxt':'warntxt')}
+async function load(){try{let d=await api('restaurant_ops.api.system_watchdog_api.get_dashboard'); if(!d.success){overall.textContent=d.message||'NO DATA';return} overall.textContent=d.status||'UNKNOWN'; statusCard.className='card '+((d.status==='OK')?'ok':(d.status==='CRITICAL'?'bad':'warn')); gen.textContent=d.generated_at||''; retrans.textContent=(d.sip_retransmissions||{}).last_60m||0; let ac=0; Object.values(d.missing_audio||{}).forEach(v=>ac+=Number(v||0)); audio.textContent=ac; oldStatus.textContent=(d.old_watchdog||{}).status||'N/A'; let tr=d.trunks||{}; trunks.innerHTML=Object.keys(tr).sort().map(k=>'<tr><td class="ltr">'+esc(k)+'</td><td class="'+cls(tr[k].last_state)+'">'+esc(tr[k].last_state||'')+'</td><td>'+esc(tr[k].reachable||0)+'</td><td>'+esc(tr[k].lagged||0)+'</td><td>'+esc(tr[k].unreachable||0)+'</td><td>'+esc(tr[k].last_event_time||'')+'</td></tr>').join(''); let ma=d.missing_audio||{}; audios.innerHTML=Object.keys(ma).map(k=>'<tr><td class="ltr">'+esc(k)+'</td><td>'+esc(ma[k])+'</td></tr>').join('')||'<tr><td colspan="2" class="muted">لا توجد</td></tr>'; hist.innerHTML=(d.history||[]).map(x=>'<tr><td>'+esc(x.generated_at||'')+'</td><td class="'+cls(x.status)+'">'+esc(x.status||'')+'</td><td>'+esc(((x.sip_retransmissions||{}).last_60m)||0)+'</td><td>'+esc(Object.values(x.missing_audio||{}).reduce((a,b)=>a+Number(b||0),0))+'</td><td>'+esc((x.old_watchdog||{}).status||'')+'</td></tr>').join(''); raw.textContent=JSON.stringify(d,null,2);}catch(e){overall.textContent='ERROR';raw.textContent=String(e)}}
+(async function(){if(await guard()){await load();setInterval(load,300000)}})();
+</script>
+</body>
+</html>
+HTMLWATCH
+cat > "$WATCHDOG_PY" <<'PYPG'
+no_cache = 1
+PYPG
+
+# -----------------------------------------------------------------------------
+# Host employee performance generator
+# -----------------------------------------------------------------------------
+echo "🧩 Step 6: Install host employee performance generator"
+cat > "$EMP_SCRIPT" <<'SHEMP'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+CONF_FILE="${CONF_FILE:-/opt/frappe_crm/queue_journey.conf}"
+[[ -f "$CONF_FILE" ]] && source "$CONF_FILE"
+
+ELASTIX_SSH="${ELASTIX_SSH:-root@10.11.1.253}"
+QUEUE_LOG="${QUEUE_LOG:-/var/log/asterisk/queue_log}"
+QUEUES="${QUEUES:-1234,123}"
+MAX_LINES="${MAX_LINES:-700000}"
+SSH_KEY="${SSH_KEY:-/root/.ssh/id_rsa_roshdy_queue_journey}"
+PASSWORD_FILE="${PASSWORD_FILE:-/root/.roshdy_elastix_root.pass}"
+TARGET_DATE="${TARGET_DATE:-$(date -d 'yesterday' +%F)}"
+
+HOST_BASE="$ROOT/sites/$SITE/private/files/employee_performance"
+CONT_BASE="/home/frappe/frappe-bench/sites/$SITE/private/files/employee_performance"
+RUN_ID="$(date +%Y%m%d_%H%M%S)_$TARGET_DATE"
+RUN_DIR="$HOST_BASE/runs/$RUN_ID"
+RAW_LOG="$RUN_DIR/queue_log_raw.txt"
+EVENTS_JSON="$RUN_DIR/queue_events.json"
+mkdir -p "$RUN_DIR" "$HOST_BASE"
+
+cd "$ROOT"
+if docker compose version >/dev/null 2>&1; then COMPOSE=(docker compose); else COMPOSE=(docker-compose); fi
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then echo "backend container not found" >&2; exit 1; fi
+bench_exec(){ "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"; }
+
+START_EPOCH="$(date -d "$TARGET_DATE 10:00:00" +%s)"
+END_EPOCH="$(date -d "$TARGET_DATE +1 day 05:00:00" +%s)"
+START_TXT="$(date -d "@$START_EPOCH" '+%F %T')"
+END_TXT="$(date -d "@$END_EPOCH" '+%F %T')"
+
+SSH_OPTS=(-o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/root/.ssh/known_hosts)
+if [[ -n "$SSH_KEY" && -f "$SSH_KEY" ]]; then
+  SSH_OPTS=(-i "$SSH_KEY" -o IdentitiesOnly=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/root/.ssh/known_hosts -o PreferredAuthentications=publickey -o BatchMode=yes)
+fi
+ssh_remote_to_stdout(){
+  local remote_cmd="$1"
+  if ssh "${SSH_OPTS[@]}" "$ELASTIX_SSH" "$remote_cmd"; then return 0; fi
+  if [[ -n "$PASSWORD_FILE" && -f "$PASSWORD_FILE" ]] && command -v sshpass >/dev/null 2>&1; then
+    sshpass -f "$PASSWORD_FILE" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$ELASTIX_SSH" "$remote_cmd"
+    return $?
+  fi
+  return 1
+}
+
+echo "[$(date '+%F %T')] V46 employee performance target=$TARGET_DATE window=$START_TXT -> $END_TXT"
+# Read-only. Tail + awk on Elastix, no writes.
+REMOTE_CMD="tail -n '$MAX_LINES' '$QUEUE_LOG' | awk -F'|' -v s='$START_EPOCH' -v e='$END_EPOCH' 'BEGIN{split(\"$QUEUES\",q,\",\"); for(i in q) allow[q[i]]=1} (\$1>=s && \$1<e && allow[\$3]) {print}'"
+ssh_remote_to_stdout "$REMOTE_CMD" > "$RAW_LOG"
+
+python3 - "$RAW_LOG" "$EVENTS_JSON" "$TARGET_DATE" "$START_EPOCH" "$END_EPOCH" <<'PY'
+import sys,json,re,datetime
+raw,out,target,start,end=sys.argv[1],sys.argv[2],sys.argv[3],int(sys.argv[4]),int(sys.argv[5])
+def ext(agent):
+    agent=str(agent or '')
+    for pat in (r'(?:Local|SIP|PJSIP|Agent)/(\d{3,6})', r'^(\d{3,6})$', r'\b(\d{3,6})\b'):
+        m=re.search(pat,agent,re.I)
+        if m and m.group(1) not in ('123','1234'): return m.group(1)
+    return ''
+events=[]
+with open(raw,'r',errors='ignore') as f:
+    for line in f:
+        line=line.rstrip('\n')
+        if not line: continue
+        p=line.split('|')
+        if len(p)<5: continue
+        try: t=int(float(p[0]))
+        except Exception: continue
+        if not (start<=t<end): continue
+        events.append({'time_epoch':t,'time_text':datetime.datetime.fromtimestamp(t).strftime('%Y-%m-%d %H:%M:%S'),'callid':p[1],'queue':p[2],'agent':p[3],'agent_ext':ext(p[3]),'event':p[4],'data':p[5:],'raw':line})
+obj={'target_date':target,'generated_at':datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),'start_epoch':start,'end_epoch':end,'events':events}
+with open(out,'w',encoding='utf-8') as fh: json.dump(obj,fh,ensure_ascii=False,indent=2)
+print('events',len(events),'out',out)
+PY
+
+# Copy events JSON into backend container because Frappe reads container site path.
+"${COMPOSE[@]}" exec -T backend mkdir -p "$CONT_BASE/runs/$RUN_ID"
+"${COMPOSE[@]}" cp "$EVENTS_JSON" "backend:$CONT_BASE/runs/$RUN_ID/queue_events.json" 2>/dev/null || docker cp "$EVENTS_JSON" "$BACKEND:$CONT_BASE/runs/$RUN_ID/queue_events.json"
+"${COMPOSE[@]}" exec -T backend chmod -R a+rX "$CONT_BASE" || true
+
+KWARGS="$(python3 - <<PY
+import json
+print(json.dumps({'target_date':'$TARGET_DATE','events_rel_path':'employee_performance/runs/$RUN_ID/queue_events.json'}, ensure_ascii=False))
+PY
+)"
+bench_exec execute restaurant_ops.api.employee_performance_api.build_snapshot_from_queue_events --kwargs "$KWARGS" | tee "$RUN_DIR/build_output.txt"
+
+# Copy generated snapshot back to host for backup/visibility; page uses container copy.
+"${COMPOSE[@]}" cp "backend:$CONT_BASE/employee_performance_${TARGET_DATE}.json" "$HOST_BASE/employee_performance_${TARGET_DATE}.json" 2>/dev/null || docker cp "$BACKEND:$CONT_BASE/employee_performance_${TARGET_DATE}.json" "$HOST_BASE/employee_performance_${TARGET_DATE}.json" 2>/dev/null || true
+"${COMPOSE[@]}" cp "backend:$CONT_BASE/latest.json" "$HOST_BASE/latest.json" 2>/dev/null || docker cp "$BACKEND:$CONT_BASE/latest.json" "$HOST_BASE/latest.json" 2>/dev/null || true
+chmod -R a+rX "$HOST_BASE" || true
+
+# Clean temporary caches; keep daily snapshots.
+find "$HOST_BASE/runs" -mindepth 1 -maxdepth 1 -type d -mtime +7 -exec rm -rf --one-file-system {} + 2>/dev/null || true
+"${COMPOSE[@]}" exec -T backend bash -lc "find '$CONT_BASE/runs' -mindepth 1 -maxdepth 1 -type d -mtime +7 -exec rm -rf --one-file-system {} + 2>/dev/null || true" || true
+find "$HOST_BASE" -maxdepth 1 -name 'employee_performance_*.json' -type f -mtime +180 -delete 2>/dev/null || true
+
+echo "[$(date '+%F %T')] DONE employee performance $TARGET_DATE"
+SHEMP
+chmod +x "$EMP_SCRIPT"
+
+# -----------------------------------------------------------------------------
+# Host system watchdog collector
+# -----------------------------------------------------------------------------
+echo "🧩 Step 7: Install host watchdog collector"
+cat > "$WATCHDOG_SCRIPT" <<'SHWATCH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+CONF_FILE="${CONF_FILE:-/opt/frappe_crm/queue_journey.conf}"
+[[ -f "$CONF_FILE" ]] && source "$CONF_FILE"
+
+ELASTIX_SSH="${ELASTIX_SSH:-root@10.11.1.253}"
+FULL_LOG="${FULL_LOG:-/var/log/asterisk/full}"
+FULL_TAIL_LINES="${FULL_TAIL_LINES:-60000}"
+SSH_KEY="${SSH_KEY:-/root/.ssh/id_rsa_roshdy_queue_journey}"
+PASSWORD_FILE="${PASSWORD_FILE:-/root/.roshdy_elastix_root.pass}"
+
+HOST_SW_BASE="$ROOT/sites/$SITE/private/files/system_watchdog"
+CONT_SW_BASE="/home/frappe/frappe-bench/sites/$SITE/private/files/system_watchdog"
+HOST_EP_BASE="$ROOT/sites/$SITE/private/files/employee_performance"
+CONT_EP_BASE="/home/frappe/frappe-bench/sites/$SITE/private/files/employee_performance"
+RUN_ID="$(date +%Y%m%d_%H%M%S)"
+RUN_DIR="$HOST_SW_BASE/runs/$RUN_ID"
+TMP_FULL="$RUN_DIR/full_tail.txt"
+TMP_PEERS="$RUN_DIR/sip_show_peers.txt"
+mkdir -p "$RUN_DIR" "$HOST_SW_BASE/history" "$HOST_EP_BASE/presence"
+
+cd "$ROOT"
+if docker compose version >/dev/null 2>&1; then COMPOSE=(docker compose); else COMPOSE=(docker-compose); fi
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+
+SSH_OPTS=(-o ConnectTimeout=8 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/root/.ssh/known_hosts)
+if [[ -n "$SSH_KEY" && -f "$SSH_KEY" ]]; then
+  SSH_OPTS=(-i "$SSH_KEY" -o IdentitiesOnly=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/root/.ssh/known_hosts -o PreferredAuthentications=publickey -o BatchMode=yes)
+fi
+ssh_remote_to_stdout(){
+  local remote_cmd="$1"
+  if ssh "${SSH_OPTS[@]}" "$ELASTIX_SSH" "$remote_cmd"; then return 0; fi
+  if [[ -n "$PASSWORD_FILE" && -f "$PASSWORD_FILE" ]] && command -v sshpass >/dev/null 2>&1; then
+    sshpass -f "$PASSWORD_FILE" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=8 "$ELASTIX_SSH" "$remote_cmd"
+    return $?
+  fi
+  return 1
+}
+
+ssh_remote_to_stdout "tail -n '$FULL_TAIL_LINES' '$FULL_LOG'" > "$TMP_FULL" 2> "$RUN_DIR/full_fetch.err" || true
+ssh_remote_to_stdout "asterisk -rx 'sip show peers'" > "$TMP_PEERS" 2> "$RUN_DIR/peers_fetch.err" || true
+
+OLD_STATUS_FILE="$ROOT/logs/elastix_watchdog_status.json"
+OLD_STATUS_JSON="{}"
+[[ -f "$OLD_STATUS_FILE" ]] && OLD_STATUS_JSON="$(cat "$OLD_STATUS_FILE" 2>/dev/null || echo '{}')"
+
+python3 - "$TMP_FULL" "$TMP_PEERS" "$HOST_SW_BASE" "$HOST_EP_BASE" "$OLD_STATUS_JSON" <<'PY'
+import sys,json,re,os,datetime
+full_path, peers_path, sw_base, ep_base, old_status_raw = sys.argv[1:6]
+now=datetime.datetime.now(); cutoff60=now-datetime.timedelta(minutes=60); cutoff15=now-datetime.timedelta(minutes=15)
+try: old=json.loads(old_status_raw)
+except Exception: old={}
+trunk_names=['SIP_TRUNK_TEdata','trunk_to_cisco','trunk_to_yeastar']
+trunks={t:{'reachable':0,'lagged':0,'unreachable':0,'last_state':'UNKNOWN','last_event_time':''} for t in trunk_names}
+missing_audio={'custom/roshdy_cairo_welcome':0,'no-valid-responce-transfering':0,'wav_roshdy_waiting':0}
+retrans60=0; retrans15=0; broken_pipe=0; cdr_warnings=0; lines60=0
+rx_dt=re.compile(r'^\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]')
+rx_peer=re.compile(r"Peer '([^']+)' is now (Reachable|UNREACHABLE|Lagged)", re.I)
+try:
+    with open(full_path,'r',errors='ignore') as f:
+        for line in f:
+            m=rx_dt.search(line)
+            if not m: continue
+            try: dt=datetime.datetime.strptime(m.group(1),'%Y-%m-%d %H:%M:%S')
+            except Exception: continue
+            if dt < cutoff60: continue
+            lines60 += 1
+            pm=rx_peer.search(line)
+            if pm and pm.group(1) in trunks:
+                t=pm.group(1); st=pm.group(2).upper()
+                if st=='REACHABLE': trunks[t]['reachable'] += 1; trunks[t]['last_state']='OK'
+                elif st=='UNREACHABLE': trunks[t]['unreachable'] += 1; trunks[t]['last_state']='CRITICAL'
+                elif st=='LAGGED': trunks[t]['lagged'] += 1; trunks[t]['last_state']='WARNING'
+                trunks[t]['last_event_time']=dt.strftime('%Y-%m-%d %H:%M:%S')
+            if 'Retransmission timeout reached' in line:
+                retrans60 += 1
+                if dt >= cutoff15: retrans15 += 1
+            for k in list(missing_audio):
+                if k in line: missing_audio[k] += 1
+            if 'Broken pipe' in line: broken_pipe += 1
+            if 'res_odbc' in line or 'cdr_mysql' in line or 'asteriskcdrdb' in line:
+                if 'WARNING' in line or 'ERROR' in line: cdr_warnings += 1
+except Exception as e:
+    full_error=str(e)
+else:
+    full_error=None
+# Presence sample from sip show peers
+extensions={}; online=[]
+try:
+    with open(peers_path,'r',errors='ignore') as f:
+        for line in f:
+            m=re.match(r'^(\d{3,6})(?:/\d{3,6})?\s+', line.strip())
+            if not m: continue
+            ext=m.group(1)
+            status='UNKNOWN'
+            sm=re.search(r'\b(OK \([^)]*\)|UNKNOWN|UNREACHABLE|Lagged \([^)]*\))', line, re.I)
+            if sm: status=sm.group(1)
+            extensions[ext]=status
+            if status.upper().startswith('OK'):
+                online.append(ext)
+except Exception:
+    pass
+presence={'timestamp':now.strftime('%Y-%m-%d %H:%M:%S'),'extensions':extensions,'online':sorted(online)}
+os.makedirs(os.path.join(ep_base,'presence'),exist_ok=True)
+pres_file=os.path.join(ep_base,'presence',now.strftime('%Y-%m-%d')+'.jsonl')
+with open(pres_file,'a',encoding='utf-8') as pf: pf.write(json.dumps(presence,ensure_ascii=False)+'\n')
+status='OK'
+if old.get('status') and old.get('status')!='OK': status='CRITICAL'
+if any(v['unreachable']>0 for v in trunks.values()) or retrans15>20: status='CRITICAL'
+elif any(v['lagged']>0 for v in trunks.values()) or retrans60>0 or any(missing_audio.values()): status='WARNING'
+obj={'success':True,'generated_at':now.strftime('%Y-%m-%d %H:%M:%S'),'status':status,'old_watchdog':old,'trunks':trunks,'sip_retransmissions':{'last_15m':retrans15,'last_60m':retrans60},'missing_audio':missing_audio,'cdr_warnings_last_60m':cdr_warnings,'broken_pipe_last_60m':broken_pipe,'full_lines_scanned_last_60m':lines60,'full_fetch_error':full_error,'presence':{'online_count':len(online),'total_extensions':len(extensions),'online':sorted(online)}}
+os.makedirs(sw_base,exist_ok=True); os.makedirs(os.path.join(sw_base,'history'),exist_ok=True)
+open(os.path.join(sw_base,'latest.json'),'w',encoding='utf-8').write(json.dumps(obj,ensure_ascii=False,indent=2))
+hist=os.path.join(sw_base,'history',now.strftime('%Y-%m-%d')+'.jsonl')
+with open(hist,'a',encoding='utf-8') as hf: hf.write(json.dumps(obj,ensure_ascii=False)+'\n')
+print(json.dumps({'status':status,'generated_at':obj['generated_at'],'retrans60':retrans60,'online':len(online)},ensure_ascii=False))
+PY
+
+chmod -R a+rX "$HOST_SW_BASE" "$HOST_EP_BASE" || true
+if [[ -n "${BACKEND:-}" ]]; then
+  "${COMPOSE[@]}" exec -T backend mkdir -p "$CONT_SW_BASE/history" "$CONT_EP_BASE/presence" || true
+  "${COMPOSE[@]}" cp "$HOST_SW_BASE/latest.json" "backend:$CONT_SW_BASE/latest.json" 2>/dev/null || docker cp "$HOST_SW_BASE/latest.json" "$BACKEND:$CONT_SW_BASE/latest.json" 2>/dev/null || true
+  TODAY="$(date +%F)"
+  "${COMPOSE[@]}" cp "$HOST_SW_BASE/history/$TODAY.jsonl" "backend:$CONT_SW_BASE/history/$TODAY.jsonl" 2>/dev/null || docker cp "$HOST_SW_BASE/history/$TODAY.jsonl" "$BACKEND:$CONT_SW_BASE/history/$TODAY.jsonl" 2>/dev/null || true
+  "${COMPOSE[@]}" cp "$HOST_EP_BASE/presence/$TODAY.jsonl" "backend:$CONT_EP_BASE/presence/$TODAY.jsonl" 2>/dev/null || docker cp "$HOST_EP_BASE/presence/$TODAY.jsonl" "$BACKEND:$CONT_EP_BASE/presence/$TODAY.jsonl" 2>/dev/null || true
+  "${COMPOSE[@]}" exec -T backend chmod -R a+rX "$CONT_SW_BASE" "$CONT_EP_BASE" || true
+fi
+# cleanup watchdog caches and history older than 7 days
+find "$HOST_SW_BASE/runs" -mindepth 1 -maxdepth 1 -type d -mtime +2 -exec rm -rf --one-file-system {} + 2>/dev/null || true
+find "$HOST_SW_BASE/history" -type f -name '*.jsonl' -mtime +7 -delete 2>/dev/null || true
+find "$HOST_EP_BASE/presence" -type f -name '*.jsonl' -mtime +14 -delete 2>/dev/null || true
+SHWATCH
+chmod +x "$WATCHDOG_SCRIPT"
+
+# -----------------------------------------------------------------------------
+# Patch admin desk card/sidebar safely
+# -----------------------------------------------------------------------------
+echo "🧩 Step 8: Patch admin-desk original page"
+python3 - <<'PYPATCH'
+from pathlib import Path
+p=Path('/opt/frappe_crm/apps/restaurant_ops/restaurant_ops/www/admin-desk.html')
+s=p.read_text(encoding='utf-8',errors='ignore')
+# Remove old V46 blocks if any.
+for a,b in [
+    ('<!-- BEGIN ROSHDY EMP PERF LINK V46 -->','<!-- END ROSHDY EMP PERF LINK V46 -->'),
+    ('<!-- BEGIN ROSHDY EMP PERF CARD V46 -->','<!-- END ROSHDY EMP PERF CARD V46 -->'),
+]:
+    while a in s and b in s:
+        i=s.index(a); j=s.index(b,i)+len(b); s=s[:i]+s[j:]
+link='''
+<!-- BEGIN ROSHDY EMP PERF LINK V46 -->
+<a href="/employee-performance"><b>📊</b> <span>أداء الموظفين</span></a>
+<!-- END ROSHDY EMP PERF LINK V46 -->
+'''
+card='''
+<!-- BEGIN ROSHDY EMP PERF CARD V46 -->
+<a href="/employee-performance" class="mod-card"><div class="icon">📊</div><div class="lbl">أداء الموظفين</div><div class="desc">تقييم التحويلات والردود والعملاء الجدد</div></a>
+<!-- END ROSHDY EMP PERF CARD V46 -->
+'''
+# Sidebar after call report link.
+needle='<a href="/call-report"><b>📞</b> <span>تقرير المكالمات</span></a>'
+if needle in s:
+    s=s.replace(needle, needle+'\n'+link, 1)
+# Card before feedback admin or closing cards section.
+needle2='<a href="/feedback-admin" class="mod-card"'
+if needle2 in s:
+    idx=s.index(needle2)
+    s=s[:idx]+card+'\n'+s[idx:]
+else:
+    idx=s.find('</section>', s.find('class="cards-grid"'))
+    if idx!=-1:
+        s=s[:idx]+card+'\n'+s[idx:]
+    else:
+        s += '\n'+card+'\n'
+p.write_text(s,encoding='utf-8')
+PYPATCH
+
+# -----------------------------------------------------------------------------
+# Cron jobs
+# -----------------------------------------------------------------------------
+echo "🧩 Step 9: Install cron jobs"
+cat > "$CRON_EMP" <<EOF
+# Roshdy V46 employee performance snapshot - runs after complete operational day ends at 05:00
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+20 5 * * * root cd $ROOT && $EMP_SCRIPT >> $ROOT/logs/employee_performance_v46.log 2>&1
+EOF
+cat > "$CRON_WATCHDOG" <<EOF
+# Roshdy V46 hidden watchdog collector - read only every 5 minutes
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+*/5 * * * * root cd $ROOT && $WATCHDOG_SCRIPT >> $ROOT/logs/system_watchdog_v46.log 2>&1
+EOF
+chmod 0644 "$CRON_EMP" "$CRON_WATCHDOG"
+
+# Ownership and syntax validation.
+echo "🧪 Step 10: Syntax validation"
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+[[ -n "$APP_OWNER" ]] && chown "$APP_OWNER" "$EMP_API" "$WATCHDOG_API" "$EMP_HTML" "$EMP_PY" "$WATCHDOG_HTML" "$WATCHDOG_PY" "$ADMIN_HTML" 2>/dev/null || true
+bash -n "$EMP_SCRIPT"
+bash -n "$WATCHDOG_SCRIPT"
+python3 -m py_compile "$EMP_API" "$WATCHDOG_API"
+
+# Restart ERP services only so new Python modules load. Elastix untouched.
+echo "🧹 Step 11: Clear cache + restart ERP services only"
+bench_exec clear-cache || true
+SERVICES="$(${COMPOSE[@]} ps --services 2>/dev/null || true)"
+for svc in backend frontend websocket queue-short queue-long scheduler; do
+  if grep -qx "$svc" <<< "$SERVICES"; then
+    echo "restart $svc"
+    "${COMPOSE[@]}" restart "$svc" >/dev/null
+  fi
+done
+sleep 10
+bench_exec clear-cache || true
+
+# Run collectors once.
+echo "🧩 Step 12: Run initial watchdog collection"
+mkdir -p "$ROOT/logs"
+"$WATCHDOG_SCRIPT" | tee "$BACKUP_DIR/watchdog_initial_run.txt"
+
+echo "🧩 Step 13: Build initial employee performance snapshot for last complete day"
+TARGET_DATE="$(date -d 'yesterday' +%F)" "$EMP_SCRIPT" | tee "$BACKUP_DIR/employee_performance_initial_run.txt"
+
+# Validation
+OUT_DIR="$BACKUP_DIR/validation"
+mkdir -p "$OUT_DIR"
+echo "🧪 Step 14: Page + API validation"
+set +e
+for page in admin-desk employee-performance watchdog queue-journey-report call-report; do
+  code="$(curl -k -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$page" 2>/dev/null || echo 000)"
+  echo "$page => $code" | tee -a "$OUT_DIR/page_smoke_checks.txt"
+done
+bench_exec execute restaurant_ops.api.employee_performance_api.debug_status | tee "$OUT_DIR/employee_debug_status.json"
+V1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.employee_performance_api.get_available_dates | tee "$OUT_DIR/employee_available_dates.json"
+V2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.employee_performance_api.get_dashboard | tee "$OUT_DIR/employee_dashboard_sample.json"
+V3=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.system_watchdog_api.get_dashboard | tee "$OUT_DIR/watchdog_dashboard.json"
+V4=${PIPESTATUS[0]}
+set -e
+if [[ $V1 -ne 0 || $V2 -ne 0 || $V3 -ne 0 || $V4 -ne 0 ]]; then
+  echo "❌ Validation failed. راجع $OUT_DIR"
+  exit 1
+fi
+
+echo "🏥 Step 15: Health check - Elastix/CDR/AMI + Queue + Call Report"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$OUT_DIR/health_asterisk_bridge.json"
+H1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status | tee "$OUT_DIR/health_queue_status.json"
+H2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' | tee "$OUT_DIR/health_call_report.json"
+H3=${PIPESTATUS[0]}
+set -e
+if [[ $H1 -ne 0 || $H2 -ne 0 || $H3 -ne 0 ]]; then
+  echo "⚠️ Health check فيه تحذير/فشل. راجع $OUT_DIR"
+  exit 1
+fi
+
+cat <<EOF
+============================================================
+✅ DONE V46
+📦 Backup/log folder: $BACKUP_DIR
+✅ /employee-performance added to original admin desk card/sidebar
+✅ /watchdog hidden page installed for System Manager only
+✅ Employee performance daily snapshot cron: 05:20
+✅ Watchdog collector cron: every 5 minutes
+✅ Phone normalization added: 010 / +20 / 20 variants
+✅ New customers details hidden behind button
+✅ Employee call details hidden behind button
+✅ Presence sampler starts now; online/offline estimates appear for future days
+🛡️ report_api.py untouched
+🛡️ Elastix logs/config untouched; read-only only
+============================================================
+EOF

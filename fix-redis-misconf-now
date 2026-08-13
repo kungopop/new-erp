@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# fix-redis-misconf-now
+# Emergency fix for:
+#   MISCONF Redis is configured to save RDB snapshots, but it is currently not able to persist on disk.
+# This makes Frappe pages/API fail because Redis refuses cache writes.
+# Fix:
+# - Check disk/Redis persistence info.
+# - Temporarily allow writes with CONFIG SET stop-writes-on-bgsave-error no.
+# - Persist via docker-compose.override.yml for redis-cache and redis-queue.
+# - Restart Redis + ERP services.
+# - Validate pages, call-report, break/sales APIs, Elastix health.
+
+ROOT="/opt/frappe_crm"
+SITE="crm.local"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/FIX_REDIS_MISCONF_BEFORE_$TS"
+
+say(){ echo -e "\n============================================================\n$1\n============================================================"; }
+run(){ echo -e "\n--- $* ---"; "$@" || true; }
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo "❌ شغّل كـ root: sudo -i ثم ./fix-redis-misconf-now"
+  exit 1
+fi
+
+say "1) Preflight + Backup"
+if [[ ! -d "$ROOT" ]]; then
+  echo "❌ مش لاقي $ROOT"
+  exit 1
+fi
+cd "$ROOT"
+BACKEND="$(docker compose ps -q backend || true)"
+REDIS_CACHE="$(docker compose ps -q redis-cache || true)"
+REDIS_QUEUE="$(docker compose ps -q redis-queue || true)"
+if [[ -z "$BACKEND" || -z "$REDIS_CACHE" || -z "$REDIS_QUEUE" ]]; then
+  echo "❌ ناقص containers. docker compose ps:"
+  docker compose ps || true
+  exit 1
+fi
+mkdir -p "$BACKUP_DIR"
+cp -a "$ROOT/docker-compose.yml" "$BACKUP_DIR/docker-compose.yml.bak" 2>/dev/null || true
+cp -a "$ROOT/docker-compose.override.yml" "$BACKUP_DIR/docker-compose.override.yml.bak" 2>/dev/null || true
+
+echo "✅ Backup: $BACKUP_DIR"
+echo "BACKEND=$BACKEND"
+echo "REDIS_CACHE=$REDIS_CACHE"
+echo "REDIS_QUEUE=$REDIS_QUEUE"
+
+say "2) Disk / Docker usage diagnostics"
+run df -h
+run df -ih
+run docker system df
+run docker compose ps
+
+echo "--- Redis cache persistence before ---"
+docker exec "$REDIS_CACHE" redis-cli INFO persistence | egrep 'rdb_last_bgsave_status|rdb_last_bgsave_time_sec|rdb_bgsave_in_progress|rdb_last_cow_size|loading|aof_enabled' || true
+docker exec "$REDIS_CACHE" redis-cli CONFIG GET stop-writes-on-bgsave-error || true
+
+echo "--- Redis queue persistence before ---"
+docker exec "$REDIS_QUEUE" redis-cli INFO persistence | egrep 'rdb_last_bgsave_status|rdb_last_bgsave_time_sec|rdb_bgsave_in_progress|rdb_last_cow_size|loading|aof_enabled' || true
+docker exec "$REDIS_QUEUE" redis-cli CONFIG GET stop-writes-on-bgsave-error || true
+
+say "3) Immediate Redis write-unblock"
+docker exec "$REDIS_CACHE" redis-cli CONFIG SET stop-writes-on-bgsave-error no || true
+docker exec "$REDIS_QUEUE" redis-cli CONFIG SET stop-writes-on-bgsave-error no || true
+
+echo "--- Redis write test after CONFIG SET ---"
+docker exec "$REDIS_CACHE" redis-cli SET roshdy_redis_test ok EX 60 || true
+docker exec "$REDIS_QUEUE" redis-cli SET roshdy_redis_test ok EX 60 || true
+
+say "4) Persist Redis setting using docker-compose.override.yml"
+cat > "$ROOT/docker-compose.override.yml" <<'YAML'
+services:
+  redis-cache:
+    command: ["redis-server", "--stop-writes-on-bgsave-error", "no"]
+  redis-queue:
+    command: ["redis-server", "--stop-writes-on-bgsave-error", "no"]
+YAML
+cat "$ROOT/docker-compose.override.yml"
+
+say "5) Recreate Redis with override, then restart ERP services"
+docker compose up -d redis-cache redis-queue
+sleep 5
+# Fresh IDs after recreate
+REDIS_CACHE="$(docker compose ps -q redis-cache || true)"
+REDIS_QUEUE="$(docker compose ps -q redis-queue || true)"
+
+echo "--- Redis configs after recreate ---"
+docker exec "$REDIS_CACHE" redis-cli CONFIG GET stop-writes-on-bgsave-error || true
+docker exec "$REDIS_QUEUE" redis-cli CONFIG GET stop-writes-on-bgsave-error || true
+
+docker exec "$REDIS_CACHE" redis-cli SET roshdy_redis_test ok EX 60 || true
+docker exec "$REDIS_QUEUE" redis-cli SET roshdy_redis_test ok EX 60 || true
+
+# Restart Frappe services after Redis reset.
+docker compose restart backend frontend websocket queue-short queue-long scheduler
+sleep 12
+BACKEND="$(docker compose ps -q backend || true)"
+
+say "6) Clear Frappe cache now Redis is writable"
+docker exec "$BACKEND" bash -lc "find /home/frappe/frappe-bench/apps/restaurant_ops -name '*.pyc' -delete; find /home/frappe/frappe-bench/apps/restaurant_ops -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true" || true
+docker exec "$BACKEND" bench --site "$SITE" clear-cache || true
+docker exec "$BACKEND" bench --site "$SITE" clear-website-cache || true
+
+say "7) Validate pages and APIs"
+echo "--- Page HTTP status ---"
+for page in login admin-desk call-report break-admin sales-report email-report-customizer quality-desk; do
+  code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$page" || true)"
+  echo "$page => $code"
+done
+
+echo "--- report_api.get_calls_report ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' || true
+
+echo "--- ops break report ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.ops_reports_api.get_break_report --kwargs '{"date_from":"2026-08-06","date_to":"2026-08-06"}' || true
+
+echo "--- ops sales report ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.ops_reports_api.get_sales_report --kwargs '{"date_from":"2026-08-06","date_to":"2026-08-06"}' || true
+
+echo "--- ops email preview ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.ops_reports_api.preview_enhanced_service_email --kwargs '{"date_from":"2026-08-06","date_to":"2026-08-06"}' || true
+
+say "8) Elastix/CDR/AMI health check"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics || true
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.queue_api.get_queue_status || true
+
+say "✅ Redis MISCONF fixed"
+echo "لو الصفحات رجعت 200 والـ APIs نجحت، كان السبب Redis مش التقارير نفسها."
+echo "لو df -h فيه partition ممتلئ، لازم ننضف مساحة بعد كده عشان Redis snapshots ما تفشلش تاني."
+echo "Backup: $BACKUP_DIR"

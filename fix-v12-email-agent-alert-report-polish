@@ -1,0 +1,613 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Roshdy V12 final fixes:
+# 1) Stop hidden/bad recipients admin@roshdy.com and el.alfy@roshdy.com from any report email send.
+# 2) Make employee full-screen alert reliable when admin ends break (matches by employee.user_id, owner, and extension session).
+# 3) Upper Management email wording/order polish:
+#    - Complaint queue card: no "Queue 123" wording.
+#    - Open complaints highlighted before today's complaints.
+#    - "مكالمات فائتة من الموظفين" wording.
+#    - Cancellation reason normalized for management.
+#    - Target items wording clarified as registrations/offers, not total sales.
+# 4) Cancellation reason input becomes a business dropdown on admin desk and full cancellation report page.
+# Safety: backup first; DOES NOT touch report_api.py / Elastix / CDR / AMI config.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "❌ docker compose/docker-compose مش موجود"
+  exit 1
+fi
+
+APP_DIR="$ROOT/apps/$APP"
+PKG_DIR="$APP_DIR/$APP"
+WWW_DIR="$PKG_DIR/www"
+API_DIR="$PKG_DIR/api"
+EMAIL_REPORT="$API_DIR/email_report.py"
+UPPER_API="$API_DIR/upper_management_email_api.py"
+BREAK_API="$API_DIR/break_api.py"
+AGENT_HTML="$WWW_DIR/agent-desk.html"
+ADMIN_HTML="$WWW_DIR/admin-desk.html"
+CANCEL_HTML="$WWW_DIR/order-cancellations-report.html"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/V12_EMAIL_AGENT_ALERT_REPORT_POLISH_BEFORE_$TS"
+mkdir -p "$BACKUP_DIR"
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend container مش شغال أو مش لاقيه"
+  exit 1
+fi
+
+bench_exec() {
+  "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"
+}
+
+echo "============================================================"
+echo "🔧 Roshdy V12: email recipients + agent alert + upper report polish"
+echo "📦 Backup: $BACKUP_DIR"
+echo "============================================================"
+
+echo "🧯 Backup files + bench backup"
+for f in "$EMAIL_REPORT" "$UPPER_API" "$BREAK_API" "$AGENT_HTML" "$ADMIN_HTML" "$CANCEL_HTML"; do
+  [[ -f "$f" ]] && cp -a "$f" "$BACKUP_DIR/$(basename "$f").before"
+done
+bench_exec backup --with-files | tee "$BACKUP_DIR/bench_backup_output.txt"
+
+echo "🧩 Patching backend and pages"
+export EMAIL_REPORT UPPER_API BREAK_API AGENT_HTML ADMIN_HTML CANCEL_HTML
+python3 - <<'PY'
+# -*- coding: utf-8 -*-
+from pathlib import Path
+import os
+
+email_report = Path(os.environ["EMAIL_REPORT"])
+upper_api = Path(os.environ["UPPER_API"])
+break_api = Path(os.environ["BREAK_API"])
+agent_html = Path(os.environ["AGENT_HTML"])
+admin_html = Path(os.environ["ADMIN_HTML"])
+cancel_html = Path(os.environ["CANCEL_HTML"])
+
+# ------------------------------------------------------------------
+# 1) Filter hidden/bad recipients in legacy email_report send paths.
+# ------------------------------------------------------------------
+if email_report.exists():
+    s = email_report.read_text(encoding="utf-8", errors="ignore")
+    start = "# BEGIN ROSHDY EMAIL RECIPIENT FILTER V12"
+    end = "# END ROSHDY EMAIL RECIPIENT FILTER V12"
+    patch = r'''
+# BEGIN ROSHDY EMAIL RECIPIENT FILTER V12
+# Prevent hidden/non-deliverable report recipients from being sent to.
+# This specifically fixes bounces to admin@roshdy.com and el.alfy@roshdy.com.
+try:
+    import frappe
+    import re as _r12_re
+except Exception:
+    frappe = None
+
+_ROSHDY_BLOCKED_REPORT_EMAILS_V12 = {
+    "admin@roshdy.com",
+    "el.alfy@roshdy.com",
+    "administrator@roshdy.com",
+}
+
+
+def _roshdy_v12_flat_emails(value):
+    out = []
+    if value is None:
+        return out
+    if isinstance(value, (list, tuple, set)):
+        for x in value:
+            out.extend(_roshdy_v12_flat_emails(x))
+        return out
+    text = str(value)
+    found = _r12_re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", text)
+    return found or ([text.strip()] if "@" in text else [])
+
+
+def _roshdy_v12_clean_recipients(value):
+    original_is_string = isinstance(value, str)
+    emails = _roshdy_v12_flat_emails(value)
+    seen, cleaned, blocked = set(), [], []
+    for e in emails:
+        e = str(e).strip().strip(",; ")
+        if not e:
+            continue
+        key = e.lower()
+        if key in _ROSHDY_BLOCKED_REPORT_EMAILS_V12 or key.endswith("@local.local") or key.endswith("@example.com"):
+            blocked.append(e)
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(e)
+    if blocked and frappe:
+        try:
+            frappe.logger("roshdy_email").warning("Blocked hidden report recipients: " + ", ".join(blocked))
+        except Exception:
+            pass
+    if original_is_string:
+        return ", ".join(cleaned)
+    return cleaned
+
+
+if frappe and not getattr(frappe, "_roshdy_sendmail_filtered_v12", False):
+    frappe._roshdy_sendmail_original_v12 = frappe.sendmail
+
+    def _roshdy_filtered_sendmail_v12(*args, **kwargs):
+        args = list(args)
+        if args:
+            args[0] = _roshdy_v12_clean_recipients(args[0])
+        for key in ("recipients", "cc", "bcc"):
+            if key in kwargs:
+                kwargs[key] = _roshdy_v12_clean_recipients(kwargs.get(key))
+        return frappe._roshdy_sendmail_original_v12(*args, **kwargs)
+
+    frappe.sendmail = _roshdy_filtered_sendmail_v12
+    frappe._roshdy_sendmail_filtered_v12 = True
+# END ROSHDY EMAIL RECIPIENT FILTER V12
+'''
+    if start in s and end in s:
+        i=s.index(start); j=s.index(end,i)+len(end); s=s[:i]+patch.strip()+s[j:]
+    else:
+        s=s.rstrip()+"\n\n"+patch.strip()+"\n"
+    compile(s, str(email_report), "exec")
+    email_report.write_text(s, encoding="utf-8")
+
+# ------------------------------------------------------------------
+# 2) Break API: robust employee alert matching + ack.
+# ------------------------------------------------------------------
+if break_api.exists():
+    s = break_api.read_text(encoding="utf-8", errors="ignore")
+    start = "# BEGIN ROSHDY BREAK ALERT V12 ROBUST MATCHING"
+    end = "# END ROSHDY BREAK ALERT V12 ROBUST MATCHING"
+    patch = r'''
+# BEGIN ROSHDY BREAK ALERT V12 ROBUST MATCHING
+# Robust employee alert when admin ends break.
+# Match alert by linked Employee.user_id, break owner, or active Extension Session extension.
+try:
+    import frappe
+    from frappe.utils import now_datetime, get_datetime, cstr, add_to_date
+except Exception:
+    frappe = None
+
+
+def _v12_break_admin_allowed():
+    try:
+        if frappe.session.user == "Administrator":
+            return True
+        roles = set(frappe.get_roles(frappe.session.user))
+        return bool(roles.intersection({"System Manager", "Call Center Admin", "Restaurant Manager", "Break Admin"}))
+    except Exception:
+        return False
+
+
+def _v12_meta_has(dt, fn):
+    try:
+        return frappe.get_meta(dt).has_field(fn)
+    except Exception:
+        return False
+
+
+def _v12_user_employee_names(user):
+    names = []
+    try:
+        if frappe.db.exists("DocType", "Employee"):
+            names = frappe.get_all("Employee", filters={"user_id": user}, pluck="name", limit_page_length=50) or []
+    except Exception:
+        pass
+    return names
+
+
+def _v12_user_extensions(user):
+    exts = []
+    try:
+        if frappe.db.exists("DocType", "Extension Session"):
+            rows = frappe.get_all("Extension Session", filters={"user": user, "session_status": "active"}, fields=["extension"], limit_page_length=20)
+            exts.extend([cstr(r.get("extension")) for r in rows if r.get("extension")])
+    except Exception:
+        pass
+    try:
+        if frappe.db.exists("DocType", "Employee"):
+            meta = frappe.get_meta("Employee")
+            emp_names = _v12_user_employee_names(user)
+            if emp_names:
+                for df in meta.fields:
+                    fn = cstr(df.fieldname).lower()
+                    if any(x in fn for x in ("extension", "ext", "sip")):
+                        for emp in emp_names:
+                            val = frappe.db.get_value("Employee", emp, df.fieldname)
+                            if val:
+                                exts.append(cstr(val))
+    except Exception:
+        pass
+    out=[]
+    for e in exts:
+        if e and e not in out:
+            out.append(e)
+    return out
+
+
+@frappe.whitelist()
+def get_my_break_admin_alert():
+    user = frappe.session.user
+    if not user or user == "Guest":
+        return {"success": True, "has_alert": False, "reason": "guest"}
+    dt = "Employee Break Log"
+    if not frappe.db.exists("DocType", dt):
+        return {"success": True, "has_alert": False, "reason": "missing break doctype"}
+    employees = _v12_user_employee_names(user)
+    exts = _v12_user_extensions(user)
+    since = add_to_date(now_datetime(), hours=-72)
+    clauses = ["owner=%s"]
+    params = [user]
+    if employees:
+        clauses.append("employee in (" + ",".join(["%s"] * len(employees)) + ")")
+        params.extend(employees)
+    if exts and _v12_meta_has(dt, "extension_at_start"):
+        clauses.append("extension_at_start in (" + ",".join(["%s"] * len(exts)) + ")")
+        params.extend(exts)
+    params.append(since)
+    ack_clause = ""
+    if _v12_meta_has(dt, "admin_close_acknowledged"):
+        ack_clause = "and ifnull(admin_close_acknowledged,0)=0"
+    sql = f"""
+        select name, employee, break_type, start_time, end_time, duration_minutes,
+               closed_by, closure_type, modified, owner, extension_at_start
+        from `tabEmployee Break Log`
+        where ifnull(docstatus,0) < 2
+          and ifnull(closure_type,'')='admin'
+          and ({' or '.join(clauses)})
+          and modified >= %s
+          {ack_clause}
+        order by modified desc
+        limit 1
+    """
+    rows = frappe.db.sql(sql, params, as_dict=True)
+    if not rows:
+        return {"success": True, "has_alert": False, "user": user, "employees": employees, "extensions": exts}
+    r = rows[0]
+    closed_by = r.get("closed_by") or "الإدارة"
+    closed_by_label = frappe.db.get_value("User", closed_by, "full_name") or closed_by
+    return {"success": True, "has_alert": True, "alert": {"break_log": r.get("name"), "employee": r.get("employee"), "break_type": r.get("break_type") or "", "start_time": cstr(r.get("start_time") or ""), "end_time": cstr(r.get("end_time") or ""), "duration_minutes": r.get("duration_minutes"), "closed_by": closed_by_label, "message": f"تم إنهاء البريك بواسطة {closed_by_label}"}}
+
+
+@frappe.whitelist()
+def acknowledge_admin_closed_break(break_log=None):
+    if not break_log:
+        frappe.throw("break_log مطلوب")
+    dt = "Employee Break Log"
+    if not frappe.db.exists(dt, break_log):
+        frappe.throw("سجل البريك غير موجود")
+    doc = frappe.get_doc(dt, break_log)
+    user = frappe.session.user
+    employees = _v12_user_employee_names(user)
+    exts = _v12_user_extensions(user)
+    allowed = doc.get("owner") == user or doc.get("employee") in employees or (doc.get("extension_at_start") and cstr(doc.get("extension_at_start")) in exts) or _v12_break_admin_allowed()
+    if not allowed:
+        frappe.throw("غير مسموح")
+    updates = {}
+    if _v12_meta_has(dt, "admin_close_acknowledged"):
+        updates["admin_close_acknowledged"] = 1
+    if _v12_meta_has(dt, "admin_close_acknowledged_at"):
+        updates["admin_close_acknowledged_at"] = now_datetime()
+    if updates:
+        frappe.db.set_value(dt, break_log, updates, update_modified=True)
+        frappe.db.commit()
+    return {"success": True}
+# END ROSHDY BREAK ALERT V12 ROBUST MATCHING
+'''
+    if start in s and end in s:
+        i=s.index(start); j=s.index(end,i)+len(end); s=s[:i]+patch.strip()+s[j:]
+    else:
+        s=s.rstrip()+"\n\n"+patch.strip()+"\n"
+    compile(s, str(break_api), "exec")
+    break_api.write_text(s, encoding="utf-8")
+
+# ------------------------------------------------------------------
+# 3) Upper API: recipient filter, polished render, cancellation reason normalization.
+# ------------------------------------------------------------------
+if upper_api.exists():
+    s = upper_api.read_text(encoding="utf-8", errors="ignore")
+    start = "# BEGIN ROSHDY UPPER REPORT V12 POLISH AND RECIPIENTS"
+    end = "# END ROSHDY UPPER REPORT V12 POLISH AND RECIPIENTS"
+    patch = r'''
+# BEGIN ROSHDY UPPER REPORT V12 POLISH AND RECIPIENTS
+try:
+    import frappe
+    from frappe.utils import cstr, flt, now_datetime
+    import html as _v12_html
+    import re as _v12_re
+except Exception:
+    pass
+
+_BLOCKED_REPORT_EMAILS_V12 = {"admin@roshdy.com", "el.alfy@roshdy.com", "administrator@roshdy.com"}
+
+
+def _v12_e(v):
+    return _v12_html.escape(cstr(v) if v is not None else "")
+
+
+def _v12_n(v):
+    try:
+        f=flt(v or 0)
+        return f"{int(f):,}" if float(f).is_integer() else f"{f:,.1f}"
+    except Exception:
+        return cstr(v)
+
+
+def _v12_extract_emails(value):
+    out=[]
+    if value is None:
+        return out
+    if isinstance(value,(list,tuple,set)):
+        for x in value: out.extend(_v12_extract_emails(x))
+        return out
+    if isinstance(value,dict):
+        for x in value.values(): out.extend(_v12_extract_emails(x))
+        return out
+    text=cstr(value)
+    out.extend(_v12_re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", text))
+    return out
+
+
+def _v12_clean_recipients(values):
+    seen=set(); cleaned=[]; blocked=[]
+    for e in _v12_extract_emails(values):
+        e=cstr(e).strip().strip(",; ")
+        if not e: continue
+        key=e.lower()
+        if key in _BLOCKED_REPORT_EMAILS_V12 or key.endswith("@local.local") or key.endswith("@example.com"):
+            blocked.append(e); continue
+        if key in seen: continue
+        seen.add(key); cleaned.append(e)
+    return cleaned
+
+
+def _v12_resolve_upper_recipients(direct=None, kwargs=None):
+    kwargs=kwargs or {}
+    candidates=[direct]
+    for k in ("recipients","recipient","emails","email","to","send_to","test_email","email_to","mail_to","upper_management_emails","upper_management_recipients","upper_emails","management_emails"):
+        if kwargs.get(k): candidates.append(kwargs.get(k))
+    explicit=_v12_clean_recipients(candidates)
+    if explicit: return explicit, "explicit_ui_or_api"
+    # Use existing resolver if available, then clean it.
+    try:
+        recips, source, _sources = _r5_resolve_upper_recipients(direct=direct, kwargs=kwargs)
+        clean=_v12_clean_recipients(recips)
+        if clean: return clean, "existing_exact_settings_filtered"
+    except Exception:
+        pass
+    try:
+        recips, source, _sources = _roshdy_v4_resolve_upper_recipients(direct=direct, kwargs=kwargs)
+        clean=_v12_clean_recipients(recips)
+        if clean: return clean, "existing_v4_settings_filtered"
+    except Exception:
+        pass
+    return [], "not_found"
+
+
+def _v12_cancel_reason_public(reason):
+    raw=cstr(reason or "").strip()
+    low=raw.lower()
+    if not raw:
+        return "غير محدد"
+    # normalize informal/free text for management email only
+    bad_mood_words=("مزاجه", "مزاج", "mood", "مش عايز", "غير رأيه", "غير رايه")
+    if any(x in low for x in bad_mood_words):
+        return "العميل ألغى الطلب — عدم رغبة العميل في استكمال الطلب"
+    return raw
+
+
+def _v12_td(v,strong=False):
+    val=_v12_e(v)
+    if strong: val='<b>'+val+'</b>'
+    return f"<td style='padding:8px;border:1px solid #e5e7eb;text-align:right;direction:rtl;font-size:12px'>{val}</td>"
+
+
+def _v12_empty(cols,text):
+    return f"<tr><td colspan='{cols}' style='padding:12px;border:1px solid #e5e7eb;text-align:center;color:#64748b;background:#f8fafc'>{_v12_e(text)}</td></tr>"
+
+
+def _v12_table(headers, body):
+    th=''.join(f"<th style='background:#111827;color:white;padding:9px;border:1px solid #e5e7eb;text-align:right;direction:rtl;font-size:12px'>{_v12_e(h)}</th>" for h in headers)
+    return f"<table dir='rtl' width='100%' cellpadding='0' cellspacing='0' style='border-collapse:collapse;width:100%;direction:rtl;text-align:right;margin-top:8px;font-family:Tahoma,Arial,sans-serif'><thead><tr>{th}</tr></thead><tbody>{body}</tbody></table>"
+
+
+def _v12_card(title,value,note,color="#1F4E79",bg="#fff"):
+    return f"<td style='width:25%;padding:6px;vertical-align:top'><div style='background:{bg};border:1px solid #e5e7eb;border-right:6px solid {color};border-radius:14px;padding:13px;min-height:102px;text-align:right;direction:rtl'><div style='font-size:13px;color:#475569;font-weight:bold'>{_v12_e(title)}</div><div style='font-size:28px;font-weight:900;color:{color};margin-top:5px'>{_v12_e(value)}</div><div style='font-size:12px;color:#64748b;margin-top:4px'>{note}</div></div></td>"
+
+
+@frappe.whitelist()
+def render_upper_management_report_html(date_from=None, date_to=None):
+    d=get_upper_management_report_data(date_from,date_to)
+    calls=d.get('calls') or {}; comps=d.get('complaints') or {}; cancels=d.get('cancellations') or {}; target=d.get('target_items') or {}; cq=d.get('complaint_queue') or {}
+    staff_count=calls.get('staff_missed_count', calls.get('employee_issue_count',0))
+    issue_rows=calls.get('employee_issue_rows') or []
+    issue_html=''.join(f"<tr>{_v12_td(r.get('time'))}{_v12_td(r.get('employee'))}{_v12_td(r.get('extension'))}{_v12_td(r.get('caller'))}{_v12_td(r.get('action'),True)}{_v12_td(r.get('duration'))}</tr>" for r in issue_rows[:80]) or _v12_empty(6,"لا توجد مكالمات مؤكدة فائتة من الموظفين خلال الفترة")
+    open_rows=comps.get('open_rows') or []
+    open_html=''.join(f"<tr>{_v12_td(r.get('name'))}{_v12_td(r.get('status'))}{_v12_td(r.get('category'))}{_v12_td(r.get('priority'))}{_v12_td(r.get('customer_name'))}{_v12_td(r.get('creation'))}</tr>" for r in open_rows[:100]) or _v12_empty(6,"لا توجد شكاوى مفتوحة حاليًا")
+    today_rows=comps.get('today_rows') or []
+    today_html=''.join(f"<tr>{_v12_td(r.get('creation'))}{_v12_td(r.get('name'))}{_v12_td(r.get('status'))}{_v12_td(r.get('category'))}{_v12_td(r.get('priority'))}{_v12_td(r.get('customer_name'))}</tr>" for r in today_rows[:80]) or _v12_empty(6,"لا توجد شكاوى جديدة مسجلة اليوم")
+    cancel_rows=cancels.get('rows') or []
+    cancel_html=''.join(f"<tr>{_v12_td(r.get('cancellation_time'))}{_v12_td(r.get('order_no'))}{_v12_td(r.get('shift'))}{_v12_td(r.get('branch'))}{_v12_td(r.get('customer_name'))}{_v12_td(_v12_cancel_reason_public(r.get('reason')))}{_v12_td(r.get('logged_by'))}</tr>" for r in cancel_rows[:80]) or _v12_empty(7,"لا توجد إلغاءات مسجلة اليوم")
+    target_rows=target.get('rows') or []
+    target_html=''.join(f"<tr>{_v12_td(r.get('item'))}{_v12_td(_v12_n(r.get('qty')),True)}{_v12_td(_v12_n(r.get('entries')),True)}</tr>" for r in target_rows[:80]) or _v12_empty(3,"لا توجد تسجيلات عرض للأصناف المطلوبة خلال الفترة")
+    # priority followups
+    follow=[]
+    if flt(comps.get('open_all') or 0)>0: follow.append(f"مراجعة الشكاوى المفتوحة حاليًا وعددها {_v12_n(comps.get('open_all'))}.")
+    if flt(cancels.get('count') or 0)>0: follow.append("مراجعة سبب الإلغاء المسجل اليوم والتأكد أنه مصنف بشكل واضح.")
+    if flt(target.get('total_qty') or 0)<=0: follow.append("لم يتم تسجيل أي عرض للأصناف المطلوبة خلال الفترة.")
+    if flt(staff_count or 0)>0: follow.append("مراجعة المكالمات الفائتة من الموظفين.")
+    if not follow: follow=["لا توجد ملاحظات تحتاج متابعة اليوم."]
+    follow_html=''.join(f"<div style='background:#fffbeb;border:1px solid #fde68a;border-radius:10px;padding:9px;margin:6px 0;color:#92400e;font-size:13px'>• {_v12_e(x)}</div>" for x in follow)
+    open_color="#dc2626" if flt(comps.get('open_all') or 0)>0 else "#16a34a"
+    return f"""<!doctype html><html lang='ar' dir='rtl'><head><meta charset='utf-8'></head><body dir='rtl' style='margin:0;background:#f3f4f6;direction:rtl;text-align:right;font-family:Tahoma,Arial,sans-serif;color:#111827'><table dir='rtl' width='100%' style='direction:rtl;text-align:right;background:#f3f4f6'><tr><td align='right' style='padding:16px'><div style='max-width:960px;margin:0 0 0 auto;background:white;border:1px solid #e5e7eb;border-radius:16px;overflow:hidden'><div style='height:8px;background:#1F4E79'></div><div style='padding:18px'><h1 style='margin:0;font-size:22px;color:#0f172a'>مطعم رشدي — تقرير الإدارة العليا</h1><div style='color:#64748b;font-size:13px;margin-top:6px'>الفترة: {_v12_e(d['period']['label'])} | وقت الإصدار: {_v12_e(d['generated_at'])}</div><div style='margin-top:10px;display:inline-block;background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe;border-radius:999px;padding:7px 11px;font-weight:bold;font-size:12px'>{_v12_e(d.get('status_label'))}</div><h2 style='font-size:18px;margin:16px 0 8px'>ملخص اليوم</h2><table width='100%' dir='rtl'><tr>{_v12_card('شكاوى مفتوحة حاليًا', _v12_n(comps.get('open_all')), 'كل الشكاوى غير المغلقة وتحتاج متابعة', open_color, '#fef2f2' if flt(comps.get('open_all') or 0)>0 else '#f0fdf4')}{_v12_card('مكالمات خط الشكاوى', _v12_n(cq.get('count')), 'مكالمة دخلت على خط الشكاوى خلال الفترة', '#2563eb')}{_v12_card('المكالمات المسجلة', _v12_n(calls.get('total')), 'إجمالي مكالمات الفترة')}{_v12_card('تم الرد عليها', _v12_n(calls.get('answered')), 'عدد المكالمات التي تم الرد عليها', '#16a34a')}</tr><tr>{_v12_card('مكالمات فائتة من الموظفين', _v12_n(staff_count), 'فقط الحالات المؤكدة من Call Report', '#dc2626' if flt(staff_count)>0 else '#1F4E79')}{_v12_card('شكاوى جديدة اليوم', _v12_n(comps.get('registered_today')), 'المسجلة خلال الفترة', '#f97316')}{_v12_card('إلغاءات اليوم', _v12_n(cancels.get('count')), 'مدخلة يدويًا من الإدارة', '#6f42c1')}{_v12_card('تسجيلات عرض الأصناف المطلوبة', _v12_n(target.get('total_qty')), 'لا تمثل إجمالي مبيعات المطعم', '#f59e0b')}</tr></table><div style='border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-top:14px'><h3 style='margin:0 0 8px'>📌 يحتاج متابعة</h3>{follow_html}</div><div style='border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-top:14px'><h3 style='margin:0 0 8px'>🔴 الشكاوى المفتوحة حاليًا</h3>{_v12_table(['رقم الشكوى','الحالة','التصنيف','الأولوية','العميل','تاريخ التسجيل'], open_html)}</div><div style='border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-top:14px'><h3 style='margin:0 0 8px'>↩️ الإلغاءات المسجلة اليوم</h3>{_v12_table(['وقت التسجيل','رقم الطلب','الوردية','الفرع','اسم العميل','سبب الإلغاء','سجلها'], cancel_html)}</div><div style='border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-top:14px'><h3 style='margin:0 0 8px'>👤 المكالمات الفائتة من الموظفين</h3><div style='color:#64748b;font-size:12px'>لا يتم احتساب Busy/Declined العام كخطأ موظف. يظهر هنا فقط ما صنفه Call Report كـ staff_missed/employee_missed.</div>{_v12_table(['الوقت','الموظف','التحويلة','رقم العميل','ما حدث','المدة'], issue_html)}</div><div style='border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-top:14px'><h3 style='margin:0 0 8px'>📋 شكاوى جديدة اليوم</h3>{_v12_table(['وقت التسجيل','رقم الشكوى','الحالة','التصنيف','الأولوية','العميل'], today_html)}</div><div style='border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-top:14px'><h3 style='margin:0 0 8px'>🛒 تسجيلات عرض الأصناف المطلوبة</h3>{_v12_table(['الصنف المطلوب عرضه','القطع/التسجيلات','عدد مرات التسجيل'], target_html)}<div style='font-size:12px;color:#64748b;margin-top:8px'>هذا الجزء لا يعرض إجمالي مبيعات المطعم ولا إجمالي الإيراد، لكنه يوضح ما تم تسجيله من الأصناف المطلوب عرضها أثناء المكالمات.</div></div></div></div></td></tr></table></body></html>"""
+
+
+@frappe.whitelist()
+def preview_upper_management_report(date_from=None, date_to=None, **kwargs):
+    return {"success": True, "html": render_upper_management_report_html(date_from=date_from, date_to=date_to), "data": get_upper_management_report_data(date_from, date_to)}
+
+
+@frappe.whitelist()
+def debug_email_send_config(**kwargs):
+    recips, source = _v12_resolve_upper_recipients(kwargs=kwargs)
+    hidden=[]
+    try:
+        rows=frappe.db.sql("select 'User' as doctype, name as field, email as value from `tabUser` where email in ('admin@roshdy.com','el.alfy@roshdy.com') union all select doctype, field, value from `tabSingles` where value like '%%admin@roshdy.com%%' or value like '%%el.alfy@roshdy.com%%'", as_dict=True)
+        hidden=rows
+    except Exception:
+        pass
+    return {"success": True, "upper_recipients_count": len(recips), "upper_recipients": recips, "source": source, "blocked_hidden_recipients": sorted(list(_BLOCKED_REPORT_EMAILS_V12)), "hidden_occurrences_in_db": hidden, "note": "Blocked hidden recipients are filtered at send time and will not receive reports."}
+
+
+@frappe.whitelist()
+def send_upper_management_report(recipients=None, date_from=None, date_to=None, subject=None, **kwargs):
+    recips, source = _v12_resolve_upper_recipients(direct=recipients, kwargs=kwargs)
+    if not recips:
+        frappe.throw("لم يتم العثور على إيميلات الإدارة العليا بعد فلترة الإيميلات المخفية/غير الصحيحة. راجع خانة إيميلات الإدارة العليا.")
+    html_body=render_upper_management_report_html(date_from=date_from, date_to=date_to)
+    subj=subject or kwargs.get('email_subject') or kwargs.get('subject') or f"تقرير الإدارة العليا - مطعم رشدي - {date_from or ''}".strip()
+    frappe.sendmail(recipients=recips, subject=subj, message=html_body, now=True)
+    return {"success": True, "message": f"تم إرسال تقرير الإدارة العليا إلى {len(recips)} مستخدم", "recipients": recips, "recipients_count": len(recips), "source": source, "subject": subj}
+
+
+@frappe.whitelist()
+def verify_cancellations_in_upper_email(date_from=None, date_to=None):
+    data=get_upper_management_report_data(date_from=date_from, date_to=date_to)
+    html=render_upper_management_report_html(date_from=date_from, date_to=date_to)
+    return {"success": True, "cancellations_count": (data.get('cancellations') or {}).get('count',0), "open_complaints_all": (data.get('complaints') or {}).get('open_all',0), "staff_missed_count": (data.get('calls') or {}).get('staff_missed_count',(data.get('calls') or {}).get('employee_issue_count',0)), "html_has_no_queue_123_wording": "Queue 123" not in cstr(html), "html_has_open_complaints_priority": "شكاوى مفتوحة حاليًا" in cstr(html), "html_has_missed_wording": "مكالمات فائتة من الموظفين" in cstr(html), "html_has_target_wording": "تسجيلات عرض الأصناف المطلوبة" in cstr(html), "html_has_cancellation_section": "الإلغاءات" in cstr(html)}
+# END ROSHDY UPPER REPORT V12 POLISH AND RECIPIENTS
+'''
+    if start in s and end in s:
+        i=s.index(start); j=s.index(end,i)+len(end); s=s[:i]+patch.strip()+s[j:]
+    else:
+        s=s.rstrip()+"\n\n"+patch.strip()+"\n"
+    compile(s, str(upper_api), "exec")
+    upper_api.write_text(s, encoding="utf-8")
+
+# ------------------------------------------------------------------
+# 4) Agent desk full-screen alert overlay.
+# ------------------------------------------------------------------
+if agent_html.exists():
+    s=agent_html.read_text(encoding="utf-8", errors="ignore")
+    blocks=[("<!-- BEGIN ROSHDY AGENT BREAK CLOSE ALERT -->","<!-- END ROSHDY AGENT BREAK CLOSE ALERT -->"),("<!-- BEGIN ROSHDY AGENT BREAK ADMIN CLOSED V10 -->","<!-- END ROSHDY AGENT BREAK ADMIN CLOSED V10 -->"),("<!-- BEGIN ROSHDY AGENT BREAK ADMIN CLOSED V12 -->","<!-- END ROSHDY AGENT BREAK ADMIN CLOSED V12 -->")]
+    for a,b in blocks:
+        while a in s and b in s:
+            i=s.index(a); j=s.index(b,i)+len(b); s=s[:i]+"\n"+s[j:]
+    block=r'''
+<!-- BEGIN ROSHDY AGENT BREAK ADMIN CLOSED V12 -->
+{% raw %}
+<style>#roshdy-admin-break-closed-v12{position:fixed;inset:0;background:rgba(15,23,42,.88);z-index:999999;display:none;align-items:center;justify-content:center;padding:18px;direction:rtl;font-family:Tahoma,Arial,sans-serif;text-align:center}.rabc12-card{background:#fff;border-radius:22px;box-shadow:0 35px 90px rgba(0,0,0,.45);width:540px;max-width:100%;padding:28px}.rabc12-ico{font-size:58px;margin-bottom:10px}.rabc12-title{font-size:25px;font-weight:900;color:#0f172a;margin-bottom:10px}.rabc12-msg{font-size:18px;color:#334155;margin-bottom:14px}.rabc12-details{background:#f8fafc;border:1px solid #e5e7eb;border-radius:14px;padding:12px;color:#475569;font-size:13px;margin-bottom:18px}.rabc12-btn{background:#0f766e;color:white;border:0;border-radius:14px;padding:13px 22px;font-size:16px;font-weight:900;cursor:pointer}</style>
+<div id="roshdy-admin-break-closed-v12"><div class="rabc12-card"><div class="rabc12-ico">⏱️</div><div class="rabc12-title">تم إنهاء البريك</div><div id="rabc12-msg" class="rabc12-msg">تم إنهاء البريك بواسطة الإدارة</div><div id="rabc12-details" class="rabc12-details"></div><button id="rabc12-ack" class="rabc12-btn">تمام، تم العلم</button></div></div>
+<script>(function(){if(window.RoshdyBreakClosedV12)return;window.RoshdyBreakClosedV12=1;var current=null;function api(m,args){args=args||{};var q=new URLSearchParams();Object.keys(args).forEach(function(k){if(args[k]!==undefined&&args[k]!==null)q.append(k,args[k])});return fetch('/api/method/'+m+(q.toString()?'?'+q.toString():''),{method:'GET',credentials:'same-origin',cache:'no-store'}).then(function(r){return r.json()}).then(function(j){if(j.exc)throw j;return j.message||j})}function show(a){a=a||{};current=a.break_log||current;document.getElementById('rabc12-msg').textContent=a.message||('تم إنهاء البريك بواسطة '+(a.closed_by||'الإدارة'));document.getElementById('rabc12-details').innerHTML='نوع البريك: <b>'+(a.break_type||'')+'</b><br>وقت الإنهاء: <b>'+(a.end_time||'')+'</b><br>مدة البريك: <b>'+(a.duration_minutes||'')+' دقيقة</b>';document.getElementById('roshdy-admin-break-closed-v12').style.display='flex'}function poll(){api('restaurant_ops.api.break_api.get_my_break_admin_alert',{}).then(function(r){if(r&&r.has_alert&&r.alert)show(r.alert)}).catch(function(e){console.log('break admin alert poll',e)})}document.getElementById('rabc12-ack').onclick=function(){var box=document.getElementById('roshdy-admin-break-closed-v12');if(!current){box.style.display='none';return}api('restaurant_ops.api.break_api.acknowledge_admin_closed_break',{break_log:current}).finally(function(){box.style.display='none'})};if(window.frappe&&frappe.realtime){try{frappe.realtime.on('roshdy_break_force_closed',function(p){show(p||{})})}catch(e){}}setTimeout(poll,800);setInterval(poll,3000);})();</script>
+{% endraw %}
+<!-- END ROSHDY AGENT BREAK ADMIN CLOSED V12 -->
+'''
+    low=s.lower()
+    if "</body>" in low:
+        i=s.rfind("</body>") if "</body>" in s else low.rindex("</body>")
+        s=s[:i]+"\n"+block+"\n"+s[i:]
+    else:
+        s=s.rstrip()+"\n"+block+"\n"
+    agent_html.write_text(s, encoding="utf-8")
+
+# ------------------------------------------------------------------
+# 5) Cancellation reason dropdown enhancer on admin and cancellation report pages.
+# ------------------------------------------------------------------
+reason_script=r'''
+<!-- BEGIN ROSHDY CANCEL REASON SELECT V12 -->
+<script>(function(){if(window.RoshdyReasonSelectV12)return;window.RoshdyReasonSelectV12=1;var opts=['العميل غيّر رأيه','عدم رغبة العميل في استكمال الطلب','تأخير في التوصيل','عدم توفر صنف','خطأ في الطلب','السعر غير مناسب','العميل لم يرد للتأكيد','طلب مكرر','أخرى'];function enhance(id){var el=document.getElementById(id);if(!el||el.dataset.reasonV12)return;var sel=document.createElement('select');sel.id=id;sel.dataset.reasonV12='1';sel.innerHTML='<option value="">اختر سبب الإلغاء</option>'+opts.map(function(x){return '<option value="'+x+'">'+x+'</option>'}).join('');el.parentNode.replaceChild(sel,el)}function run(){enhance('c-reason');enhance('c_reason')}new MutationObserver(run).observe(document.body,{childList:true,subtree:true});setInterval(run,1000);setTimeout(run,300);})();</script>
+<!-- END ROSHDY CANCEL REASON SELECT V12 -->
+'''
+for path in (admin_html, cancel_html):
+    if not path.exists(): continue
+    s=path.read_text(encoding="utf-8", errors="ignore")
+    a="<!-- BEGIN ROSHDY CANCEL REASON SELECT V12 -->"; b="<!-- END ROSHDY CANCEL REASON SELECT V12 -->"
+    while a in s and b in s:
+        i=s.index(a); j=s.index(b,i)+len(b); s=s[:i]+"\n"+s[j:]
+    low=s.lower()
+    if "</body>" in low:
+        i=low.rindex("</body>"); s=s[:i]+"\n"+reason_script+"\n"+s[i:]
+    else:
+        s=s.rstrip()+"\n"+reason_script+"\n"
+    path.write_text(s, encoding="utf-8")
+PY
+
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+if [[ -n "$APP_OWNER" ]]; then
+  chown "$APP_OWNER" "$EMAIL_REPORT" "$UPPER_API" "$BREAK_API" "$AGENT_HTML" "$ADMIN_HTML" "$CANCEL_HTML" 2>/dev/null || true
+fi
+
+echo "🧹 Clear cache + restart app services"
+bench_exec clear-cache || true
+"${COMPOSE[@]}" restart backend frontend websocket queue-short queue-long scheduler >/dev/null
+sleep 8
+bench_exec clear-cache || true
+
+echo "🧪 Page smoke checks"
+set +e
+for p in admin-desk agent-desk break-admin order-cancellations-report email-report-customizer call-report; do
+  code="$(curl -k -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$p" 2>/dev/null || echo 000)"
+  echo "$p => $code" | tee -a "$BACKUP_DIR/page_smoke_checks_v12.txt"
+done
+set -e
+
+if ! grep -q "admin-desk => 200" "$BACKUP_DIR/page_smoke_checks_v12.txt" || ! grep -q "agent-desk => 200" "$BACKUP_DIR/page_smoke_checks_v12.txt"; then
+  echo "❌ Critical page failed. راجع: $BACKUP_DIR"
+  exit 1
+fi
+
+echo "🧪 Backend validation"
+set +e
+bench_exec execute restaurant_ops.api.upper_management_email_api.debug_email_send_config | tee "$BACKUP_DIR/email_debug_v12.txt"
+V1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.upper_management_email_api.verify_cancellations_in_upper_email | tee "$BACKUP_DIR/email_verify_v12.txt"
+V2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.break_api.get_active_breaks | tee "$BACKUP_DIR/active_breaks_v12.txt"
+V3=${PIPESTATUS[0]}
+# This may return no alert if no admin-closed break for current user; it should not error.
+bench_exec execute restaurant_ops.api.break_api.get_my_break_admin_alert | tee "$BACKUP_DIR/my_break_alert_v12.txt"
+V4=${PIPESTATUS[0]}
+set -e
+
+if [[ $V1 -ne 0 || $V2 -ne 0 || $V3 -ne 0 || $V4 -ne 0 ]]; then
+  echo "❌ Backend validation failed. راجع: $BACKUP_DIR"
+  exit 1
+fi
+
+echo "🏥 Health Check - Elastix/CDR/AMI + Queue + Call Report"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$BACKUP_DIR/health_asterisk_bridge.txt"
+H1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status | tee "$BACKUP_DIR/health_queue_status.txt"
+H2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' | tee "$BACKUP_DIR/health_call_report.txt"
+H3=${PIPESTATUS[0]}
+set -e
+
+if [[ $H1 -ne 0 || $H2 -ne 0 || $H3 -ne 0 ]]; then
+  echo "⚠️ Health returned non-zero. راجع: $BACKUP_DIR"
+else
+  echo "✅ Health checks OK"
+fi
+
+echo "============================================================"
+echo "✅ DONE V12"
+echo "📦 Backup folder: $BACKUP_DIR"
+echo "📧 Hidden recipients admin@roshdy.com / el.alfy@roshdy.com are filtered from report emails"
+echo "⏱️ Agent full-screen break-ended alert uses robust matching + polling"
+echo "📊 Upper management email wording/order polished"
+echo "↩️ Cancellation reason dropdown + public reason normalization"
+echo "🛡️ report_api.py لم يتم لمسه"
+echo "============================================================"

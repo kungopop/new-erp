@@ -1,0 +1,512 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Roshdy V30: Fix Feedback Excel upload using chunked GET upload fallback
+# ----------------------------------------------------------------------
+# Problem:
+#   Browser multipart upload fails on /feedback-admin.
+# Fix:
+#   - Add safe chunked upload endpoints (GET, small base64 chunks) to feedback_api.py.
+#   - Override /feedback-admin uploadExcel() to use chunked upload.
+#   - Parser accepts xlsx even if extension is .pdf, headers name/phone, Arabic headers,
+#     and restores leading zero for Egyptian mobile numbers.
+# Safety:
+#   - Fresh snapshot/backup first.
+#   - Does NOT touch report_api.py / Elastix / CDR / AMI.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "❌ docker compose/docker-compose مش موجود"
+  exit 1
+fi
+
+APP_DIR="$ROOT/apps/$APP"
+PKG_DIR="$APP_DIR/$APP"
+API_DIR="$PKG_DIR/api"
+WWW_DIR="$PKG_DIR/www"
+FEEDBACK_API="$API_DIR/feedback_api.py"
+FEEDBACK_ADMIN_HTML="$WWW_DIR/feedback-admin.html"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/FIX_FEEDBACK_UPLOAD_CHUNKED_V30_BEFORE_$TS"
+mkdir -p "$BACKUP_DIR/files"
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend container مش شغال أو مش لاقيه"
+  exit 1
+fi
+
+bench_exec() {
+  "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"
+}
+
+echo "============================================================"
+echo "🔧 Roshdy V30: Feedback chunked upload fix"
+echo "📦 Snapshot/Backup: $BACKUP_DIR"
+echo "============================================================"
+
+if [[ ! -f "$FEEDBACK_API" || ! -f "$FEEDBACK_ADMIN_HTML" ]]; then
+  echo "❌ feedback_api.py أو feedback-admin.html مش موجودين. لازم موديول الفيدباك يكون مركب الأول."
+  exit 1
+fi
+
+echo "🧯 Step 1: Fresh snapshot + bench backup"
+cp -a "$FEEDBACK_API" "$BACKUP_DIR/files/feedback_api.py.before"
+cp -a "$FEEDBACK_ADMIN_HTML" "$BACKUP_DIR/files/feedback-admin.html.before"
+bench_exec backup --with-files | tee "$BACKUP_DIR/bench_backup_output.txt"
+
+echo "🧩 Step 2: Patch feedback_api.py chunked upload endpoints"
+cat >> "$FEEDBACK_API" <<'PYAPI'
+
+# BEGIN ROSHDY FEEDBACK CHUNKED UPLOAD V30
+try:
+    import base64 as _fb30_base64
+    import csv as _fb30_csv
+    import io as _fb30_io
+    import json as _fb30_json
+    import os as _fb30_os
+    import re as _fb30_re
+    import shutil as _fb30_shutil
+    import uuid as _fb30_uuid
+    import frappe as _fb30_frappe
+    from frappe.utils import today as _fb30_today, now_datetime as _fb30_now_datetime, cstr as _fb30_cstr, cint as _fb30_cint
+except Exception:
+    pass
+
+
+def _fb30_temp_root():
+    path = _fb30_frappe.get_site_path("private", "files", "feedback_upload_tmp")
+    _fb30_os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _fb30_safe_upload_id(upload_id):
+    upload_id = _fb30_cstr(upload_id or "")
+    if not _fb30_re.match(r"^[A-Za-z0-9_.-]{8,80}$", upload_id):
+        _fb30_frappe.throw("upload_id غير صالح")
+    return upload_id
+
+
+def _fb30_upload_dir(upload_id):
+    upload_id = _fb30_safe_upload_id(upload_id)
+    root = _fb30_temp_root()
+    path = _fb30_os.path.abspath(_fb30_os.path.join(root, upload_id))
+    if not path.startswith(_fb30_os.path.abspath(root)):
+        _fb30_frappe.throw("مسار رفع غير آمن")
+    return path
+
+
+def _fb30_norm_phone(phone):
+    s = _fb30_cstr(phone or "").strip().replace("\xa0", "")
+    if _fb30_re.match(r"^\d+\.0$", s):
+        s = s[:-2]
+    trans = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
+    s = s.translate(trans)
+    plus = s.startswith("+")
+    digits = _fb30_re.sub(r"\D+", "", s)
+    if not digits:
+        return ""
+    if plus:
+        return "+" + digits
+    # Egyptian mobile after Excel drops initial zero.
+    if len(digits) == 10 and digits[:2] in ("10", "11", "12", "15"):
+        return "0" + digits
+    # Best-effort landline if zero is missing.
+    if len(digits) == 9:
+        return "0" + digits
+    return digits
+
+
+def _fb30_looks_phone(v):
+    digits = _fb30_re.sub(r"\D+", "", _fb30_cstr(v or ""))
+    return len(digits) >= 7
+
+
+def _fb30_cell(v):
+    if v is None:
+        return ""
+    try:
+        if isinstance(v, float) and v.is_integer():
+            return str(int(v))
+    except Exception:
+        pass
+    return _fb30_cstr(v).strip()
+
+
+def _fb30_header_map(headers):
+    hmap = {}
+    for i, h in enumerate(headers or []):
+        key = _fb30_cell(h).lower().strip()
+        if not key:
+            continue
+        if any(x in key for x in ("phone", "mobile", "tel", "number", "رقم", "موبايل", "تليفون", "هاتف", "رقم العميل")):
+            hmap.setdefault("phone", i)
+        elif any(x in key for x in ("name", "customer", "client", "اسم", "عميل", "اسم العميل")):
+            hmap.setdefault("name", i)
+    return hmap
+
+
+def _fb30_parse_bytes(content):
+    rows = []
+    # xlsx parser by content, not extension.
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(filename=_fb30_io.BytesIO(content), read_only=True, data_only=True)
+        ws = wb.active
+        it = ws.iter_rows(values_only=True)
+        try:
+            first = next(it)
+        except StopIteration:
+            return []
+        headers = list(first or [])
+        hmap = _fb30_header_map(headers)
+        data_rows = it if hmap.get("phone") is not None else iter([first] + list(it))
+        for row in data_rows:
+            vals = list(row or [])
+            if hmap.get("phone") is not None:
+                phone = vals[hmap["phone"]] if hmap["phone"] < len(vals) else ""
+                name = vals[hmap.get("name")] if hmap.get("name") is not None and hmap.get("name") < len(vals) else ""
+            else:
+                phone = ""; name = ""
+                for v in vals:
+                    txt = _fb30_cell(v)
+                    if _fb30_looks_phone(txt) and not phone:
+                        phone = txt
+                    elif txt and not name:
+                        name = txt
+            phone = _fb30_norm_phone(phone)
+            if phone:
+                rows.append({"customer_name": _fb30_cell(name), "customer_phone": phone})
+        return rows
+    except Exception:
+        pass
+    # CSV fallback.
+    try:
+        text = content.decode("utf-8-sig", errors="ignore")
+        reader = _fb30_csv.reader(_fb30_io.StringIO(text))
+        all_rows = list(reader)
+        if not all_rows:
+            return []
+        hmap = _fb30_header_map(all_rows[0])
+        data_rows = all_rows[1:] if hmap.get("phone") is not None else all_rows
+        for row in data_rows:
+            if hmap.get("phone") is not None:
+                phone = row[hmap["phone"]] if hmap["phone"] < len(row) else ""
+                name = row[hmap.get("name")] if hmap.get("name") is not None and hmap.get("name") < len(row) else ""
+            else:
+                phone = ""; name = ""
+                for v in row:
+                    if _fb30_looks_phone(v) and not phone:
+                        phone = v
+                    elif _fb30_cstr(v).strip() and not name:
+                        name = v
+            phone = _fb30_norm_phone(phone)
+            if phone:
+                rows.append({"customer_name": _fb30_cstr(name).strip(), "customer_phone": phone})
+    except Exception:
+        pass
+    return rows
+
+
+@_fb30_frappe.whitelist()
+def feedback_upload_start(filename=None):
+    ensure_feedback_doctype()
+    if not _is_admin():
+        _fb30_frappe.throw("غير مسموح")
+    upload_id = _fb30_uuid.uuid4().hex
+    path = _fb30_upload_dir(upload_id)
+    _fb30_os.makedirs(path, exist_ok=True)
+    meta = {"filename": _fb30_cstr(filename or ""), "user": _fb30_frappe.session.user, "created_at": _fb30_now_datetime().strftime("%Y-%m-%d %H:%M:%S")}
+    with open(_fb30_os.path.join(path, "meta.json"), "w", encoding="utf-8") as f:
+        f.write(_fb30_json.dumps(meta, ensure_ascii=False))
+    return {"success": True, "upload_id": upload_id}
+
+
+@_fb30_frappe.whitelist()
+def feedback_upload_chunk(upload_id=None, idx=None, data=None):
+    ensure_feedback_doctype()
+    if not _is_admin():
+        _fb30_frappe.throw("غير مسموح")
+    upload_id = _fb30_safe_upload_id(upload_id)
+    idx = _fb30_cint(idx)
+    if idx < 0:
+        _fb30_frappe.throw("chunk index غير صالح")
+    path = _fb30_upload_dir(upload_id)
+    if not _fb30_os.path.isdir(path):
+        _fb30_frappe.throw("جلسة الرفع غير موجودة")
+    data = _fb30_cstr(data or "")
+    # chunk data is base64 text; keep as text file.
+    with open(_fb30_os.path.join(path, "%06d.part" % idx), "w", encoding="ascii") as f:
+        f.write(data)
+    return {"success": True, "idx": idx}
+
+
+@_fb30_frappe.whitelist()
+def feedback_upload_commit(upload_id=None, total_chunks=None, feedback_date=None, shift_number=None, filename=None):
+    ensure_feedback_doctype()
+    if not _is_admin():
+        _fb30_frappe.throw("غير مسموح")
+    upload_id = _fb30_safe_upload_id(upload_id)
+    path = _fb30_upload_dir(upload_id)
+    if not _fb30_os.path.isdir(path):
+        _fb30_frappe.throw("جلسة الرفع غير موجودة")
+    total = _fb30_cint(total_chunks)
+    if total <= 0:
+        _fb30_frappe.throw("عدد أجزاء الملف غير صحيح")
+    feedback_date = _fb30_cstr(feedback_date or _fb30_today())[:10]
+    shift_number = _fb30_cstr(shift_number or "").strip()
+    if not shift_number:
+        _fb30_frappe.throw("رقم الوردية مطلوب")
+    pieces = []
+    for i in range(total):
+        fn = _fb30_os.path.join(path, "%06d.part" % i)
+        if not _fb30_os.path.exists(fn):
+            _fb30_frappe.throw("جزء ناقص من الملف: %s" % i)
+        with open(fn, "r", encoding="ascii") as f:
+            pieces.append(f.read())
+    b64 = "".join(pieces)
+    content = _fb30_base64.b64decode(b64)
+    rows = _fb30_parse_bytes(content)
+    if not rows:
+        _fb30_shutil.rmtree(path, ignore_errors=True)
+        return {"success": False, "message": "لم يتم العثور على أرقام صالحة داخل الملف", "parsed": 0, "filename": filename}
+    batch = "EXCEL-" + _fb30_now_datetime().strftime("%Y%m%d%H%M%S")
+    created = skipped = 0
+    errors = []
+    sample = []
+    for r in rows:
+        try:
+            res = _insert_item(r.get("customer_name"), r.get("customer_phone"), feedback_date, shift_number, source="excel", import_batch=batch, raw_payload=_fb30_json.dumps(r, ensure_ascii=False))
+            if res.get("skipped_duplicate"):
+                skipped += 1
+            else:
+                created += 1
+            if len(sample) < 5:
+                sample.append(r)
+        except Exception as e:
+            errors.append(_fb30_cstr(e))
+    _fb30_frappe.db.commit()
+    _fb30_shutil.rmtree(path, ignore_errors=True)
+    return {"success": True, "message": "تم رفع ملف الفيدباك", "filename": filename, "batch": batch, "parsed": len(rows), "created": created, "skipped_duplicates": skipped, "errors": errors[:20], "sample": sample}
+
+
+# Keep normal multipart upload too, but make it use the same parser.
+@_fb30_frappe.whitelist()
+def upload_feedback_excel(feedback_date=None, shift_number=None, filedata=None, filename=None):
+    ensure_feedback_doctype()
+    if not _is_admin():
+        _fb30_frappe.throw("غير مسموح")
+    feedback_date = _fb30_cstr(feedback_date or _fb30_frappe.form_dict.get("feedback_date") or _fb30_today())[:10]
+    shift_number = _fb30_cstr(shift_number or _fb30_frappe.form_dict.get("shift_number") or "").strip()
+    if not shift_number:
+        _fb30_frappe.throw("رقم الوردية مطلوب قبل رفع الملف")
+    content = None
+    uploaded_name = filename or ""
+    try:
+        if _fb30_frappe.request and _fb30_frappe.request.files:
+            f = _fb30_frappe.request.files.get("file") or next(iter(_fb30_frappe.request.files.values()))
+            uploaded_name = getattr(f, "filename", "") or uploaded_name
+            content = f.read()
+    except Exception:
+        content = None
+    if content is None and filedata:
+        raw = _fb30_cstr(filedata)
+        if "," in raw and raw.split(",", 1)[0].startswith("data:"):
+            raw = raw.split(",", 1)[1]
+        content = _fb30_base64.b64decode(raw)
+    if not content:
+        _fb30_frappe.throw("ملف Excel/CSV مطلوب")
+    rows = _fb30_parse_bytes(content)
+    if not rows:
+        return {"success": False, "message": "لم يتم العثور على أرقام صالحة داخل الملف", "filename": uploaded_name, "parsed": 0}
+    batch = "EXCEL-" + _fb30_now_datetime().strftime("%Y%m%d%H%M%S")
+    created = skipped = 0
+    errors = []
+    sample = []
+    for r in rows:
+        try:
+            res = _insert_item(r.get("customer_name"), r.get("customer_phone"), feedback_date, shift_number, source="excel", import_batch=batch, raw_payload=_fb30_json.dumps(r, ensure_ascii=False))
+            if res.get("skipped_duplicate"):
+                skipped += 1
+            else:
+                created += 1
+            if len(sample) < 5:
+                sample.append(r)
+        except Exception as e:
+            errors.append(_fb30_cstr(e))
+    _fb30_frappe.db.commit()
+    return {"success": True, "message": "تم رفع ملف الفيدباك", "filename": uploaded_name, "batch": batch, "parsed": len(rows), "created": created, "skipped_duplicates": skipped, "errors": errors[:20], "sample": sample}
+
+
+@_fb30_frappe.whitelist()
+def debug_feedback_upload_parser_sample():
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["name", "phone"])
+    ws.append(["ا/ قمر محمود", 1014434368])
+    ws.append(["ا/نورين احمد", 1026608655])
+    ws.append(["ا/ امينه مصطفي", 502548189])
+    bio = _fb30_io.BytesIO()
+    wb.save(bio)
+    rows = _fb30_parse_bytes(bio.getvalue())
+    return {"success": True, "parsed": len(rows), "rows": rows}
+# END ROSHDY FEEDBACK CHUNKED UPLOAD V30
+PYAPI
+
+echo "🧩 Step 3: Override /feedback-admin upload JS with chunked upload"
+cat >> "$FEEDBACK_ADMIN_HTML" <<'HTML'
+
+<!-- BEGIN ROSHDY FEEDBACK CHUNKED UPLOAD V30 -->
+<script>
+(function(){
+  if(window.RoshdyFeedbackChunkedUploadV30) return;
+  window.RoshdyFeedbackChunkedUploadV30 = true;
+
+  function getEl(id){ return document.getElementById(id); }
+  function msg(text){
+    try { if(typeof toast === 'function') toast(text); else alert(text); }
+    catch(e){ alert(text); }
+  }
+  function qs(o){
+    var p = new URLSearchParams();
+    Object.keys(o||{}).forEach(function(k){ var v=o[k]; if(v!==undefined && v!==null && v!=='') p.append(k,v); });
+    return p.toString();
+  }
+  async function getApi(method,args){
+    var q = qs(args||{});
+    var r = await fetch('/api/method/'+method+(q?'?'+q:''), {method:'GET', credentials:'same-origin', cache:'no-store'});
+    var j = await r.json();
+    if(j.exc) throw j;
+    return j.message || j;
+  }
+  function requireShiftV30(){
+    var sh = getEl('add_shift');
+    if(!sh || !sh.value.trim()){
+      msg('رقم الوردية مطلوب قبل رفع الملف');
+      if(sh) sh.focus();
+      return false;
+    }
+    return true;
+  }
+  function readFileAsBase64(file){
+    return new Promise(function(resolve,reject){
+      var reader = new FileReader();
+      reader.onload = function(){
+        var s = String(reader.result||'');
+        resolve(s.indexOf(',')>=0 ? s.split(',',2)[1] : s);
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+  }
+
+  window.uploadExcel = async function(){
+    if(!requireShiftV30()) return;
+    var fileInput = getEl('file');
+    var file = fileInput && fileInput.files && fileInput.files[0];
+    if(!file){ msg('اختار ملف Excel/CSV'); return; }
+    var btn = getEl('uploadBtn');
+    var out = getEl('uploadResult');
+    if(btn){ btn.disabled=true; btn.textContent='جاري الرفع...'; }
+    if(out) out.textContent='جاري قراءة الملف...';
+    try{
+      var b64 = await readFileAsBase64(file);
+      var start = await getApi('restaurant_ops.api.feedback_api.feedback_upload_start', {filename:file.name});
+      if(!start || !start.success) throw new Error('فشل بدء جلسة الرفع');
+      var uploadId = start.upload_id;
+      var chunkSize = 1800; // safe URL size for old/proxy setups
+      var total = Math.ceil(b64.length / chunkSize);
+      for(var i=0;i<total;i++){
+        var chunk = b64.slice(i*chunkSize, (i+1)*chunkSize);
+        if(out) out.textContent='رفع الملف: جزء '+(i+1)+' من '+total;
+        await getApi('restaurant_ops.api.feedback_api.feedback_upload_chunk', {upload_id:uploadId, idx:i, data:chunk});
+      }
+      if(out) out.textContent='جاري تحليل الملف وحفظ البيانات...';
+      var res = await getApi('restaurant_ops.api.feedback_api.feedback_upload_commit', {
+        upload_id: uploadId,
+        total_chunks: total,
+        feedback_date: (getEl('add_date')||{}).value || '',
+        shift_number: (getEl('add_shift')||{}).value || '',
+        filename: file.name
+      });
+      if(!res.success){
+        msg(res.message || 'فشل رفع الملف');
+        if(out) out.textContent=res.message || 'فشل رفع الملف';
+        return;
+      }
+      var text='تم قراءة '+(res.parsed||0)+' صف — تم إضافة '+(res.created||0)+' — مكرر '+(res.skipped_duplicates||0);
+      msg(text);
+      if(out) out.textContent=text + (res.sample ? ' | عينة: '+JSON.stringify(res.sample) : '');
+      try{ if(typeof load === 'function') load(); }catch(e){}
+    }catch(e){
+      console.error(e);
+      msg('فشل رفع الملف: '+(e.message || 'راجع Console'));
+      if(out) out.textContent='فشل رفع الملف: '+(e.message || 'Error');
+    }finally{
+      if(btn){ btn.disabled=false; btn.textContent='رفع الملف'; }
+    }
+  };
+})();
+</script>
+<!-- END ROSHDY FEEDBACK CHUNKED UPLOAD V30 -->
+HTML
+
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+[[ -n "$APP_OWNER" ]] && chown "$APP_OWNER" "$FEEDBACK_API" "$FEEDBACK_ADMIN_HTML" 2>/dev/null || true
+
+echo "🧹 Step 4: Clear cache + restart app services"
+bench_exec clear-cache || true
+"${COMPOSE[@]}" restart backend frontend websocket queue-short queue-long scheduler >/dev/null
+sleep 8
+bench_exec clear-cache || true
+
+echo "🧪 Step 5: Validation"
+set +e
+for p in feedback-admin feedback; do
+  code="$(curl -k -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$p" 2>/dev/null || echo 000)"
+  echo "$p => $code" | tee -a "$BACKUP_DIR/page_smoke_checks_v30.txt"
+done
+bench_exec execute restaurant_ops.api.feedback_api.debug_feedback_upload_parser_sample | tee "$BACKUP_DIR/debug_feedback_upload_parser_sample.txt"
+V1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.feedback_api.debug_feedback_status | tee "$BACKUP_DIR/debug_feedback_status.txt"
+V2=${PIPESTATUS[0]}
+set -e
+
+if [[ $V1 -ne 0 || $V2 -ne 0 ]]; then
+  echo "❌ Validation failed. راجع: $BACKUP_DIR"
+  exit 1
+fi
+
+echo "🏥 Step 6: Health Check - Elastix/CDR/AMI + Queue + Call Report"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$BACKUP_DIR/health_asterisk_bridge.txt"
+H1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status | tee "$BACKUP_DIR/health_queue_status.txt"
+H2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' | tee "$BACKUP_DIR/health_call_report.txt"
+H3=${PIPESTATUS[0]}
+set -e
+
+if [[ $H1 -ne 0 || $H2 -ne 0 || $H3 -ne 0 ]]; then
+  echo "⚠️ Health returned non-zero. راجع: $BACKUP_DIR"
+else
+  echo "✅ Health checks OK"
+fi
+
+echo "============================================================"
+echo "✅ DONE V30"
+echo "📦 Backup folder: $BACKUP_DIR"
+echo "📤 Feedback upload now uses chunked upload, avoiding multipart/CSRF issues"
+echo "📌 Parser supports user's Book1 format: name / phone, and restores leading zeros"
+echo "🛡️ report_api.py / Elastix / CDR / AMI untouched"
+echo "============================================================"

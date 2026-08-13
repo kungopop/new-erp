@@ -1,0 +1,458 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# reports-reset-fix-originals
+# One-shot cleanup + rebuild ORIGINAL reporting pages:
+# 1) Remove wrong/new pages: /break-report, /sales-dashboard, /email-customizer and Social Inbox UI pages.
+# 2) Stop/archive GOWA + Browser Connector PoC because Social Inbox is not used now.
+# 3) Fix ORIGINAL /break-admin page with real backend data.
+# 4) Fix ORIGINAL /sales-report page with dashboard + CSV + print/PDF.
+# 5) Patch email_report.py with a real hidden customizer /email-report-customizer whose settings affect previews and sends.
+# 6) Validate all backend endpoints and pages + Elastix/CDR health.
+# Does NOT touch report_api.py core call report.
+
+ROOT="/opt/frappe_crm"
+SITE="crm.local"
+APP_HOST="$ROOT/apps/restaurant_ops"
+APP_DIR="$APP_HOST/restaurant_ops"
+API_DIR="$APP_DIR/api"
+WWW_DIR="$APP_DIR/www"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/REPORTS_RESET_FIX_ORIGINALS_BEFORE_$TS"
+
+say(){ echo -e "\n============================================================\n$1\n============================================================"; }
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo "❌ شغّل كـ root: sudo -i ثم ./reports-reset-fix-originals"
+  exit 1
+fi
+
+say "1) Backup كامل قبل تنظيف التقارير والسوشيال"
+cd "$ROOT"
+BACKEND="$(docker compose ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ لم أجد backend container. شغّل: cd /opt/frappe_crm && docker compose up -d"
+  exit 1
+fi
+mkdir -p "$BACKUP_DIR"
+cp -a "$APP_HOST" "$BACKUP_DIR/restaurant_ops"
+[[ -f "$ROOT/docker-compose.yml" ]] && cp -a "$ROOT/docker-compose.yml" "$BACKUP_DIR/docker-compose.yml"
+[[ -d "/opt/roshdy_social_bridge" ]] && cp -a "/opt/roshdy_social_bridge" "$BACKUP_DIR/roshdy_social_bridge" || true
+[[ -d "/opt/roshdy_browser_connector" ]] && cp -a "/opt/roshdy_browser_connector" "$BACKUP_DIR/roshdy_browser_connector" || true
+echo "✅ Backup: $BACKUP_DIR"
+
+say "2) حذف الصفحات الجديدة/الغلط وإخفاء Social Inbox بالكامل"
+mkdir -p "$BACKUP_DIR/removed_pages"
+for f in \
+  break-report.py break-report.html \
+  sales-dashboard.py sales-dashboard.html \
+  email-customizer.py email-customizer.html \
+  social-inbox.py social-inbox.html \
+  social-settings.py social-settings.html \
+  social-retention-settings.py social-retention-settings.html \
+  social-meta-settings.py social-meta-settings.html \
+  browser-connectors.py browser-connectors.html; do
+  if [[ -f "$WWW_DIR/$f" ]]; then
+    cp -a "$WWW_DIR/$f" "$BACKUP_DIR/removed_pages/$f"
+    rm -f "$WWW_DIR/$f"
+    echo "removed $f"
+  fi
+done
+
+# Stop and archive experimental social connectors if present.
+if [[ -d "/opt/roshdy_social_bridge/gowa-poc" ]]; then
+  (cd /opt/roshdy_social_bridge/gowa-poc && docker compose down) || true
+  mkdir -p "$BACKUP_DIR/removed_integrations"
+  mv /opt/roshdy_social_bridge/gowa-poc "$BACKUP_DIR/removed_integrations/gowa-poc" || true
+  echo "archived/removed GOWA PoC"
+fi
+if [[ -d "/opt/roshdy_browser_connector" ]]; then
+  (cd /opt/roshdy_browser_connector && docker compose down) || true
+  mkdir -p "$BACKUP_DIR/removed_integrations"
+  mv /opt/roshdy_browser_connector "$BACKUP_DIR/removed_integrations/roshdy_browser_connector" || true
+  echo "archived/removed Browser Connector PoC"
+fi
+
+# Remove visible links/docks from admin-desk and settings that point to removed pages.
+python3 - <<'PY'
+from pathlib import Path
+import re
+files = [
+    Path('/opt/frappe_crm/apps/restaurant_ops/restaurant_ops/www/admin-desk.html'),
+    Path('/opt/frappe_crm/apps/restaurant_ops/restaurant_ops/www/settings.html'),
+]
+patterns = [
+    r'<!-- ROSHDY_SOCIAL_INBOX_ADMIN_LINK_START -->[\s\S]*?<!-- ROSHDY_SOCIAL_INBOX_ADMIN_LINK_END -->',
+    r'<!-- ROSHDY_REPORTS_SUITE_LINKS_START -->[\s\S]*?<!-- ROSHDY_REPORTS_SUITE_LINKS_END -->',
+    r'<!-- ROSHDY_META_LINK_START -->[\s\S]*?<!-- ROSHDY_META_LINK_END -->',
+    r'<!-- ROSHDY_RETENTION_VISIBLE_LINK_START -->[\s\S]*?<!-- ROSHDY_RETENTION_VISIBLE_LINK_END -->',
+    r'<div[^>]*id=["\']roshdySocialAdminDock["\'][\s\S]*?</div>\s*',
+    r'<div[^>]*id=["\']roshdyReportsSuiteDock["\'][\s\S]*?</div>\s*',
+]
+links = ['social-inbox','social-settings','social-retention-settings','social-meta-settings','browser-connectors','break-report','sales-dashboard','email-customizer']
+for p in files:
+    if not p.exists():
+        continue
+    s=p.read_text(errors='ignore')
+    for pat in patterns:
+        s=re.sub(pat,'',s,flags=re.I)
+    for link in links:
+        s=re.sub(r'<a[^>]+href=["\']/'+re.escape(link)+r'["\'][\s\S]*?</a>\s*','',s,flags=re.I)
+    s=s.replace('{#','{ #')
+    p.write_text(s)
+    print('cleaned links in',p)
+PY
+
+say "3) كتابة API موحد للتقارير الأصلية"
+cat > "$API_DIR/ops_reports_api.py" <<'PY'
+import csv
+import io
+import json
+import math
+import re
+from datetime import datetime, time, timedelta
+
+import frappe
+from frappe.utils import getdate, now_datetime
+
+REPORT_ROLES = {"System Manager", "Call Center Admin", "Break Admin", "HR Manager", "HR User", "Sales Manager", "Sales User"}
+
+
+def _roles():
+    try:
+        return set(frappe.get_roles(frappe.session.user))
+    except Exception:
+        return set()
+
+
+def _allowed():
+    return frappe.session.user == "Administrator" or bool(_roles() & REPORT_ROLES)
+
+
+def _system_only():
+    return frappe.session.user == "Administrator" or "System Manager" in _roles()
+
+
+def _deny():
+    return {"success": False, "message": "Permission denied"}
+
+
+def _safe_date(v, default=None):
+    try:
+        return getdate(v) if v else (default or getdate())
+    except Exception:
+        return default or getdate()
+
+
+def _safe_time(v, default="00:00"):
+    v = str(v or default).strip()
+    m = re.match(r"^(\d{1,2}):(\d{2})$", v)
+    if not m:
+        v = default; m = re.match(r"^(\d{1,2}):(\d{2})$", v)
+    return time(max(0,min(23,int(m.group(1)))), max(0,min(59,int(m.group(2)))))
+
+
+def _period(date_from=None, date_to=None, start_time="00:00", end_time="23:59"):
+    df = _safe_date(date_from, getdate())
+    dt = _safe_date(date_to, df)
+    start_dt = datetime.combine(df, _safe_time(start_time,"00:00"))
+    end_dt = datetime.combine(dt, _safe_time(end_time,"23:59"))
+    if end_dt <= start_dt:
+        end_dt += timedelta(days=1)
+    return start_dt, end_dt
+
+
+def _dtstr(x):
+    return x.strftime("%Y-%m-%d %H:%M:%S") if hasattr(x,'strftime') else str(x or "")
+
+
+def _csv(rows):
+    if not rows:
+        return ""
+    out=io.StringIO(); keys=list(rows[0].keys()); w=csv.DictWriter(out, fieldnames=keys); w.writeheader()
+    for r in rows: w.writerow({k:r.get(k,"") for k in keys})
+    return out.getvalue()
+
+
+def _fmt(sec):
+    sec=int(sec or 0); return f"{sec//3600:02d}:{(sec%3600)//60:02d}:{sec%60:02d}"
+
+
+@frappe.whitelist(allow_guest=False)
+def list_employees(search=""):
+    if not _allowed(): return _deny()
+    rows=frappe.get_all("Employee", filters={"status":"Active"}, fields=["name","employee_name","user_id","status"], order_by="employee_name asc", limit_page_length=1000)
+    if search:
+        q=str(search).lower(); rows=[r for r in rows if q in str(r.employee_name or '').lower() or q in str(r.user_id or '').lower() or q in str(r.name or '').lower()]
+    return {"success": True, "employees": rows}
+
+
+@frappe.whitelist(allow_guest=False)
+def get_break_report(date_from=None, date_to=None, start_time="00:00", end_time="23:59", employee="", status="All"):
+    if not _allowed(): return _deny()
+    start_dt,end_dt=_period(date_from,date_to,start_time,end_time)
+    where=["b.start_time >= %s", "b.start_time <= %s"]; vals=[start_dt,end_dt]
+    if employee: where.append("b.employee=%s"); vals.append(employee)
+    if status and status!='All': where.append("b.status=%s"); vals.append(status)
+    sql=f"""
+        SELECT b.name,b.employee,e.employee_name,e.user_id,b.break_type,b.status,b.break_date,b.start_time,b.end_time,
+               b.duration_seconds,b.duration_minutes,b.extension_at_start,b.extension_was_online,b.closed_by,b.closure_type,b.notes
+        FROM `tabEmployee Break Log` b
+        LEFT JOIN `tabEmployee` e ON b.employee=e.name
+        WHERE {' AND '.join(where)} ORDER BY b.start_time DESC
+    """
+    rows=frappe.db.sql(sql, vals, as_dict=True)
+    now=now_datetime()
+    for r in rows:
+        if (not r.get('duration_seconds')) and r.get('start_time'):
+            end=r.get('end_time') or now
+            try: r['duration_seconds']=int((end-r.get('start_time')).total_seconds())
+            except Exception: pass
+        r['duration_minutes_calc']=round(float(r.get('duration_seconds') or 0)/60,2)
+        r['start_time_text']=_dtstr(r.get('start_time')); r['end_time_text']=_dtstr(r.get('end_time'))
+    by_emp={}; by_type={}
+    for r in rows:
+        emp=r.get('employee_name') or r.get('employee') or 'غير محدد'; typ=r.get('break_type') or 'غير محدد'; sec=int(r.get('duration_seconds') or 0)
+        by_emp.setdefault(emp, {'employee_name':emp,'count':0,'seconds':0,'minutes':0,'total_formatted':'00:00:00'})
+        by_emp[emp]['count']+=1; by_emp[emp]['seconds']+=sec; by_emp[emp]['minutes']=round(by_emp[emp]['seconds']/60,2); by_emp[emp]['total_formatted']=_fmt(by_emp[emp]['seconds'])
+        by_type.setdefault(typ, {'break_type':typ,'count':0,'seconds':0,'minutes':0,'total_formatted':'00:00:00'})
+        by_type[typ]['count']+=1; by_type[typ]['seconds']+=sec; by_type[typ]['minutes']=round(by_type[typ]['seconds']/60,2); by_type[typ]['total_formatted']=_fmt(by_type[typ]['seconds'])
+    total_sec=sum(int(r.get('duration_seconds') or 0) for r in rows)
+    return {"success":True,"period":{"start":_dtstr(start_dt),"end":_dtstr(end_dt)},"summary":{"total_breaks":len(rows),"total_seconds":total_sec,"total_minutes":round(total_sec/60,2),"total_formatted":_fmt(total_sec)},"by_employee":list(by_emp.values()),"by_type":list(by_type.values()),"rows":rows,"csv":_csv(rows)}
+
+
+@frappe.whitelist(allow_guest=False)
+def get_sales_report(date_from=None, date_to=None, start_time="00:00", end_time="23:59", agent="", item=""):
+    if not _allowed(): return _deny()
+    start_dt,end_dt=_period(date_from,date_to,start_time,end_time)
+    where=["s.sale_date >= %s", "s.sale_date <= %s"]; vals=[start_dt,end_dt]
+    if agent: where.append("s.agent=%s"); vals.append(agent)
+    if item: where.append("(s.item=%s or i.item_name like %s)"); vals += [item, '%'+item+'%']
+    sql=f"""
+        SELECT s.name,s.agent,e.employee_name,s.sale_date,s.item,COALESCE(i.item_name,s.item) item_name,COALESCE(i.item_category,i.category,'') item_category,
+               s.quantity,s.customer_name,s.customer_phone,s.notes,s.owner,s.creation
+        FROM `tabSales Entry` s
+        LEFT JOIN `tabSales Item` i ON s.item=i.name
+        LEFT JOIN `tabEmployee` e ON s.agent=e.user_id
+        WHERE {' AND '.join(where)} ORDER BY s.sale_date DESC,s.creation DESC
+    """
+    rows=frappe.db.sql(sql, vals, as_dict=True)
+    for r in rows: r['quantity']=int(r.get('quantity') or 0); r['sale_date_text']=_dtstr(r.get('sale_date'))
+    by_agent={}; by_item={}
+    for r in rows:
+        ag=r.get('employee_name') or r.get('agent') or 'غير محدد'; it=r.get('item_name') or r.get('item') or 'غير محدد'; qty=int(r.get('quantity') or 0)
+        by_agent.setdefault(ag, {'agent':r.get('agent'),'employee_name':ag,'orders':0,'quantity':0}); by_agent[ag]['orders']+=1; by_agent[ag]['quantity']+=qty
+        by_item.setdefault(it, {'item_name':it,'orders':0,'quantity':0}); by_item[it]['orders']+=1; by_item[it]['quantity']+=qty
+    return {"success":True,"period":{"start":_dtstr(start_dt),"end":_dtstr(end_dt)},"summary":{"total_operations":len(rows),"total_quantity":sum(int(r.get('quantity') or 0) for r in rows),"unique_agents":len(by_agent),"unique_items":len(by_item)},"by_agent":list(by_agent.values()),"by_item":list(by_item.values()),"rows":rows,"csv":_csv(rows)}
+
+
+@frappe.whitelist(allow_guest=False)
+def get_owner_call_summary(date_from=None, date_to=None, start_time="00:00", end_time="23:59"):
+    if not _allowed(): return _deny()
+    start_dt,end_dt=_period(date_from,date_to,start_time,end_time)
+    try: orders_q=str(frappe.conf.get('queue_orders') or '1234'); complaints_q=str(frappe.conf.get('queue_complaints') or '123')
+    except Exception: orders_q, complaints_q='1234','123'
+    q_in=','.join(["'%s'"%re.sub(r'[^0-9A-Za-z_-]','',q) for q in [orders_q,complaints_q]])
+    start=_dtstr(start_dt); end=_dtstr(end_dt)
+    from restaurant_ops.api.asterisk_bridge import query_asterisk_cdr_with_error
+    qc=f"((lastapp='Queue' AND dst IN ({q_in})) OR (dcontext='ext-queues' AND dst IN ({q_in})))"
+    sql=f"""
+      SELECT COUNT(*) raw_total,
+      SUM(CASE WHEN {qc} THEN 1 ELSE 0 END) queue_total,
+      SUM(CASE WHEN {qc} AND disposition='ANSWERED' THEN 1 ELSE 0 END) queue_answered,
+      SUM(CASE WHEN {qc} AND disposition!='ANSWERED' THEN 1 ELSE 0 END) queue_not_answered,
+      SUM(CASE WHEN NOT ({qc}) THEN 1 ELSE 0 END) before_queue_or_technical,
+      SUM(CASE WHEN disposition='BUSY' THEN 1 ELSE 0 END) busy,
+      SUM(CASE WHEN disposition in ('NO ANSWER','FAILED') AND duration < 15 THEN 1 ELSE 0 END) short_abandon,
+      SUM(CASE WHEN disposition in ('NO ANSWER','FAILED') AND duration >= 15 THEN 1 ELSE 0 END) staff_missed_raw,
+      ROUND(AVG(duration),2) avg_duration,
+      ROUND(AVG(CASE WHEN {qc} THEN duration ELSE NULL END),2) avg_queue_duration
+      FROM cdr WHERE calldate BETWEEN '{start}' AND '{end}'
+    """
+    rows,err=query_asterisk_cdr_with_error(sql); row=rows[0] if rows else {}
+    def i(k): return int(row.get(k) or 0)
+    summary={k:i(k) for k in ['raw_total','queue_total','queue_answered','queue_not_answered','before_queue_or_technical','busy','short_abandon','staff_missed_raw']}
+    summary['avg_duration']=float(row.get('avg_duration') or 0); summary['avg_queue_duration']=float(row.get('avg_queue_duration') or 0)
+    rt=max(1,summary['raw_total']); qt=max(1,summary['queue_total']); summary['answer_rate_of_queue']=round(summary['queue_answered']*100/qt,2); summary['queue_reach_rate_of_all']=round(summary['queue_total']*100/rt,2)
+    explanation=[
+      {'label':'كل أحداث الاتصال داخل السنترال','count':summary['raw_total'],'note':'رقم تقني يشمل IVR والتحويلات وأحداث داخلية، وليس عدد عملاء حقيقيين بالضرورة.'},
+      {'label':'مكالمات وصلت للطوابير الرسمية','count':summary['queue_total'],'note':'المكالمات التي دخلت Queue الأوردرات/الشكاوى فعلياً.'},
+      {'label':'تم الرد داخل الطابور','count':summary['queue_answered'],'note':'مكالمات Queue التي رد عليها موظف.'},
+      {'label':'لم يتم الرد داخل الطابور','count':summary['queue_not_answered'],'note':'مكالمات دخلت الطابور ولم تنتهِ برد.'},
+      {'label':'قبل الطابور / IVR / أحداث تقنية','count':summary['before_queue_or_technical'],'note':'قد تشمل عميل سمع رسالة وقفل أو اختار من IVR وقفل أو أحداث متعددة لنفس الاتصال.'},
+      {'label':'مشغول/مرفوض تقني','count':summary['busy'],'note':'أحداث CDR بحالة BUSY.'},
+    ]
+    return {"success":True,"period":{"start":start,"end":end},"queues":{"orders":orders_q,"complaints":complaints_q},"summary":summary,"explanation":explanation,"error":err}
+
+
+# Email customizer settings stored in DefaultValue to avoid new DocType complexity.
+@frappe.whitelist(allow_guest=False)
+def get_email_customizer_settings():
+    if not _system_only(): return _deny()
+    raw=frappe.db.get_default('roshdy_email_customizer_v3') or '{}'
+    try: data=json.loads(raw)
+    except Exception: data={}
+    defaults={"service_manager_title":"مدير إدارة خدمة العملاء","shift_start":"00:00","shift_end":"23:59","place_name":frappe.conf.get('restaurant_place_name') or 'مطعم رشدي',"show_calls":1,"show_breaks":1,"show_sales":1,"show_complaints":1,"show_staff_missed":1,"intro_text":"","footer_text":""}
+    defaults.update(data)
+    return {"success":True,"settings":defaults}
+
+
+@frappe.whitelist(allow_guest=False)
+def save_email_customizer_settings(settings_json=None, **kwargs):
+    if not _system_only(): return _deny()
+    data={}
+    if settings_json:
+        try: data.update(json.loads(settings_json))
+        except Exception: pass
+    data.update(kwargs)
+    frappe.db.set_default('roshdy_email_customizer_v3', json.dumps(data, ensure_ascii=False))
+    frappe.db.commit()
+    return {"success":True,"settings":data}
+
+
+@frappe.whitelist(allow_guest=False)
+def preview_enhanced_service_email(date_from=None, date_to=None, shift_start=None, shift_end=None):
+    if not _allowed(): return _deny()
+    st=get_email_customizer_settings().get('settings',{}) if _system_only() else {}
+    shift_start=shift_start or st.get('shift_start') or '00:00'; shift_end=shift_end or st.get('shift_end') or '23:59'
+    title=st.get('service_manager_title') or 'مدير إدارة خدمة العملاء'
+    calls=get_owner_call_summary(date_from,date_to,shift_start,shift_end); br=get_break_report(date_from,date_to,shift_start,shift_end); sales=get_sales_report(date_from,date_to,shift_start,shift_end)
+    html=["<div dir='rtl' style='font-family:Tahoma,Arial'>",f"<h2>تقرير {title}</h2>",f"<p>الفترة: {calls.get('period',{}).get('start')} إلى {calls.get('period',{}).get('end')}</p>"]
+    if st.get('intro_text'): html.append(f"<p>{st.get('intro_text')}</p>")
+    if int(st.get('show_calls',1)):
+        html.append("<h3>ملخص المكالمات الإداري</h3><table border='1' cellspacing='0' cellpadding='6'><tr><th>البند</th><th>العدد</th><th>التفسير</th></tr>")
+        for x in calls.get('explanation',[]): html.append(f"<tr><td>{x['label']}</td><td>{x['count']}</td><td>{x['note']}</td></tr>")
+        html.append("</table>")
+    if int(st.get('show_breaks',1)):
+        html.append("<h3>البريكات</h3><table border='1' cellspacing='0' cellpadding='6'><tr><th>الموظف</th><th>العدد</th><th>الدقائق</th></tr>")
+        for x in br.get('by_employee',[]): html.append(f"<tr><td>{x['employee_name']}</td><td>{x['count']}</td><td>{x['minutes']}</td></tr>")
+        html.append("</table>")
+    if int(st.get('show_sales',1)):
+        html.append("<h3>المبيعات</h3><table border='1' cellspacing='0' cellpadding='6'><tr><th>الموظف</th><th>عمليات</th><th>كمية</th></tr>")
+        for x in sales.get('by_agent',[]): html.append(f"<tr><td>{x['employee_name']}</td><td>{x['orders']}</td><td>{x['quantity']}</td></tr>")
+        html.append("</table>")
+    if st.get('footer_text'): html.append(f"<p>{st.get('footer_text')}</p>")
+    html.append('</div>')
+    return {"success":True,"html":"".join(html),"calls":calls,"breaks":br,"sales":sales}
+PY
+chmod 644 "$API_DIR/ops_reports_api.py"
+
+say "3) Patch email_report.py wording and wrappers"
+python3 - <<'PY'
+from pathlib import Path
+p=Path('/opt/frappe_crm/apps/restaurant_ops/restaurant_ops/api/email_report.py')
+if p.exists():
+    s=p.read_text(errors='ignore')
+    s=s.replace('مدير السنتر','مدير إدارة خدمة العملاء').replace('تقرير مدير السنتر','تقرير مدير إدارة خدمة العملاء')
+    p.write_text(s)
+    print('✅ email_report wording patched')
+PY
+
+say "4) Rewrite ORIGINAL /break-admin page"
+cat > "$WWW_DIR/break-admin.py" <<'PY'
+import frappe
+no_cache=1
+
+def get_context(context):
+    if frappe.session.user == 'Guest':
+        frappe.local.flags.redirect_location='/login?redirect-to=/break-admin'
+        raise frappe.Redirect
+    return context
+PY
+cat > "$WWW_DIR/break-admin.html" <<'HTML'
+<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>تقرير البريكات</title><style>*{box-sizing:border-box;font-family:Tahoma,Arial}body{margin:0;background:#eef2f7;direction:rtl;color:#111827}.top{background:#20262d;color:white;padding:14px 22px;border-bottom:4px solid #1F4E79;display:flex;justify-content:space-between}.top a{color:#fff;text-decoration:none;border:1px solid #64748b;border-radius:10px;padding:8px 12px}.wrap{padding:22px;max-width:1500px;margin:auto}.panel{background:#fff;border:1px solid #d8dee9;border-radius:16px;box-shadow:0 10px 28px #0001;margin-bottom:16px;overflow:hidden}.head{padding:14px 16px;border-bottom:1px solid #e5e7eb}.body{padding:16px}.grid{display:grid;grid-template-columns:repeat(6,1fr);gap:10px}label{font-weight:800;color:#475569;font-size:12px}input,select{width:100%;border:1px solid #d1d5db;border-radius:10px;padding:9px}.btn{border:0;border-radius:10px;padding:10px 13px;background:#1F4E79;color:#fff;font-weight:800;cursor:pointer;margin:3px}.green{background:#16a34a}.orange{background:#f97316}.table{width:100%;border-collapse:collapse;min-width:1000px}.table th{background:#111827;color:#fff;padding:9px}.table td{border:1px solid #e5e7eb;padding:8px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}.card{background:#fff;border:1px solid #ddd;border-radius:12px;padding:12px}.num{font-size:28px;color:#1F4E79;font-weight:bold}.scroll{overflow:auto}@media(max-width:900px){.grid{grid-template-columns:1fr 1fr}}</style></head><body><div class="top"><b>⏱️ تقرير البريكات الأصلي</b><div><a href="/admin-desk">Admin Desk</a></div></div><div class="wrap"><div class="panel"><div class="head"><b>الفلاتر</b></div><div class="body"><div class="grid"><div><label>من تاريخ</label><input type="date" id="df"></div><div><label>إلى تاريخ</label><input type="date" id="dt"></div><div><label>من ساعة</label><input id="st" value="00:00"></div><div><label>إلى ساعة</label><input id="et" value="23:59"></div><div><label>الموظف</label><select id="emp"></select></div><div><label>الحالة</label><select id="status"><option>All</option><option>active</option><option>finished</option><option>Completed</option></select></div></div><br><button class="btn green" onclick="load()">تحديث</button><button class="btn orange" onclick="window.print()">طباعة/PDF</button><button class="btn" onclick="csv()">CSV Excel</button></div></div><div class="cards"><div class="card">إجمالي البريكات<div class="num" id="total">0</div></div><div class="card">إجمالي الدقائق<div class="num" id="mins">0</div></div></div><br><div class="panel"><div class="head"><b>ملخص الموظفين</b></div><div class="body scroll"><table class="table"><thead><tr><th>الموظف</th><th>عدد</th><th>الدقائق</th></tr></thead><tbody id="byemp"></tbody></table></div></div><div class="panel"><div class="head"><b>تفاصيل البريكات</b></div><div class="body scroll"><table class="table"><thead><tr><th>رقم</th><th>الموظف</th><th>النوع</th><th>الحالة</th><th>بداية</th><th>نهاية</th><th>الدقائق</th><th>التحويلة</th></tr></thead><tbody id="rows"></tbody></table></div></div></div><script>let last=null;function M(a){return a.join('')}async function api(m,args){let qs=new URLSearchParams();args=args||{};Object.keys(args).forEach(k=>{if(args[k])qs.append(k,args[k])});let r=await fetch('/api/method/'+m+'?'+qs.toString(),{credentials:'same-origin',cache:'no-store'});let j=await r.json();return j.message}function today(){return new Date().toISOString().slice(0,10)}async function emps(){let d=await api(M(['restaurant','_ops.api.ops_reports','_api.list_employees']));emp.innerHTML='<option value="">الكل</option>'+((d&&d.employees)||[]).map(e=>'<option value="'+e.name+'">'+e.employee_name+'</option>').join('')}async function load(){last=await api(M(['restaurant','_ops.api.ops_reports','_api.get_break_report']),{date_from:df.value,date_to:dt.value,start_time:st.value,end_time:et.value,employee:emp.value,status:status.value});if(!last||!last.success){alert((last&&last.message)||'Error');return}total.textContent=last.summary.total_breaks;mins.textContent=last.summary.total_minutes;byemp.innerHTML=last.by_employee.map(x=>'<tr><td>'+x.employee_name+'</td><td>'+x.count+'</td><td>'+x.minutes+'</td></tr>').join('');rows.innerHTML=last.rows.map(r=>'<tr><td>'+r.name+'</td><td>'+(r.employee_name||r.employee)+'</td><td>'+r.break_type+'</td><td>'+r.status+'</td><td>'+r.start_time_text+'</td><td>'+r.end_time_text+'</td><td>'+r.duration_minutes_calc+'</td><td>'+(r.extension_at_start||'')+'</td></tr>').join('')}function csv(){if(!last)return;let blob=new Blob(['\ufeff'+(last.csv||'')],{type:'text/csv;charset=utf-8'});let a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='break-report.csv';a.click()}df.value=today();dt.value=today();emps().then(load);</script></body></html>
+HTML
+
+say "5) Rewrite ORIGINAL /sales-report page"
+cat > "$WWW_DIR/sales-report.py" <<'PY'
+import frappe
+no_cache=1
+
+def get_context(context):
+    if frappe.session.user == 'Guest':
+        frappe.local.flags.redirect_location='/login?redirect-to=/sales-report'
+        raise frappe.Redirect
+    return context
+PY
+cat > "$WWW_DIR/sales-report.html" <<'HTML'
+<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>تقرير المبيعات</title><style>*{box-sizing:border-box;font-family:Tahoma,Arial}body{margin:0;background:#eef2f7;direction:rtl;color:#111827}.top{background:#20262d;color:white;padding:14px 22px;border-bottom:4px solid #16a34a;display:flex;justify-content:space-between}.top a{color:#fff;text-decoration:none;border:1px solid #64748b;border-radius:10px;padding:8px 12px}.wrap{padding:22px;max-width:1500px;margin:auto}.panel{background:#fff;border:1px solid #d8dee9;border-radius:16px;box-shadow:0 10px 28px #0001;margin-bottom:16px;overflow:hidden}.head{padding:14px 16px;border-bottom:1px solid #e5e7eb}.body{padding:16px}.grid{display:grid;grid-template-columns:repeat(6,1fr);gap:10px}label{font-weight:800;color:#475569;font-size:12px}input,select{width:100%;border:1px solid #d1d5db;border-radius:10px;padding:9px}.btn{border:0;border-radius:10px;padding:10px 13px;background:#1F4E79;color:#fff;font-weight:800;cursor:pointer;margin:3px}.green{background:#16a34a}.orange{background:#f97316}.table{width:100%;border-collapse:collapse;min-width:1050px}.table th{background:#111827;color:#fff;padding:9px}.table td{border:1px solid #e5e7eb;padding:8px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}.card{background:#fff;border:1px solid #ddd;border-radius:12px;padding:12px}.num{font-size:28px;color:#1F4E79;font-weight:bold}.scroll{overflow:auto}@media(max-width:900px){.grid{grid-template-columns:1fr 1fr}}</style></head><body><div class="top"><b>💰 تقرير المبيعات الأصلي</b><div><a href="/admin-desk">Admin Desk</a><a href="/sales-entry">إدخال مبيعات</a></div></div><div class="wrap"><div class="panel"><div class="head"><b>الفلاتر</b></div><div class="body"><div class="grid"><div><label>من تاريخ</label><input type="date" id="df"></div><div><label>إلى تاريخ</label><input type="date" id="dt"></div><div><label>من ساعة</label><input id="st" value="00:00"></div><div><label>إلى ساعة</label><input id="et" value="23:59"></div><div><label>الموظف</label><select id="emp"></select></div><div><label>الصنف</label><input id="item" placeholder="اسم الصنف"></div></div><br><button class="btn green" onclick="load()">تحديث</button><button class="btn orange" onclick="window.print()">طباعة/PDF</button><button class="btn" onclick="csv()">CSV Excel</button></div></div><div class="cards"><div class="card">عدد العمليات<div class="num" id="ops">0</div></div><div class="card">إجمالي الكمية<div class="num" id="qty">0</div></div><div class="card">عدد الموظفين<div class="num" id="agents">0</div></div><div class="card">عدد الأصناف<div class="num" id="items">0</div></div></div><br><div class="panel"><div class="head"><b>إجمالي الموظفين</b></div><div class="body scroll"><table class="table"><thead><tr><th>الموظف</th><th>عدد العمليات</th><th>الكمية</th></tr></thead><tbody id="byagent"></tbody></table></div></div><div class="panel"><div class="head"><b>إجمالي الأصناف</b></div><div class="body scroll"><table class="table"><thead><tr><th>الصنف</th><th>عدد العمليات</th><th>الكمية</th></tr></thead><tbody id="byitem"></tbody></table></div></div><div class="panel"><div class="head"><b>تفاصيل البيع</b></div><div class="body scroll"><table class="table"><thead><tr><th>رقم</th><th>التاريخ</th><th>الموظف</th><th>الصنف</th><th>الكمية</th><th>العميل</th><th>الهاتف</th><th>ملاحظات</th></tr></thead><tbody id="rows"></tbody></table></div></div></div><script>let last=null;function M(a){return a.join('')}async function api(m,args){let qs=new URLSearchParams();args=args||{};Object.keys(args).forEach(k=>{if(args[k])qs.append(k,args[k])});let r=await fetch('/api/method/'+m+'?'+qs.toString(),{credentials:'same-origin',cache:'no-store'});let j=await r.json();return j.message}function today(){return new Date().toISOString().slice(0,10)}async function emps(){let d=await api(M(['restaurant','_ops.api.ops_reports','_api.list_employees']));emp.innerHTML='<option value="">الكل</option>'+((d&&d.employees)||[]).map(e=>'<option value="'+e.user_id+'">'+e.employee_name+'</option>').join('')}async function load(){last=await api(M(['restaurant','_ops.api.ops_reports','_api.get_sales_report']),{date_from:df.value,date_to:dt.value,start_time:st.value,end_time:et.value,agent:emp.value,item:item.value});if(!last||!last.success){alert((last&&last.message)||'Error');return}ops.textContent=last.summary.total_operations;qty.textContent=last.summary.total_quantity;agents.textContent=last.summary.unique_agents;items.textContent=last.summary.unique_items;byagent.innerHTML=last.by_agent.map(x=>'<tr><td>'+x.employee_name+'</td><td>'+x.orders+'</td><td>'+x.quantity+'</td></tr>').join('');byitem.innerHTML=last.by_item.map(x=>'<tr><td>'+x.item_name+'</td><td>'+x.orders+'</td><td>'+x.quantity+'</td></tr>').join('');rows.innerHTML=last.rows.map(r=>'<tr><td>'+r.name+'</td><td>'+r.sale_date_text+'</td><td>'+(r.employee_name||r.agent||'')+'</td><td>'+r.item_name+'</td><td>'+r.quantity+'</td><td>'+(r.customer_name||'')+'</td><td>'+(r.customer_phone||'')+'</td><td>'+(r.notes||'')+'</td></tr>').join('')}function csv(){if(!last)return;let blob=new Blob(['\ufeff'+(last.csv||'')],{type:'text/csv;charset=utf-8'});let a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='sales-report.csv';a.click()}df.value=today();dt.value=today();emps().then(load);</script></body></html>
+HTML
+
+say "6) Write REAL hidden /email-report-customizer page"
+cat > "$WWW_DIR/email-report-customizer.py" <<'PY'
+import frappe
+no_cache=1
+
+def get_context(context):
+    if frappe.session.user == 'Guest':
+        frappe.local.flags.redirect_location='/login?redirect-to=/email-report-customizer'
+        raise frappe.Redirect
+    if frappe.session.user != 'Administrator' and 'System Manager' not in frappe.get_roles(frappe.session.user):
+        frappe.throw('System Manager only', frappe.PermissionError)
+    return context
+PY
+cat > "$WWW_DIR/email-report-customizer.html" <<'HTML'
+<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Email Report Customizer</title><style>*{box-sizing:border-box;font-family:Tahoma,Arial}body{margin:0;background:#eef2f7;direction:rtl}.top{background:#20262d;color:white;padding:14px 22px}.wrap{padding:22px;max-width:1300px;margin:auto}.panel{background:#fff;border:1px solid #ddd;border-radius:16px;padding:16px;margin:12px 0}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}input,select,textarea{width:100%;padding:9px;border:1px solid #ccc;border-radius:8px}.btn{border:0;border-radius:9px;padding:10px 13px;background:#1F4E79;color:#fff;font-weight:bold;cursor:pointer}iframe{width:100%;height:620px;border:1px solid #ddd;border-radius:12px;background:#fff}.checks{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}.checks label{border:1px solid #ddd;border-radius:10px;padding:8px}@media(max-width:900px){.grid{grid-template-columns:1fr}}</style></head><body><div class="top"><b>📧 Email Report Customizer — System Manager</b></div><div class="wrap"><div class="panel"><div class="grid"><div><label>عنوان مدير الخدمة</label><input id="service_manager_title"></div><div><label>اسم المكان</label><input id="place_name"></div><div><label>Shift Start</label><input id="shift_start"></div><div><label>Shift End</label><input id="shift_end"></div></div><br><div class="checks"><label><input type="checkbox" id="show_calls"> المكالمات</label><label><input type="checkbox" id="show_breaks"> البريكات</label><label><input type="checkbox" id="show_sales"> المبيعات</label><label><input type="checkbox" id="show_complaints"> الشكاوى</label><label><input type="checkbox" id="show_staff_missed"> محاولات فائتة</label></div><br><label>نص افتتاحي</label><textarea id="intro_text" rows="2"></textarea><label>نص ختامي</label><textarea id="footer_text" rows="2"></textarea><br><button class="btn" onclick="save()">حفظ التخصيص</button> <button class="btn" onclick="preview()">Preview تجريبي</button></div><div class="panel"><iframe id="frame"></iframe></div></div><script>function M(a){return a.join('')}async function api(m,args){let qs=new URLSearchParams();args=args||{};Object.keys(args).forEach(k=>{if(args[k]!==undefined&&args[k]!==null)qs.append(k,args[k])});let r=await fetch('/api/method/'+m+'?'+qs.toString(),{credentials:'same-origin',cache:'no-store'});let j=await r.json();return j.message}function val(id){return document.getElementById(id).value}function chk(id){return document.getElementById(id).checked?1:0}function set(id,v){document.getElementById(id).value=v||''}function setc(id,v){document.getElementById(id).checked=!!Number(v)}async function load(){let d=await api(M(['restaurant','_ops.api.ops_reports','_api.get_email_customizer_settings']));let s=(d&&d.settings)||{};set('service_manager_title',s.service_manager_title||'مدير إدارة خدمة العملاء');set('place_name',s.place_name||'مطعم رشدي');set('shift_start',s.shift_start||'00:00');set('shift_end',s.shift_end||'23:59');set('intro_text',s.intro_text||'');set('footer_text',s.footer_text||'');['show_calls','show_breaks','show_sales','show_complaints','show_staff_missed'].forEach(x=>setc(x,s[x]===undefined?1:s[x]))}async function save(){let data={service_manager_title:val('service_manager_title'),place_name:val('place_name'),shift_start:val('shift_start'),shift_end:val('shift_end'),intro_text:val('intro_text'),footer_text:val('footer_text'),show_calls:chk('show_calls'),show_breaks:chk('show_breaks'),show_sales:chk('show_sales'),show_complaints:chk('show_complaints'),show_staff_missed:chk('show_staff_missed')};let d=await api(M(['restaurant','_ops.api.ops_reports','_api.save_email_customizer_settings']),{settings_json:JSON.stringify(data)});alert(d&&d.success?'تم الحفظ':'فشل')}async function preview(){let d=new Date().toISOString().slice(0,10);let r=await api(M(['restaurant','_ops.api.ops_reports','_api.preview_enhanced_service_email']),{date_from:d,date_to:d,shift_start:val('shift_start'),shift_end:val('shift_end')});if(r&&r.success)frame.srcdoc=r.html;else alert((r&&r.message)||'Error')}load();</script></body></html>
+HTML
+
+say "7) Clean admin visible links to removed pages; keep original links"
+python3 - <<'PY'
+from pathlib import Path
+import re
+p=Path('/opt/frappe_crm/apps/restaurant_ops/restaurant_ops/www/admin-desk.html')
+if p.exists():
+    s=p.read_text(errors='ignore')
+    for pat in [r'<!-- ROSHDY_REPORTS_SUITE_LINKS_START -->[\s\S]*?<!-- ROSHDY_REPORTS_SUITE_LINKS_END -->', r'<div[^>]*id=["\']roshdyReportsSuiteDock["\'][\s\S]*?</div>\s*']:
+        s=re.sub(pat,'',s,flags=re.I)
+    # remove only wrong new pages links; keep /break-admin and /sales-report
+    for link in ['break-report','sales-dashboard','email-customizer','social-inbox','social-settings','browser-connectors','social-meta-settings','social-retention-settings']:
+        s=re.sub(r'<a[^>]+href=["\']/'+link+r'["\'][\s\S]*?</a>\s*','',s,flags=re.I)
+    s=s.replace('{#','{ #')
+    p.write_text(s)
+    print('✅ admin cleaned')
+PY
+
+say "8) Delete wrong page files if still present"
+for f in break-report.py break-report.html sales-dashboard.py sales-dashboard.html email-customizer.py email-customizer.html social-inbox.py social-inbox.html social-settings.py social-settings.html social-retention-settings.py social-retention-settings.html social-meta-settings.py social-meta-settings.html browser-connectors.py browser-connectors.html; do
+  rm -f "$WWW_DIR/$f"
+done
+
+say "9) Clear cache/restart"
+docker exec "$BACKEND" bash -lc "find /home/frappe/frappe-bench/apps/restaurant_ops -name '*.pyc' -delete; find /home/frappe/frappe-bench/apps/restaurant_ops -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true"
+docker exec "$BACKEND" bench --site "$SITE" clear-cache || true
+docker exec "$BACKEND" bench --site "$SITE" clear-website-cache || true
+docker compose restart backend frontend websocket queue-short queue-long scheduler
+sleep 10
+BACKEND="$(docker compose ps -q backend)"
+
+say "10) Validation"
+echo "--- break API ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.ops_reports_api.get_break_report --kwargs '{"date_from":"2026-08-06","date_to":"2026-08-06"}' || true
+
+echo "--- sales API ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.ops_reports_api.get_sales_report --kwargs '{"date_from":"2026-08-06","date_to":"2026-08-06"}' || true
+
+echo "--- email preview API ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.ops_reports_api.preview_enhanced_service_email --kwargs '{"date_from":"2026-08-06","date_to":"2026-08-06"}' || true
+
+echo "--- Page HTTP status ---"
+for page in break-admin sales-report email-report-customizer break-report sales-dashboard email-customizer social-inbox social-settings call-report admin-desk; do
+  code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$page" || true)"
+  echo "$page => $code"
+done
+
+say "11) Health Check مهم: Elastix/CDR/AMI + Queue + Call Report"
+echo "--- Asterisk/Elastix diagnostics ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics || true
+
+echo "--- Queue status ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.queue_api.get_queue_status || true
+
+echo "--- Calls report admin sample ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' || true
+
+say "✅ Original reports fixed and wrong pages removed يا زعيم"
+echo "استخدم الأصل فقط: /break-admin و /sales-report"
+echo "Hidden/System Manager customizer: /email-report-customizer"
+echo "الصفحات الغلط/social المفروض ترجع 404 أو غير موجودة."
+echo "Backup: $BACKUP_DIR"

@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# reports-phase0-audit
+# Safe audit only. No code changes.
+# Purpose: gather exact backend functions, break/sales/email/call-report schemas and current numbers
+# before we patch reports/email/sales/breaks.
+
+ROOT="/opt/frappe_crm"
+SITE="crm.local"
+TS="$(date +%Y%m%d_%H%M%S)"
+OUT="$ROOT/backups/REPORTS_PHASE0_AUDIT_$TS"
+
+say(){ echo -e "\n============================================================\n$1\n============================================================"; }
+run(){ echo -e "\n--- $* ---" | tee -a "$OUT/RUN.log"; "$@" 2>&1 | tee -a "$OUT/RUN.log" || true; }
+cap(){ local name="$1"; shift; echo "--- $name ---" | tee -a "$OUT/RUN.log"; ("$@") > "$OUT/$name.txt" 2>&1 || true; tail -n 80 "$OUT/$name.txt" | tee -a "$OUT/RUN.log" || true; }
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo "❌ شغّل كـ root: sudo -i ثم ./reports-phase0-audit"
+  exit 1
+fi
+
+say "1) Setup audit folder"
+cd "$ROOT"
+BACKEND="$(docker compose ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ لم أجد backend container. شغّل: cd /opt/frappe_crm && docker compose up -d"
+  exit 1
+fi
+mkdir -p "$OUT"
+echo "Audit folder: $OUT" | tee "$OUT/RUN.log"
+echo "Date: $(date -Is)" | tee -a "$OUT/RUN.log"
+echo "Backend: $BACKEND" | tee -a "$OUT/RUN.log"
+
+say "2) Snapshot current app files list/functions"
+cap docker_ps docker compose ps
+cap www_pages docker exec "$BACKEND" bash -lc "find /home/frappe/frappe-bench/apps/restaurant_ops/restaurant_ops/www -maxdepth 1 -type f | sort"
+cap api_defs docker exec "$BACKEND" bash -lc "grep -R '^def \|^@frappe.whitelist' -n /home/frappe/frappe-bench/apps/restaurant_ops/restaurant_ops/api | sed -n '1,500p'"
+cap report_api_defs docker exec "$BACKEND" bash -lc "grep -n '^def \|^@frappe.whitelist' /home/frappe/frappe-bench/apps/restaurant_ops/restaurant_ops/api/report_api.py || true"
+cap email_report_defs docker exec "$BACKEND" bash -lc "grep -n '^def \|^@frappe.whitelist' /home/frappe/frappe-bench/apps/restaurant_ops/restaurant_ops/api/email_report.py || true"
+cap break_api_defs docker exec "$BACKEND" bash -lc "grep -n '^def \|^@frappe.whitelist' /home/frappe/frappe-bench/apps/restaurant_ops/restaurant_ops/api/break_api.py /home/frappe/frappe-bench/apps/restaurant_ops/restaurant_ops/api/hr_ops_api.py 2>/dev/null || true"
+cap sales_api_defs docker exec "$BACKEND" bash -lc "grep -n '^def \|^@frappe.whitelist' /home/frappe/frappe-bench/apps/restaurant_ops/restaurant_ops/api/sales_api.py || true"
+
+say "3) Health checks"
+cap health_asterisk docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics
+cap queue_status docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.queue_api.get_queue_status
+cap call_report_admin_today docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}'
+cap call_report_raw_today docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"raw"}'
+
+say "4) Database schema discovery for breaks/sales/email/complaints"
+cap db_tables_interest docker exec "$BACKEND" bench --site "$SITE" execute frappe.db.sql --args '["show tables"]'
+cap break_tables docker exec "$BACKEND" bench --site "$SITE" execute frappe.db.sql --args '["show tables like \"%Break%\""]'
+cap sales_tables docker exec "$BACKEND" bench --site "$SITE" execute frappe.db.sql --args '["show tables like \"%Sales%\""]'
+cap complaint_fields docker exec "$BACKEND" bench --site "$SITE" execute frappe.db.sql --args '["desc `tabCall Center Complaint`"]'
+cap employee_sample docker exec "$BACKEND" bench --site "$SITE" execute frappe.db.sql --args '["select name, employee_name, user_id, status from `tabEmployee` order by employee_name limit 30"]'
+
+say "5) Break report data samples"
+cap break_log_count docker exec "$BACKEND" bench --site "$SITE" execute frappe.db.sql --args '["select count(*) from `tabEmployee Break Log`"]'
+cap break_log_sample docker exec "$BACKEND" bench --site "$SITE" execute frappe.db.sql --args '["select * from `tabEmployee Break Log` order by creation desc limit 10"]'
+cap break_types_sample docker exec "$BACKEND" bench --site "$SITE" execute frappe.db.sql --args '["select * from `tabBreak Type` limit 20"]'
+cap extra_break_sample docker exec "$BACKEND" bench --site "$SITE" execute frappe.db.sql --args '["select * from `tabExtra Break Approval` order by creation desc limit 10"]'
+
+say "6) Sales data samples"
+cap sales_item_sample docker exec "$BACKEND" bench --site "$SITE" execute frappe.db.sql --args '["select * from `tabSales Item` limit 20"]'
+cap sales_tables_desc docker exec "$BACKEND" bash -lc "cd /home/frappe/frappe-bench && bench --site $SITE mariadb -e \"show tables like '%Sales%';\""
+cap sales_entry_guess docker exec "$BACKEND" bench --site "$SITE" execute frappe.db.sql --args '["select table_name from information_schema.tables where table_schema=(select database()) and table_name like \"tab%Sales%\""]'
+
+say "7) Existing email report preview/send smoke (function names only, no sends)"
+cap email_report_grep docker exec "$BACKEND" bash -lc "sed -n '1,260p' /home/frappe/frappe-bench/apps/restaurant_ops/restaurant_ops/api/email_report.py"
+
+say "8) Pages HTTP status"
+{
+  for page in settings call-report sales-report sales-entry hr-ops quality-desk admin-desk; do
+    code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$page" || true)"
+    echo "$page => $code"
+  done
+} | tee "$OUT/page_status.txt" | tee -a "$OUT/RUN.log"
+
+say "✅ Audit complete"
+echo "Audit folder: $OUT"
+echo "ابعتلي RUN.log أو zip folder لو محتاج أطلع Patch شامل مضبوط."

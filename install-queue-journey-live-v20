@@ -1,0 +1,866 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Roshdy V20 - LIVE Queue Journey integration
+# ------------------------------------------------------------
+# What this installs:
+# 1) Host fetch/parser script that pulls /var/log/asterisk/queue_log from Elastix via SSH,
+#    parses missed employee attempts, and writes JSON into Frappe private files.
+# 2) Frappe API: restaurant_ops.api.queue_journey_api
+#    - get_queue_journey_report
+#    - debug_queue_journey_status
+# 3) Full page: /queue-journey-report
+# 4) Upper Management email integration with journey summary:
+#    - total missed attempts
+#    - answered later
+#    - customer abandoned after attempt
+#    - details with employee/extension names
+# 5) Customer Service Manager email missed-attempt section fixed to use the same journey source.
+#
+# Safety:
+# - Backup first.
+# - Does NOT edit restaurant_ops.api.report_api.
+# - Does NOT touch Elastix/Asterisk configs, CDR, AMI.
+# - Host parser reads queue_log over SSH only.
+#
+# Usage:
+#   cd /opt/frappe_crm
+#   chmod +x install-queue-journey-live-v20
+#   ./install-queue-journey-live-v20
+#
+# Optional:
+#   ELASTIX_SSH=root@10.11.1.253 ./install-queue-journey-live-v20
+#   RUN_FETCH_NOW=0 ./install-queue-journey-live-v20
+#   INSTALL_CRON=0 ./install-queue-journey-live-v20
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+ELASTIX_SSH="${ELASTIX_SSH:-root@10.11.1.253}"
+QUEUE_LOG="${QUEUE_LOG:-/var/log/asterisk/queue_log}"
+QUEUES="${QUEUES:-1234,123}"
+THRESHOLD="${THRESHOLD:-15}"
+MAX_LINES="${MAX_LINES:-500000}"
+RUN_FETCH_NOW="${RUN_FETCH_NOW:-1}"
+INSTALL_CRON="${INSTALL_CRON:-1}"
+CRON_MINUTES="${CRON_MINUTES:-5}"
+TS="$(date +%Y%m%d_%H%M%S)"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "❌ docker compose/docker-compose مش موجود"
+  exit 1
+fi
+
+APP_DIR="$ROOT/apps/$APP"
+PKG_DIR="$APP_DIR/$APP"
+API_DIR="$PKG_DIR/api"
+WWW_DIR="$PKG_DIR/www"
+SCRIPTS_DIR="$ROOT/scripts"
+APP_SCRIPTS_DIR="$PKG_DIR/scripts"
+SITES_DIR="$ROOT/sites"
+PRIVATE_FILES="$SITES_DIR/$SITE/private/files"
+JOURNEY_DIR="$PRIVATE_FILES/queue_journey"
+HOST_FETCH_SCRIPT="$SCRIPTS_DIR/roshdy_queue_journey_fetch_parse"
+CONF_FILE="$ROOT/queue_journey.conf"
+UPPER_API="$API_DIR/upper_management_email_api.py"
+EMAIL_REPORT="$API_DIR/email_report.py"
+QUEUE_API="$API_DIR/queue_journey_api.py"
+PAGE_HTML="$WWW_DIR/queue-journey-report.html"
+PAGE_PY="$WWW_DIR/queue-journey-report.py"
+BACKUP_DIR="$ROOT/backups/QUEUE_JOURNEY_LIVE_V20_BEFORE_$TS"
+
+mkdir -p "$BACKUP_DIR" "$SCRIPTS_DIR" "$APP_SCRIPTS_DIR" "$JOURNEY_DIR"
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend container مش شغال أو مش لاقيه"
+  exit 1
+fi
+
+bench_exec() {
+  "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"
+}
+
+echo "============================================================"
+echo "🚀 Roshdy V20: LIVE Queue Journey integration"
+echo "📦 Backup: $BACKUP_DIR"
+echo "🔐 Elastix SSH: $ELASTIX_SSH"
+echo "☎️ Queues: $QUEUES"
+echo "⏱️ Threshold: $THRESHOLD seconds"
+echo "============================================================"
+
+echo "🧯 Step 1: Backup files + bench backup"
+for f in "$UPPER_API" "$EMAIL_REPORT" "$QUEUE_API" "$PAGE_HTML" "$PAGE_PY" "$HOST_FETCH_SCRIPT" "$CONF_FILE"; do
+  [[ -e "$f" ]] && cp -a "$f" "$BACKUP_DIR/$(basename "$f").before" || true
+done
+bench_exec backup --with-files | tee "$BACKUP_DIR/bench_backup_output.txt"
+
+cat > "$CONF_FILE" <<EOF
+# Roshdy Queue Journey config
+ROOT="$ROOT"
+SITE="$SITE"
+ELASTIX_SSH="$ELASTIX_SSH"
+QUEUE_LOG="$QUEUE_LOG"
+QUEUES="$QUEUES"
+THRESHOLD="$THRESHOLD"
+MAX_LINES="$MAX_LINES"
+EOF
+
+echo "🧩 Step 2: Install host fetch/parser script"
+cat > "$HOST_FETCH_SCRIPT" <<'PYHOST'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+CONF_FILE="${CONF_FILE:-/opt/frappe_crm/queue_journey.conf}"
+[[ -f "$CONF_FILE" ]] && source "$CONF_FILE"
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+ELASTIX_SSH="${ELASTIX_SSH:-root@10.11.1.253}"
+QUEUE_LOG="${QUEUE_LOG:-/var/log/asterisk/queue_log}"
+QUEUES="${QUEUES:-1234,123}"
+THRESHOLD="${THRESHOLD:-15}"
+MAX_LINES="${MAX_LINES:-500000}"
+DATE_FROM="${DATE_FROM:-$(date +%F)}"
+DATE_TO="${DATE_TO:-$DATE_FROM}"
+OUT_BASE="$ROOT/sites/$SITE/private/files/queue_journey"
+RUN_ID="$(date +%Y%m%d_%H%M%S)"
+RUN_DIR="$OUT_BASE/runs/$RUN_ID"
+TMP_LOG="$RUN_DIR/queue_log_tail.txt"
+mkdir -p "$RUN_DIR" "$OUT_BASE"
+
+echo "[$(date '+%F %T')] Fetching queue_log from $ELASTIX_SSH:$QUEUE_LOG for $DATE_FROM..$DATE_TO queues=$QUEUES threshold=$THRESHOLD max_lines=$MAX_LINES"
+
+if [[ -n "${LOCAL_QUEUE_LOG:-}" && -f "$LOCAL_QUEUE_LOG" ]]; then
+  if [[ "$MAX_LINES" == "0" ]]; then
+    cat "$LOCAL_QUEUE_LOG" > "$TMP_LOG"
+  else
+    tail -n "$MAX_LINES" "$LOCAL_QUEUE_LOG" > "$TMP_LOG"
+  fi
+else
+  if [[ "$MAX_LINES" == "0" ]]; then
+    ssh -o ConnectTimeout=10 "$ELASTIX_SSH" "cat '$QUEUE_LOG'" > "$TMP_LOG"
+  else
+    ssh -o ConnectTimeout=10 "$ELASTIX_SSH" "tail -n '$MAX_LINES' '$QUEUE_LOG'" > "$TMP_LOG"
+  fi
+fi
+
+python3 - "$TMP_LOG" "$DATE_FROM" "$DATE_TO" "$QUEUES" "$THRESHOLD" "$RUN_DIR" <<'PY'
+import sys, os, re, json, csv, datetime, time
+from collections import defaultdict, Counter
+
+log_path, date_from, date_to, queues_s, threshold_s, run_dir = sys.argv[1:7]
+queues = {q.strip() for q in queues_s.split(',') if q.strip()}
+threshold = float(threshold_s or 15)
+start = int(time.mktime(datetime.datetime.strptime(date_from+' 00:00:00', '%Y-%m-%d %H:%M:%S').timetuple()))
+end = int(time.mktime(datetime.datetime.strptime(date_to+' 23:59:59', '%Y-%m-%d %H:%M:%S').timetuple()))
+interesting = {'DID','ENTERQUEUE','RINGNOANSWER','RINGCANCELED','AGENTDUMP','CONNECT','COMPLETECALLER','COMPLETEAGENT','ABANDON','EXITWITHTIMEOUT','EXITEMPTY','EXITWITHKEY','TRANSFER'}
+
+def ext_from_agent(agent):
+    agent = str(agent or '')
+    for pat in (r'(?:Local|SIP|PJSIP|Agent)/(\d{3,6})', r'^(\d{3,6})$', r'\b(\d{3,6})\b'):
+        m = re.search(pat, agent, re.I)
+        if m and m.group(1) not in ('123','1234'):
+            return m.group(1)
+    return ''
+
+def ts_text(t):
+    return datetime.datetime.fromtimestamp(int(t)).strftime('%Y-%m-%d %H:%M:%S')
+
+def caller_from(evs):
+    for e in evs:
+        if e['event'] == 'ENTERQUEUE':
+            for d in e.get('data') or []:
+                if re.search(r'\d{5,}', d or ''):
+                    return d
+    return ''
+
+rows=[]; counts=Counter(); by_queue=defaultdict(Counter)
+with open(log_path, 'r', errors='ignore') as f:
+    for line in f:
+        line=line.rstrip('\n')
+        if not line: continue
+        parts=line.split('|')
+        if len(parts)<5: continue
+        try: t=int(float(parts[0]))
+        except Exception: continue
+        if not (start <= t <= end): continue
+        callid, queue, agent, event = parts[1], parts[2], parts[3], parts[4]
+        if queues and queue not in queues: continue
+        counts[event]+=1; by_queue[queue][event]+=1
+        if event not in interesting: continue
+        rows.append({'time_epoch':t,'time_text':ts_text(t),'callid':callid,'queue':queue,'agent':agent,'agent_ext':ext_from_agent(agent),'event':event,'data':parts[5:],'raw':line})
+
+by_call=defaultdict(list)
+for r in rows: by_call[r['callid']].append(r)
+for cid in by_call: by_call[cid].sort(key=lambda x:x['time_epoch'])
+
+attempts=[]; call_summaries=[]
+for cid, evs in by_call.items():
+    caller=caller_from(evs)
+    connects=[e for e in evs if e['event']=='CONNECT']
+    abandons=[e for e in evs if e['event']=='ABANDON']
+    completes=[e for e in evs if e['event'] in ('COMPLETECALLER','COMPLETEAGENT')]
+    if connects:
+        final='answered'; final_ext=connects[-1].get('agent_ext') or ''
+    elif abandons:
+        final='customer_abandoned_before_answer'; final_ext=''
+    elif completes:
+        final='completed_but_connect_missing'; final_ext=''
+    else:
+        final='unknown_or_still_in_queue'; final_ext=''
+    call_summaries.append({'callid':cid,'caller':caller,'queue':evs[0]['queue'] if evs else '','events_count':len(evs),'events':[e['event'] for e in evs],'final_outcome':final,'final_extension':final_ext})
+    for i,e in enumerate(evs):
+        if e['event'] not in ('RINGNOANSWER','RINGCANCELED','AGENTDUMP'): continue
+        missed_ext=e.get('agent_ext') or ''
+        if not missed_ext: continue
+        raw=(e.get('data') or [''])[0] if e.get('data') else ''
+        try:
+            # Asterisk queue_log RINGNOANSWER duration is milliseconds.
+            ring_seconds=round(float(raw or 0)/1000.0, 1)
+        except Exception:
+            ring_seconds=0
+        if ring_seconds < threshold: continue
+        later=evs[i+1:]
+        conn=next((x for x in later if x['event']=='CONNECT'), None)
+        aban=next((x for x in later if x['event']=='ABANDON'), None)
+        comp=next((x for x in later if x['event'] in ('COMPLETECALLER','COMPLETEAGENT')), None)
+        tout=next((x for x in later if x['event'] in ('EXITWITHTIMEOUT','EXITEMPTY','EXITWITHKEY')), None)
+        if conn:
+            ans_ext=conn.get('agent_ext') or ''
+            fate='answered_later_same_extension' if ans_ext==missed_ext else 'answered_later_other_extension'
+            fate_time=conn['time_text']
+        elif aban:
+            ans_ext=''; fate='customer_abandoned_after_attempt'; fate_time=aban['time_text']
+        elif comp:
+            ans_ext=''; fate='completed_after_attempt_connect_missing'; fate_time=comp['time_text']
+        elif tout:
+            ans_ext=''; fate='timeout_after_attempt_no_final_connect_seen'; fate_time=tout['time_text']
+        else:
+            ans_ext=''; fate='unknown_after_attempt'; fate_time=''
+        attempts.append({'attempt_time':e['time_text'],'callid':cid,'queue':e['queue'],'caller':caller,'missed_extension':missed_ext,'missed_event':e['event'],'ring_seconds':ring_seconds,'fate':fate,'fate_time':fate_time,'answered_extension':ans_ext,'final_outcome_for_call':final,'raw_data':e.get('data') or []})
+
+by_ext=defaultdict(lambda:{'extension':'','attempts':0,'answered_later_same_extension':0,'answered_later_other_extension':0,'customer_abandoned_after_attempt':0,'timeout_no_final_connect':0,'unknown':0})
+for a in attempts:
+    row=by_ext[a['missed_extension']]
+    row['extension']=a['missed_extension']; row['attempts']+=1
+    if a['fate'] in ('answered_later_same_extension','answered_later_other_extension'):
+        row[a['fate']]+=1
+    elif a['fate']=='customer_abandoned_after_attempt': row['customer_abandoned_after_attempt']+=1
+    elif a['fate']=='timeout_after_attempt_no_final_connect_seen': row['timeout_no_final_connect']+=1
+    else: row['unknown']+=1
+
+attempts_by_fate=dict(Counter(a['fate'] for a in attempts))
+answered_later=sum(v for k,v in attempts_by_fate.items() if k.startswith('answered_later'))
+summary={'success':True,'generated_at':datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),'date_from':date_from,'date_to':date_to,'queues':sorted(queues),'threshold_seconds':threshold,'events_loaded':len(rows),'event_counts':dict(counts),'event_counts_by_queue':{q:dict(c) for q,c in by_queue.items()},'calls_seen':len(by_call),'attempts_total':len(attempts),'answered_later_total':answered_later,'customer_abandoned_after_attempt':attempts_by_fate.get('customer_abandoned_after_attempt',0),'unknown_or_timeout':attempts_by_fate.get('unknown_after_attempt',0)+attempts_by_fate.get('timeout_after_attempt_no_final_connect_seen',0)+attempts_by_fate.get('completed_after_attempt_connect_missing',0),'attempts_by_fate':attempts_by_fate,'attempts_by_missed_extension':sorted(by_ext.values(), key=lambda x:x['attempts'], reverse=True),'attempts':attempts,'call_journey_samples':call_summaries[:300],'can_determine_journey':True}
+
+json_path=os.path.join(run_dir,'queue_journey_result.json')
+open(json_path,'w',encoding='utf-8').write(json.dumps(summary,ensure_ascii=False,indent=2))
+with open(os.path.join(run_dir,'queue_journey_attempts.csv'),'w',newline='',encoding='utf-8-sig') as f:
+    headers=['attempt_time','queue','caller','missed_extension','ring_seconds','fate','answered_extension','fate_time','callid','final_outcome_for_call']
+    w=csv.DictWriter(f,fieldnames=headers); w.writeheader()
+    for a in attempts: w.writerow({k:a.get(k,'') for k in headers})
+with open(os.path.join(run_dir,'queue_journey_summary.txt'),'w',encoding='utf-8') as f:
+    f.write('Date: %s to %s\n' % (date_from,date_to))
+    f.write('Threshold seconds: %s\n' % threshold)
+    f.write('Queues: %s\n' % ','.join(sorted(queues)))
+    f.write('Events loaded: %s\n' % len(rows))
+    f.write('Event counts: %s\n' % dict(counts))
+    f.write('Calls seen: %s\n' % len(by_call))
+    f.write('Attempts total: %s\n' % len(attempts))
+    f.write('Answered later total: %s\n' % answered_later)
+    f.write('Customer abandoned after attempt: %s\n' % attempts_by_fate.get('customer_abandoned_after_attempt',0))
+    f.write('Unknown/timeout: %s\n' % summary['unknown_or_timeout'])
+    f.write('Attempts by fate: %s\n\n' % attempts_by_fate)
+    f.write('By missed extension:\n')
+    for r in summary['attempts_by_missed_extension']: f.write(str(r)+'\n')
+    f.write('\nFirst 30 attempts:\n')
+    for a in attempts[:30]: f.write(str(a)+'\n')
+print(json_path)
+PY
+
+TODAY_NAME="queue_journey_${DATE_FROM}_${DATE_TO}.json"
+cp "$RUN_DIR/queue_journey_result.json" "$OUT_BASE/$TODAY_NAME"
+cp "$RUN_DIR/queue_journey_result.json" "$OUT_BASE/latest.json"
+cp "$RUN_DIR/queue_journey_summary.txt" "$OUT_BASE/latest_summary.txt"
+chmod 0644 "$OUT_BASE/$TODAY_NAME" "$OUT_BASE/latest.json" "$OUT_BASE/latest_summary.txt" 2>/dev/null || true
+
+echo "[$(date '+%F %T')] Done. JSON: $OUT_BASE/$TODAY_NAME"
+cat "$RUN_DIR/queue_journey_summary.txt"
+PYHOST
+chmod +x "$HOST_FETCH_SCRIPT"
+
+# Make host script owner root executable; private files readable by container volume.
+chmod +x "$HOST_FETCH_SCRIPT"
+
+echo "🧩 Step 3: Install Frappe API queue_journey_api.py"
+cat > "$QUEUE_API" <<'PYAPI'
+# -*- coding: utf-8 -*-
+import json
+import os
+import re
+from collections import Counter, defaultdict
+
+import frappe
+from frappe.utils import today, cstr, cint, flt, get_datetime
+
+
+def _period(date_from=None, date_to=None):
+    df = cstr(date_from or today())[:10]
+    dt = cstr(date_to or df)[:10]
+    return df, dt
+
+
+def _journey_dir():
+    return frappe.get_site_path("private", "files", "queue_journey")
+
+
+def _journey_file(date_from=None, date_to=None):
+    df, dt = _period(date_from, date_to)
+    exact = os.path.join(_journey_dir(), f"queue_journey_{df}_{dt}.json")
+    latest = os.path.join(_journey_dir(), "latest.json")
+    if os.path.exists(exact):
+        return exact, "exact"
+    if os.path.exists(latest):
+        return latest, "latest_fallback"
+    return exact, "missing"
+
+
+def _load_json(date_from=None, date_to=None):
+    path, source = _journey_file(date_from, date_to)
+    if not os.path.exists(path):
+        return None, path, source
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f), path, source
+
+
+def _mask_phone(phone):
+    phone = cstr(phone or "")
+    digits = re.sub(r"\D+", "", phone)
+    if len(digits) <= 4:
+        return phone
+    return phone[:3] + "****" + phone[-4:]
+
+
+def _employee_by_extension(ext, event_time=None):
+    ext = cstr(ext or "").strip()
+    if not ext:
+        return ""
+    # Employee.extension fields
+    try:
+        if frappe.db.exists("DocType", "Employee"):
+            meta = frappe.get_meta("Employee")
+            fields = []
+            for df in meta.fields:
+                fn = cstr(df.fieldname).lower()
+                if any(x in fn for x in ("extension", "ext", "sip")):
+                    fields.append(df.fieldname)
+            for fn in fields:
+                val = frappe.db.get_value("Employee", {fn: ext}, "employee_name")
+                if val:
+                    return val
+    except Exception:
+        pass
+    # Extension Session around time
+    try:
+        if event_time and frappe.db.exists("DocType", "Extension Session"):
+            rows = frappe.db.sql("""
+                select coalesce(e.employee_name, s.employee, s.user) employee_name
+                from `tabExtension Session` s
+                left join `tabEmployee` e on e.name=s.employee
+                where s.extension=%s
+                  and (s.started_at is null or s.started_at <= %s)
+                  and (s.released_at is null or s.released_at >= %s)
+                order by s.started_at desc
+                limit 1
+            """, (ext, event_time, event_time), as_dict=True)
+            if rows and rows[0].get("employee_name"):
+                return rows[0].get("employee_name")
+    except Exception:
+        pass
+    return ""
+
+
+def _public_employee_label(ext, event_time=None):
+    emp = _employee_by_extension(ext, event_time)
+    if emp:
+        return emp
+    if ext:
+        return f"غير محدد (تحويلة {ext})"
+    return "غير محدد"
+
+
+def _fate_label(fate, answered_ext=None, answered_employee=None):
+    if fate == "answered_later_same_extension":
+        return "تم الرد لاحقًا من نفس التحويلة"
+    if fate == "answered_later_other_extension":
+        if answered_employee:
+            return f"تم الرد لاحقًا بواسطة {answered_employee}"
+        if answered_ext:
+            return f"تم الرد لاحقًا بواسطة تحويلة {answered_ext}"
+        return "تم الرد لاحقًا"
+    if fate == "customer_abandoned_after_attempt":
+        return "العميل أغلق بعد المحاولة"
+    if fate == "completed_after_attempt_connect_missing":
+        return "اكتملت لاحقًا لكن حدث الرد غير ظاهر"
+    if fate == "timeout_after_attempt_no_final_connect_seen":
+        return "غير محدد بعد انتهاء دورة انتظار"
+    return "غير محدد"
+
+
+def _fallback_cdr(date_from=None, date_to=None, threshold=15, mask_phones=False):
+    try:
+        from restaurant_ops.api.report_api import get_staff_missed_attempts
+        d = get_staff_missed_attempts(date_from or today(), date_to or date_from or today(), threshold) or {}
+    except Exception as e:
+        d = {"success": False, "error": cstr(e), "details": [], "grouped": [], "total_attempts": 0}
+    rows = []
+    for r in (d.get("details") or [])[:500]:
+        ext = cstr(r.get("extension") or "")
+        emp = r.get("employee_name")
+        if not emp or emp == "غير مربوط وقت المكالمة":
+            emp = _public_employee_label(ext, r.get("calldate"))
+        rows.append({
+            "attempt_time": cstr(r.get("calldate") or ""),
+            "queue": "",
+            "caller": _mask_phone(r.get("src")) if mask_phones else cstr(r.get("src") or ""),
+            "missed_extension": ext,
+            "missed_employee": emp,
+            "ring_seconds": r.get("duration") or 0,
+            "fate": "journey_unavailable",
+            "fate_label": "مصير المكالمة غير متاح من ملف الرحلة",
+            "answered_extension": "",
+            "answered_employee": "",
+            "fate_time": "",
+            "callid": cstr(r.get("uniqueid") or ""),
+        })
+    return {
+        "success": True,
+        "journey_available": False,
+        "source": "cdr_fallback_get_staff_missed_attempts",
+        "summary": {
+            "attempts_total": cint(d.get("total_attempts") or len(rows) or 0),
+            "answered_later_total": None,
+            "customer_abandoned_after_attempt": None,
+            "unknown_or_timeout": cint(d.get("total_attempts") or len(rows) or 0),
+            "attempts_by_fate": {"journey_unavailable": cint(d.get("total_attempts") or len(rows) or 0)},
+        },
+        "rows": rows,
+        "grouped": d.get("grouped") or [],
+        "raw": d,
+    }
+
+
+@frappe.whitelist()
+def get_queue_journey_report(date_from=None, date_to=None, threshold=15, queues=None, mask_phones=0, limit_rows=500):
+    df, dt = _period(date_from, date_to)
+    mask_phones = bool(cint(mask_phones or 0))
+    threshold = flt(threshold or 15)
+    data, path, source = _load_json(df, dt)
+    if not data:
+        out = _fallback_cdr(df, dt, threshold=threshold, mask_phones=mask_phones)
+        out.update({"date_from": df, "date_to": dt, "cache_path": path, "cache_source": source})
+        return out
+
+    raw_rows = data.get("attempts") or data.get("attempt_rows_sample") or []
+    rows = []
+    for r in raw_rows:
+        try:
+            ring = flt(r.get("ring_seconds") or 0)
+        except Exception:
+            ring = 0
+        if ring < threshold:
+            continue
+        if queues:
+            qset = {x.strip() for x in cstr(queues).split(",") if x.strip()}
+            if qset and cstr(r.get("queue")) not in qset:
+                continue
+        missed_ext = cstr(r.get("missed_extension") or "")
+        answered_ext = cstr(r.get("answered_extension") or "")
+        missed_emp = _public_employee_label(missed_ext, r.get("attempt_time"))
+        answered_emp = _employee_by_extension(answered_ext, r.get("fate_time")) if answered_ext else ""
+        if answered_ext and not answered_emp:
+            answered_emp = f"غير محدد (تحويلة {answered_ext})"
+        fate = cstr(r.get("fate") or "unknown_after_attempt")
+        rows.append({
+            "attempt_time": cstr(r.get("attempt_time") or ""),
+            "queue": cstr(r.get("queue") or ""),
+            "caller": _mask_phone(r.get("caller")) if mask_phones else cstr(r.get("caller") or ""),
+            "missed_extension": missed_ext,
+            "missed_employee": missed_emp,
+            "ring_seconds": ring,
+            "fate": fate,
+            "fate_label": _fate_label(fate, answered_ext, answered_emp),
+            "answered_extension": answered_ext,
+            "answered_employee": answered_emp,
+            "fate_time": cstr(r.get("fate_time") or ""),
+            "callid": cstr(r.get("callid") or ""),
+            "final_outcome_for_call": cstr(r.get("final_outcome_for_call") or ""),
+        })
+
+    by_fate = Counter([r["fate"] for r in rows])
+    answered_later = sum(v for k, v in by_fate.items() if k.startswith("answered_later"))
+    abandoned = by_fate.get("customer_abandoned_after_attempt", 0)
+    unknown = len(rows) - answered_later - abandoned
+    by_ext = defaultdict(lambda: {"extension": "", "employee": "", "attempts": 0, "answered_later": 0, "customer_abandoned_after_attempt": 0, "unknown_or_timeout": 0})
+    for r in rows:
+        ext = r["missed_extension"] or "غير محدد"
+        be = by_ext[ext]
+        be["extension"] = ext
+        be["employee"] = r["missed_employee"]
+        be["attempts"] += 1
+        if r["fate"].startswith("answered_later"):
+            be["answered_later"] += 1
+        elif r["fate"] == "customer_abandoned_after_attempt":
+            be["customer_abandoned_after_attempt"] += 1
+        else:
+            be["unknown_or_timeout"] += 1
+
+    return {
+        "success": True,
+        "journey_available": True,
+        "source": "elastix_queue_log_cache",
+        "date_from": df,
+        "date_to": dt,
+        "threshold_seconds": threshold,
+        "cache_path": path,
+        "cache_source": source,
+        "generated_at": data.get("generated_at"),
+        "summary": {
+            "attempts_total": len(rows),
+            "answered_later_total": answered_later,
+            "customer_abandoned_after_attempt": abandoned,
+            "unknown_or_timeout": unknown,
+            "attempts_by_fate": dict(by_fate),
+            "attempts_by_missed_extension": sorted(by_ext.values(), key=lambda x: x["attempts"], reverse=True),
+        },
+        "rows": rows[:cint(limit_rows or 500)],
+        "raw_event_counts": data.get("event_counts"),
+    }
+
+
+@frappe.whitelist()
+def debug_queue_journey_status(date_from=None, date_to=None):
+    df, dt = _period(date_from, date_to)
+    path, source = _journey_file(df, dt)
+    return {
+        "success": True,
+        "date_from": df,
+        "date_to": dt,
+        "journey_dir": _journey_dir(),
+        "selected_path": path,
+        "selected_source": source,
+        "exists": os.path.exists(path),
+        "files": sorted(os.listdir(_journey_dir())) if os.path.exists(_journey_dir()) else [],
+    }
+PYAPI
+
+# ---------------------------------------------------------------------------
+# Patch upper management email API with final V20 overrides.
+# ---------------------------------------------------------------------------
+echo "🧩 Step 4: Patch Upper Management email"
+cat >> "$UPPER_API" <<'PYUPPER'
+
+# BEGIN ROSHDY QUEUE JOURNEY UPPER EMAIL V20
+try:
+    import frappe
+    from frappe.utils import today, cstr, flt, now_datetime
+    import html as _qj20_html
+except Exception:
+    pass
+
+try:
+    _qj20_prev_get_upper_management_report_data = get_upper_management_report_data
+except Exception:
+    _qj20_prev_get_upper_management_report_data = None
+
+
+def _qj20_e(v):
+    return _qj20_html.escape(cstr(v) if v is not None else "")
+
+
+def _qj20_n(v):
+    try:
+        f = flt(v or 0)
+        return f"{int(f):,}" if float(f).is_integer() else f"{f:,.1f}"
+    except Exception:
+        return cstr(v)
+
+
+def _qj20_card(title, value, note, color="#1F4E79", bg="#fff"):
+    return f"<td style='width:25%;padding:6px;vertical-align:top'><div style='background:{bg};border:1px solid #e5e7eb;border-right:6px solid {color};border-radius:14px;padding:13px;min-height:102px;text-align:right;direction:rtl'><div style='font-size:13px;color:#475569;font-weight:bold'>{_qj20_e(title)}</div><div style='font-size:28px;font-weight:900;color:{color};margin-top:5px'>{_qj20_e(value)}</div><div style='font-size:12px;color:#64748b;margin-top:4px'>{note}</div></div></td>"
+
+
+def _qj20_td(v, strong=False):
+    val = _qj20_e(v)
+    if strong: val = "<b>" + val + "</b>"
+    return f"<td style='padding:8px;border:1px solid #e5e7eb;text-align:right;direction:rtl;font-size:12px'>{val}</td>"
+
+
+def _qj20_empty(cols, text):
+    return f"<tr><td colspan='{cols}' style='padding:12px;border:1px solid #e5e7eb;text-align:center;color:#64748b;background:#f8fafc'>{_qj20_e(text)}</td></tr>"
+
+
+def _qj20_table(headers, body):
+    th = "".join(f"<th style='background:#111827;color:white;padding:9px;border:1px solid #e5e7eb;text-align:right;direction:rtl;font-size:12px'>{_qj20_e(h)}</th>" for h in headers)
+    return f"<table dir='rtl' width='100%' cellpadding='0' cellspacing='0' style='border-collapse:collapse;width:100%;direction:rtl;text-align:right;margin-top:8px;font-family:Tahoma,Arial,sans-serif'><thead><tr>{th}</tr></thead><tbody>{body}</tbody></table>"
+
+
+@frappe.whitelist()
+def get_upper_management_report_data(date_from=None, date_to=None):
+    if _qj20_prev_get_upper_management_report_data:
+        data = _qj20_prev_get_upper_management_report_data(date_from=date_from, date_to=date_to)
+    else:
+        data = {"success": True, "period": {"from": cstr(date_from or today()), "to": cstr(date_to or date_from or today()), "label": cstr(date_from or today())}, "generated_at": now_datetime().strftime("%Y-%m-%d %H:%M:%S")}
+    period = data.get("period") or {}
+    df = date_from or period.get("from") or today()
+    dt = date_to or period.get("to") or df
+    try:
+        from restaurant_ops.api.queue_journey_api import get_queue_journey_report
+        journey = get_queue_journey_report(date_from=df, date_to=dt, threshold=15, mask_phones=1, limit_rows=300)
+    except Exception as e:
+        journey = {"success": False, "error": cstr(e), "summary": {"attempts_total": 0}, "rows": []}
+    data["queue_journey"] = journey
+    calls = data.setdefault("calls", {})
+    summ = journey.get("summary") or {}
+    calls["staff_missed_count"] = summ.get("attempts_total") or 0
+    calls["employee_issue_count"] = summ.get("attempts_total") or 0
+    calls["employee_issue_rows"] = journey.get("rows") or []
+    calls["journey_available"] = journey.get("journey_available")
+    calls["journey_answered_later"] = summ.get("answered_later_total")
+    calls["journey_customer_abandoned"] = summ.get("customer_abandoned_after_attempt")
+    calls["journey_unknown"] = summ.get("unknown_or_timeout")
+    try:
+        follow = data.setdefault("followups", [])
+        if summ.get("customer_abandoned_after_attempt"):
+            txt = f"مراجعة {summ.get('customer_abandoned_after_attempt')} محاولة انتهت بإغلاق العميل بعد الرن على موظف."
+            if txt not in follow: follow.insert(0, txt)
+        elif summ.get("attempts_total"):
+            txt = "مراجعة محاولات الرن التي لم يرد عليها الموظفون، مع ملاحظة أن أغلبها قد يكون تم الرد عليه لاحقًا."
+            if txt not in follow: follow.append(txt)
+    except Exception:
+        pass
+    return data
+
+
+@frappe.whitelist()
+def render_upper_management_report_html(date_from=None, date_to=None):
+    d = get_upper_management_report_data(date_from, date_to)
+    calls = d.get("calls") or {}
+    comps = d.get("complaints") or {}
+    cancels = d.get("cancellations") or {}
+    target = d.get("target_items") or {}
+    cq = d.get("complaint_queue") or {}
+    journey = d.get("queue_journey") or {}
+    jsum = journey.get("summary") or {}
+    jrows = journey.get("rows") or []
+
+    open_rows = comps.get("open_rows") or []
+    open_html = "".join(f"<tr>{_qj20_td(r.get('name'))}{_qj20_td(r.get('status'))}{_qj20_td(r.get('category'))}{_qj20_td(r.get('priority'))}{_qj20_td(r.get('customer_name'))}{_qj20_td(r.get('creation'))}</tr>" for r in open_rows[:100]) or _qj20_empty(6, "لا توجد شكاوى مفتوحة حاليًا")
+    cancel_rows = cancels.get("rows") or []
+    cancel_html = "".join(f"<tr>{_qj20_td(r.get('cancellation_time'))}{_qj20_td(r.get('order_no'))}{_qj20_td(r.get('shift'))}{_qj20_td(r.get('shift_number') or '')}{_qj20_td(r.get('branch'))}{_qj20_td(r.get('customer_name'))}{_qj20_td(r.get('reason'))}{_qj20_td(r.get('logged_by'))}</tr>" for r in cancel_rows[:80]) or _qj20_empty(8, "لا توجد إلغاءات مسجلة اليوم")
+    journey_html = "".join(f"<tr>{_qj20_td(r.get('attempt_time'))}{_qj20_td(r.get('caller'))}{_qj20_td(r.get('missed_employee'))}{_qj20_td(r.get('missed_extension'))}{_qj20_td(r.get('ring_seconds'))}{_qj20_td(r.get('fate_label'), True)}{_qj20_td(r.get('answered_employee') or r.get('answered_extension'))}</tr>" for r in jrows[:100]) or _qj20_empty(7, "لا توجد محاولات رن طويلة لم يتم الرد عليها خلال الفترة")
+    target_rows = target.get("rows") or []
+    target_html = "".join(f"<tr>{_qj20_td(r.get('item'))}{_qj20_td(_qj20_n(r.get('qty')), True)}{_qj20_td(_qj20_n(r.get('entries')), True)}</tr>" for r in target_rows[:80]) or _qj20_empty(3, "لا توجد تسجيلات عرض للأصناف المطلوبة خلال الفترة")
+    today_rows = comps.get("today_rows") or []
+    today_html = "".join(f"<tr>{_qj20_td(r.get('creation'))}{_qj20_td(r.get('name'))}{_qj20_td(r.get('status'))}{_qj20_td(r.get('category'))}{_qj20_td(r.get('priority'))}{_qj20_td(r.get('customer_name'))}</tr>" for r in today_rows[:80]) or _qj20_empty(6, "لا توجد شكاوى جديدة مسجلة اليوم")
+    follow_html = "".join(f"<div style='background:#fffbeb;border:1px solid #fde68a;border-radius:10px;padding:9px;margin:6px 0;color:#92400e;font-size:13px'>• {_qj20_e(x)}</div>" for x in (d.get('followups') or ["لا توجد ملاحظات تحتاج متابعة اليوم."]))
+    open_color = "#dc2626" if flt(comps.get("open_all") or 0) > 0 else "#16a34a"
+    abandoned = jsum.get("customer_abandoned_after_attempt") or 0
+    abandoned_color = "#dc2626" if flt(abandoned) > 0 else "#16a34a"
+    return f"""<!doctype html><html lang='ar' dir='rtl'><head><meta charset='utf-8'></head><body dir='rtl' style='margin:0;background:#f3f4f6;direction:rtl;text-align:right;font-family:Tahoma,Arial,sans-serif;color:#111827'><table dir='rtl' width='100%' style='direction:rtl;text-align:right;background:#f3f4f6'><tr><td align='right' style='padding:16px'><div style='max-width:980px;margin:0 0 0 auto;background:white;border:1px solid #e5e7eb;border-radius:16px;overflow:hidden'><div style='height:8px;background:#1F4E79'></div><div style='padding:18px'><h1 style='margin:0;font-size:22px;color:#0f172a'>مطعم رشدي — تقرير الإدارة العليا</h1><div style='color:#64748b;font-size:13px;margin-top:6px'>الفترة: {_qj20_e(d['period']['label'])} | وقت الإصدار: {_qj20_e(d['generated_at'])}</div><h2 style='font-size:18px;margin:16px 0 8px'>ملخص اليوم</h2><table width='100%' dir='rtl'><tr>{_qj20_card('شكاوى مفتوحة حاليًا', _qj20_n(comps.get('open_all')), 'كل الشكاوى غير المغلقة وتحتاج متابعة', open_color, '#fef2f2' if flt(comps.get('open_all') or 0)>0 else '#f0fdf4')}{_qj20_card('مكالمات واردة على خط الشكاوى', _qj20_n(cq.get('count')), 'مكالمة دخلت على خط الشكاوى خلال الفترة', '#2563eb')}{_qj20_card('المكالمات التي تم الرد عليها', _qj20_n(calls.get('answered')), 'المكالمات المكتملة بالرد خلال الفترة', '#16a34a')}{_qj20_card('محاولات لم يرد عليها من الموظفين', _qj20_n(jsum.get('attempts_total')), 'محاولات رن طويلة على تحويلات موظفين', '#f59e0b')}</tr><tr>{_qj20_card('تم الرد عليها لاحقًا', _qj20_n(jsum.get('answered_later_total')), 'محاولات تم إنقاذها بواسطة موظف آخر/نفس التحويلة', '#16a34a')}{_qj20_card('العميل أغلق بعدها', _qj20_n(abandoned), 'محاولات انتهت بإغلاق العميل بعد الرن', abandoned_color, '#fef2f2' if flt(abandoned)>0 else '#f0fdf4')}{_qj20_card('إلغاءات اليوم', _qj20_n(cancels.get('count')), 'مدخلة يدويًا من الإدارة', '#6f42c1')}{_qj20_card('تسجيلات عرض الأصناف المطلوبة', _qj20_n(target.get('total_qty')), 'لا تمثل إجمالي مبيعات المطعم', '#f59e0b')}</tr></table><div style='border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-top:14px'><h3 style='margin:0 0 8px'>🔴 المطلوب متابعته اليوم</h3>{follow_html}</div><div style='border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-top:14px'><h3 style='margin:0 0 8px'>👤 رحلة محاولات الرن التي لم يتم الرد عليها</h3><div style='color:#64748b;font-size:12px'>المقصود: المكالمة رنّت على تحويلة موظف لمدة 15 ثانية أو أكثر ولم يتم الرد في هذه المحاولة، ثم نوضح هل تم الرد لاحقًا أم أغلق العميل.</div>{_qj20_table(['الوقت','رقم العميل','لم يرد','التحويلة','مدة الرن','مصير المحاولة','تم الرد لاحقًا بواسطة'], journey_html)}</div><div style='border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-top:14px'><h3 style='margin:0 0 8px'>🔴 الشكاوى المفتوحة حاليًا</h3>{_qj20_table(['رقم الشكوى','الحالة','التصنيف','الأولوية','العميل','تاريخ التسجيل'], open_html)}</div><div style='border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-top:14px'><h3 style='margin:0 0 8px'>↩️ الإلغاءات المسجلة اليوم</h3>{_qj20_table(['وقت التسجيل','رقم الطلب','الوردية','رقم الوردية','الفرع','اسم العميل','سبب الإلغاء','سجلها'], cancel_html)}</div><div style='border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-top:14px'><h3 style='margin:0 0 8px'>📋 شكاوى جديدة اليوم</h3>{_qj20_table(['وقت التسجيل','رقم الشكوى','الحالة','التصنيف','الأولوية','العميل'], today_html)}</div><div style='border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-top:14px'><h3 style='margin:0 0 8px'>🛒 تسجيلات عرض الأصناف المطلوبة</h3>{_qj20_table(['الصنف المطلوب عرضه','القطع/التسجيلات','عدد مرات التسجيل'], target_html)}</div></div></div></td></tr></table></body></html>"""
+
+
+@frappe.whitelist()
+def preview_upper_management_report(date_from=None, date_to=None, **kwargs):
+    return {"success": True, "html": render_upper_management_report_html(date_from=date_from, date_to=date_to), "data": get_upper_management_report_data(date_from, date_to)}
+
+
+@frappe.whitelist()
+def verify_queue_journey_in_upper_email(date_from=None, date_to=None):
+    data = get_upper_management_report_data(date_from, date_to)
+    html = render_upper_management_report_html(date_from, date_to)
+    return {"success": True, "journey_available": (data.get('queue_journey') or {}).get('journey_available'), "attempts_total": ((data.get('queue_journey') or {}).get('summary') or {}).get('attempts_total'), "answered_later": ((data.get('queue_journey') or {}).get('summary') or {}).get('answered_later_total'), "abandoned": ((data.get('queue_journey') or {}).get('summary') or {}).get('customer_abandoned_after_attempt'), "html_has_journey_section": 'رحلة محاولات الرن' in cstr(html), "html_has_answered_later_card": 'تم الرد عليها لاحقًا' in cstr(html)}
+# END ROSHDY QUEUE JOURNEY UPPER EMAIL V20
+PYUPPER
+
+# ---------------------------------------------------------------------------
+# Patch center email missed section to use journey too.
+# ---------------------------------------------------------------------------
+echo "🧩 Step 5: Patch Customer Service Manager email"
+cat >> "$EMAIL_REPORT" <<'PYCENTER'
+
+# BEGIN ROSHDY QUEUE JOURNEY CENTER EMAIL V20
+try:
+    import frappe
+    from frappe.utils import today, cstr, cint
+    import html as _qjc20_html
+except Exception:
+    pass
+
+def _qjc20_e(v):
+    return _qjc20_html.escape(cstr(v) if v is not None else "")
+
+def _qjc20_table(headers, rows, empty="لا توجد بيانات"):
+    th="".join("<th style='background:#111827;color:white;padding:9px;border:1px solid #e5e7eb;text-align:right'>%s</th>" % _qjc20_e(h) for h in headers)
+    if not rows:
+        body="<tr><td colspan='%s' style='padding:12px;border:1px solid #e5e7eb;text-align:center;color:#64748b;background:#f8fafc'>%s</td></tr>" % (len(headers), _qjc20_e(empty))
+    else:
+        body="".join("<tr>"+"".join("<td style='padding:8px;border:1px solid #e5e7eb;text-align:right'>%s</td>" % _qjc20_e(c) for c in row)+"</tr>" for row in rows)
+    return "<table dir='rtl' width='100%' cellpadding='0' cellspacing='0' style='border-collapse:collapse;width:100%;direction:rtl;text-align:right;margin-top:8px'>"+"<thead><tr>"+th+"</tr></thead><tbody>"+body+"</tbody></table>"
+
+def _qjc20_staff_missed_html(date_from=None, date_to=None, title="رحلة محاولات الرن التي لم يتم الرد عليها"):
+    df=date_from or today(); dt=date_to or df
+    try:
+        from restaurant_ops.api.queue_journey_api import get_queue_journey_report
+        d=get_queue_journey_report(date_from=df,date_to=dt,threshold=15,mask_phones=0,limit_rows=500)
+    except Exception as e:
+        return "<h3>%s</h3><div class='note'>تعذر تحميل رحلة المحاولات: %s</div>" % (_qjc20_e(title), _qjc20_e(e))
+    s=d.get('summary') or {}; rows=[]
+    for r in d.get('rows') or []:
+        rows.append([r.get('attempt_time'), r.get('caller'), r.get('missed_employee'), r.get('missed_extension'), r.get('ring_seconds'), r.get('fate_label'), r.get('answered_employee') or r.get('answered_extension')])
+    cards="""
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:10px 0">
+      <div style="background:#fff7ed;border:1px solid #fed7aa;border-radius:12px;padding:10px"><div style="color:#9a3412;font-weight:bold">محاولات لم يرد عليها</div><div style="font-size:24px;font-weight:900">%s</div></div>
+      <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:12px;padding:10px"><div style="color:#166534;font-weight:bold">تم الرد لاحقًا</div><div style="font-size:24px;font-weight:900">%s</div></div>
+      <div style="background:#fef2f2;border:1px solid #fecaca;border-radius:12px;padding:10px"><div style="color:#991b1b;font-weight:bold">العميل أغلق بعدها</div><div style="font-size:24px;font-weight:900">%s</div></div>
+    </div>
+    """ % (_qjc20_e(s.get('attempts_total') or 0), _qjc20_e(s.get('answered_later_total') or 0), _qjc20_e(s.get('customer_abandoned_after_attempt') or 0))
+    note="<div style='background:#eff6ff;color:#1e3a8a;border:1px solid #bfdbfe;border-radius:10px;padding:10px;margin:8px 0'>المقصود: المكالمة رنّت على تحويلة موظف لمدة 15 ثانية أو أكثر ولم يتم الرد في هذه المحاولة، ثم نوضح هل تم الرد لاحقًا أم أغلق العميل.</div>"
+    return "<h3>%s</h3>%s%s%s" % (_qjc20_e(title), note, cards, _qjc20_table(['الوقت','رقم العميل','لم يرد','التحويلة','مدة الرن','مصير المحاولة','تم الرد لاحقًا بواسطة'], rows, 'لا توجد محاولات رن طويلة لم يتم الرد عليها خلال الفترة'))
+
+# Override all known staff missed section builders.
+def _staff_missed_section():
+    return _qjc20_staff_missed_html(today(), today(), "رحلة محاولات الرن التي لم يتم الرد عليها")
+
+def _er_staff_missed_section(date_from, date_to):
+    return _qjc20_staff_missed_html(date_from, date_to, "رحلة محاولات الرن التي لم يتم الرد عليها")
+
+def _adv_staff_missed_section(st):
+    try:
+        df, dt, _a, _b = _adv_period(st)
+    except Exception:
+        df = dt = today()
+    return _qjc20_staff_missed_html(df, dt, "رحلة محاولات الرن التي لم يتم الرد عليها")
+
+@frappe.whitelist()
+def debug_center_queue_journey_section(date_from=None,date_to=None):
+    from restaurant_ops.api.queue_journey_api import get_queue_journey_report
+    d=get_queue_journey_report(date_from=date_from or today(),date_to=date_to or date_from or today(),threshold=15,mask_phones=0,limit_rows=20)
+    return {"success":True,"summary":d.get('summary'),"rows_sample":d.get('rows')}
+# END ROSHDY QUEUE JOURNEY CENTER EMAIL V20
+PYCENTER
+
+# ---------------------------------------------------------------------------
+# Full page for journey report.
+# ---------------------------------------------------------------------------
+echo "🧩 Step 6: Install /queue-journey-report page"
+cat > "$PAGE_PY" <<'PYPAGE'
+import frappe
+from restaurant_ops.www._context import protect, ADMIN_ROLES
+no_cache = 1
+
+def get_context(context):
+    protect(context, allowed_roles=ADMIN_ROLES)
+PYPAGE
+
+cat > "$PAGE_HTML" <<'HTMLPAGE'
+<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>رحلة محاولات الرن</title><style>*{box-sizing:border-box;font-family:Tahoma,Arial}body{margin:0;background:#eef2f7;direction:rtl;color:#111827}.top{background:#20262d;color:white;padding:14px 22px;border-bottom:4px solid #1F4E79;display:flex;justify-content:space-between;align-items:center}.top a{color:#fff;text-decoration:none;border:1px solid #64748b;border-radius:10px;padding:8px 12px}.wrap{padding:22px;max-width:1600px;margin:auto}.panel{background:#fff;border:1px solid #d8dee9;border-radius:16px;box-shadow:0 10px 28px #0001;margin-bottom:16px;overflow:hidden}.head{padding:14px 16px;border-bottom:1px solid #e5e7eb;display:flex;justify-content:space-between;gap:10px;align-items:center}.body{padding:16px}.grid{display:grid;grid-template-columns:repeat(6,1fr);gap:10px}label{font-weight:800;color:#475569;font-size:12px}input,select{width:100%;border:1px solid #d1d5db;border-radius:10px;padding:9px}.btn{border:0;border-radius:10px;padding:10px 13px;background:#1F4E79;color:#fff;font-weight:800;cursor:pointer;margin:3px}.green{background:#16a34a}.orange{background:#f97316}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}.card{background:#fff;border:1px solid #ddd;border-right:5px solid #1F4E79;border-radius:12px;padding:12px}.red{border-right-color:#dc2626}.greenb{border-right-color:#16a34a}.orangeb{border-right-color:#f97316}.num{font-size:28px;color:#1F4E79;font-weight:bold}.table{width:100%;border-collapse:collapse;min-width:1150px}.table th{background:#111827;color:#fff;padding:9px}.table td{border:1px solid #e5e7eb;padding:8px}.scroll{overflow:auto}.muted{color:#64748b;font-size:13px}@media(max-width:900px){.grid{grid-template-columns:1fr 1fr}.wrap{padding:12px}.table{min-width:950px}}</style></head><body><div class="top"><b>👤 رحلة محاولات الرن التي لم يتم الرد عليها</b><div><a href="/admin-desk">Admin Desk</a></div></div><div class="wrap"><div class="panel"><div class="head"><b>الفلاتر</b><span class="muted" id="cache"></span></div><div class="body"><div class="grid"><div><label>من تاريخ</label><input type="date" id="df"></div><div><label>إلى تاريخ</label><input type="date" id="dt"></div><div><label>الطوابير</label><input id="queues" value="1234,123"></div><div><label>أقل مدة رن بالثواني</label><input id="threshold" value="15"></div><div><label>إخفاء أرقام العملاء</label><select id="mask"><option value="0">لا</option><option value="1">نعم</option></select></div><div style="align-self:end"><button class="btn green" onclick="load()">تحديث</button><button class="btn orange" onclick="window.print()">PDF/طباعة</button><button class="btn" onclick="csv()">CSV</button></div></div></div></div><div class="cards"><div class="card orangeb">محاولات لم يرد عليها<div class="num" id="total">0</div></div><div class="card greenb">تم الرد لاحقًا<div class="num" id="answered">0</div></div><div class="card red">العميل أغلق بعدها<div class="num" id="abandoned">0</div></div><div class="card">غير محدد<div class="num" id="unknown">0</div></div></div><br><div class="panel"><div class="head"><b>حسب التحويلة</b></div><div class="body scroll"><table class="table"><thead><tr><th>التحويلة</th><th>الموظف</th><th>المحاولات</th><th>تم الرد لاحقًا</th><th>العميل أغلق بعدها</th><th>غير محدد</th></tr></thead><tbody id="byext"></tbody></table></div></div><div class="panel"><div class="head"><b>التفاصيل</b></div><div class="body scroll"><table class="table"><thead><tr><th>الوقت</th><th>الطابور</th><th>رقم العميل</th><th>لم يرد</th><th>التحويلة</th><th>مدة الرن</th><th>مصير المحاولة</th><th>تم الرد لاحقًا بواسطة</th><th>وقت المصير</th></tr></thead><tbody id="rows"></tbody></table></div></div></div><script>let last=null;function today(){return new Date().toISOString().slice(0,10)}function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function qs(o){let p=new URLSearchParams();Object.keys(o||{}).forEach(k=>{let v=o[k];if(v!==undefined&&v!==null&&v!=='')p.append(k,v)});return p.toString()}async function api(m,args){let q=qs(args||{});let r=await fetch('/api/method/'+m+(q?'?'+q:''),{method:'GET',credentials:'same-origin',cache:'no-store'});let j=await r.json();if(j.exc)throw j;return j.message||j}async function load(){last=await api('restaurant_ops.api.queue_journey_api.get_queue_journey_report',{date_from:df.value,date_to:dt.value,threshold:threshold.value,queues:queues.value,mask_phones:mask.value,limit_rows:1000});let s=last.summary||{};total.textContent=s.attempts_total||0;answered.textContent=s.answered_later_total||0;abandoned.textContent=s.customer_abandoned_after_attempt||0;unknown.textContent=s.unknown_or_timeout||0;cache.textContent=(last.journey_available?'Journey source: ':'Fallback source: ')+(last.cache_source||last.source||'');byext.innerHTML=(s.attempts_by_missed_extension||[]).map(x=>'<tr><td>'+esc(x.extension)+'</td><td>'+esc(x.employee)+'</td><td>'+esc(x.attempts)+'</td><td>'+esc(x.answered_later)+'</td><td>'+esc(x.customer_abandoned_after_attempt)+'</td><td>'+esc(x.unknown_or_timeout)+'</td></tr>').join('')||'<tr><td colspan="6" style="text-align:center;color:#64748b">لا توجد بيانات</td></tr>';rows.innerHTML=(last.rows||[]).map(r=>'<tr><td>'+esc(r.attempt_time)+'</td><td>'+esc(r.queue)+'</td><td>'+esc(r.caller)+'</td><td>'+esc(r.missed_employee)+'</td><td>'+esc(r.missed_extension)+'</td><td>'+esc(r.ring_seconds)+'</td><td>'+esc(r.fate_label)+'</td><td>'+esc(r.answered_employee||r.answered_extension)+'</td><td>'+esc(r.fate_time)+'</td></tr>').join('')||'<tr><td colspan="9" style="text-align:center;color:#64748b">لا توجد محاولات</td></tr>'}function csv(){if(!last)return;let headers=['time','queue','caller','missed_employee','missed_extension','ring_seconds','fate','answered_by','fate_time'];let lines=[headers.join(',')].concat((last.rows||[]).map(r=>[r.attempt_time,r.queue,r.caller,r.missed_employee,r.missed_extension,r.ring_seconds,r.fate_label,r.answered_employee||r.answered_extension,r.fate_time].map(x=>'"'+String(x||'').replace(/"/g,'""')+'"').join(',')));let blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'});let a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='queue-journey.csv';a.click()}df.value=today();dt.value=today();load();</script></body></html>
+HTMLPAGE
+
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+[[ -n "$APP_OWNER" ]] && chown "$APP_OWNER" "$QUEUE_API" "$UPPER_API" "$EMAIL_REPORT" "$PAGE_HTML" "$PAGE_PY" "$HOST_FETCH_SCRIPT" "$CONF_FILE" 2>/dev/null || true
+
+echo "🧪 Step 7: Fetch journey now (if RUN_FETCH_NOW=1)"
+FETCH_OK=0
+if [[ "$RUN_FETCH_NOW" == "1" ]]; then
+  set +e
+  DATE_FROM="$(date +%F)" DATE_TO="$(date +%F)" "$HOST_FETCH_SCRIPT" 2>&1 | tee "$BACKUP_DIR/fetch_now_output.txt"
+  FETCH_OK=${PIPESTATUS[0]}
+  set -e
+  if [[ $FETCH_OK -ne 0 ]]; then
+    echo "⚠️ Fetch now failed. This is usually SSH/password/key issue. Install continues; API will use CDR fallback until JSON cache exists."
+  fi
+else
+  echo "ℹ️ RUN_FETCH_NOW=0, skipped immediate SSH fetch."
+fi
+
+echo "🕒 Step 8: Install cron if SSH key works and INSTALL_CRON=1"
+if [[ "$INSTALL_CRON" == "1" ]]; then
+  if ssh -o BatchMode=yes -o ConnectTimeout=5 "$ELASTIX_SSH" "test -r '$QUEUE_LOG'" >/dev/null 2>&1; then
+    cat > /etc/cron.d/roshdy_queue_journey <<EOF
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+*/$CRON_MINUTES * * * * root DATE_FROM=\$(date +\%F) DATE_TO=\$(date +\%F) $HOST_FETCH_SCRIPT >> $ROOT/logs/roshdy_queue_journey_cron.log 2>&1
+EOF
+    chmod 0644 /etc/cron.d/roshdy_queue_journey
+    mkdir -p "$ROOT/logs"
+    echo "✅ Cron installed: /etc/cron.d/roshdy_queue_journey"
+  else
+    echo "⚠️ SSH key/BachMode to $ELASTIX_SSH is not ready; cron not installed."
+    echo "   Manual fetch works with password: $HOST_FETCH_SCRIPT"
+    echo "   For cron, setup SSH key from ERP root to Elastix root."
+  fi
+else
+  echo "ℹ️ INSTALL_CRON=0, skipped cron."
+fi
+
+echo "🧹 Step 9: Clear cache + restart app services"
+bench_exec clear-cache || true
+"${COMPOSE[@]}" restart backend frontend websocket queue-short queue-long scheduler >/dev/null
+sleep 8
+bench_exec clear-cache || true
+
+echo "🧪 Step 10: Validation"
+set +e
+for p in queue-journey-report admin-desk email-report-customizer call-report; do
+  code="$(curl -k -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$p" 2>/dev/null || echo 000)"
+  echo "$p => $code" | tee -a "$BACKUP_DIR/page_smoke_checks_v20.txt"
+done
+bench_exec execute restaurant_ops.api.queue_journey_api.debug_queue_journey_status | tee "$BACKUP_DIR/debug_queue_journey_status.txt"
+V1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_journey_api.get_queue_journey_report | tee "$BACKUP_DIR/get_queue_journey_report.txt"
+V2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.upper_management_email_api.verify_queue_journey_in_upper_email | tee "$BACKUP_DIR/verify_queue_journey_in_upper_email.txt"
+V3=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.email_report.debug_center_queue_journey_section | tee "$BACKUP_DIR/debug_center_queue_journey_section.txt"
+V4=${PIPESTATUS[0]}
+set -e
+
+if [[ $V1 -ne 0 || $V2 -ne 0 || $V3 -ne 0 || $V4 -ne 0 ]]; then
+  echo "❌ Validation failed. راجع: $BACKUP_DIR"
+  exit 1
+fi
+
+echo "🏥 Step 11: Health Check - Elastix/CDR/AMI + Queue + Call Report"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$BACKUP_DIR/health_asterisk_bridge.txt"
+H1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status | tee "$BACKUP_DIR/health_queue_status.txt"
+H2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' | tee "$BACKUP_DIR/health_call_report.txt"
+H3=${PIPESTATUS[0]}
+set -e
+
+if [[ $H1 -ne 0 || $H2 -ne 0 || $H3 -ne 0 ]]; then
+  echo "⚠️ Health returned non-zero. راجع: $BACKUP_DIR"
+else
+  echo "✅ Health checks OK"
+fi
+
+echo "============================================================"
+echo "✅ DONE V20 Queue Journey LIVE integration"
+echo "📦 Backup folder: $BACKUP_DIR"
+echo "📄 Host parser: $HOST_FETCH_SCRIPT"
+echo "⚙️ Config: $CONF_FILE"
+echo "📁 JSON cache dir: $JOURNEY_DIR"
+echo "🌐 Page: /queue-journey-report"
+echo "📧 Upper + Center emails now use queue journey when cache exists; fallback to CDR if missing"
+echo "🛡️ report_api.py / Elastix / CDR / AMI untouched"
+echo "============================================================"

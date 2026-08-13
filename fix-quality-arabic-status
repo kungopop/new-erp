@@ -1,0 +1,336 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# fix-quality-arabic-status
+# Makes Quality Desk save/stat filters work whether Call Center Complaint Select options are English OR Arabic.
+# Cause: Frappe Select stores the displayed option text as the actual DB value.
+# If you changed Status/Priority options from English to Arabic, old APIs that write/read English values can fail or show blank.
+# This patch normalizes both directions and stores the value that exists in the current DocType options.
+
+ROOT="/opt/frappe_crm"
+SITE="crm.local"
+APP_HOST="$ROOT/apps/restaurant_ops"
+APP_DIR="$APP_HOST/restaurant_ops"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/FIX_QUALITY_ARABIC_STATUS_BEFORE_$TS"
+
+say(){ echo -e "\n============================================================\n$1\n============================================================"; }
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo "❌ شغّل كـ root: sudo -i ثم ./fix-quality-arabic-status"
+  exit 1
+fi
+
+say "1) Backup قبل دعم حالات الجودة عربي/إنجليزي"
+cd "$ROOT"
+BACKEND="$(docker compose ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ لم أجد backend container. شغّل: cd /opt/frappe_crm && docker compose up -d"
+  exit 1
+fi
+mkdir -p "$BACKUP_DIR"
+cp -a "$APP_HOST" "$BACKUP_DIR/restaurant_ops"
+[[ -f "$ROOT/docker-compose.yml" ]] && cp -a "$ROOT/docker-compose.yml" "$BACKUP_DIR/docker-compose.yml"
+echo "✅ Backup: $BACKUP_DIR"
+
+say "2) Append final Arabic/English adaptive Quality API overrides"
+cat >> "$APP_DIR/api/quality_api.py" <<'PY'
+
+# ===== ROSHDY QUALITY AR/EN STATUS FINAL OVERRIDE START =====
+def _qa_roles():
+    try:
+        return set(frappe.get_roles(frappe.session.user))
+    except Exception:
+        return set()
+
+
+def _qa_allowed():
+    user = frappe.session.user
+    return user == 'Administrator' or bool(_qa_roles() & {'Complaint_Quality_User', 'Call Center Admin', 'System Manager'})
+
+
+_STATUS_AR_TO_EN = {
+    'مسودة': 'Draft',
+    'مفتوح': 'Open',
+    'مفتوحة': 'Open',
+    'قيد المراجعة': 'Under Review',
+    'قيد مراجعه': 'Under Review',
+    'تم الحل': 'Resolved',
+    'محلولة': 'Resolved',
+    'مغلق': 'Closed',
+    'مغلقة': 'Closed',
+}
+_STATUS_EN_TO_AR = {
+    'Draft': 'مسودة',
+    'Open': 'مفتوحة',
+    'Under Review': 'قيد المراجعة',
+    'Resolved': 'تم الحل',
+    'Closed': 'مغلقة',
+}
+_PRIORITY_AR_TO_EN = {
+    'منخفضة': 'Low', 'منخفض': 'Low',
+    'متوسطة': 'Medium', 'متوسط': 'Medium',
+    'عالية': 'High', 'عالي': 'High',
+    'عاجلة': 'Urgent', 'عاجل': 'Urgent',
+}
+_PRIORITY_EN_TO_AR = {
+    'Low': 'منخفضة',
+    'Medium': 'متوسطة',
+    'High': 'عالية',
+    'Urgent': 'عاجلة',
+}
+
+
+def _qa_field_options(fieldname):
+    try:
+        for df in frappe.get_meta('Call Center Complaint').fields:
+            if df.fieldname == fieldname:
+                return [x.strip() for x in (df.options or '').split('\n') if x.strip()]
+    except Exception:
+        pass
+    return []
+
+
+def _qa_status_en(value):
+    s = str(value or '').strip()
+    if s in _STATUS_AR_TO_EN:
+        return _STATUS_AR_TO_EN[s]
+    if s in _STATUS_EN_TO_AR:
+        return s
+    return s
+
+
+def _qa_status_store(value):
+    """Return a status value that is valid for the current DocType Select options."""
+    en = _qa_status_en(value) or 'Under Review'
+    ar = _STATUS_EN_TO_AR.get(en, value)
+    opts = _qa_field_options('status')
+    if opts:
+        if en in opts:
+            return en
+        if ar in opts:
+            return ar
+        # If current Arabic/English text itself exists, keep it.
+        v = str(value or '').strip()
+        if v in opts:
+            return v
+    return en
+
+
+def _qa_priority_en(value):
+    s = str(value or '').strip()
+    if s in _PRIORITY_AR_TO_EN:
+        return _PRIORITY_AR_TO_EN[s]
+    if s in _PRIORITY_EN_TO_AR:
+        return s
+    return s
+
+
+def _qa_priority_match(value, wanted):
+    if not wanted or wanted == 'All':
+        return True
+    return _qa_priority_en(value) == _qa_priority_en(wanted)
+
+
+def _qa_status_match(value, wanted):
+    if not wanted or wanted == 'All':
+        return True
+    return _qa_status_en(value) == _qa_status_en(wanted)
+
+
+def _qa_meta_fields():
+    try:
+        return {df.fieldname for df in frappe.get_meta('Call Center Complaint').fields}
+    except Exception:
+        return set()
+
+
+def _qa_dt_bounds(date_from=None, date_to=None):
+    from datetime import datetime, time
+    from frappe.utils import getdate, add_days
+    today = getdate()
+    df = getdate(date_from) if date_from else today.replace(day=1)
+    dt = getdate(date_to) if date_to else today
+    return datetime.combine(df, time.min), datetime.combine(add_days(dt, 1), time.min), df, dt
+
+
+def _qa_fetch_rows(date_from=None, date_to=None, search='', assigned='All'):
+    meta = _qa_meta_fields()
+    base = ['name','customer_name','phone_number','complaint_source','complaint_category','complaint_priority','status','assigned_quality_inspector','investigation_analysis','corrective_action','complaint_details','complaint_datetime','creation','modified','closing_notes','resolved_by','resolved_at','opened_by_agent','shift','shift_leader','call_record_link']
+    fields = ['name'] + [f for f in base if f != 'name' and f in meta]
+    start, end, df, dt = _qa_dt_bounds(date_from, date_to)
+    date_expr = 'COALESCE(complaint_datetime, creation)' if 'complaint_datetime' in meta else 'creation'
+    where = [f'{date_expr} >= %s', f'{date_expr} < %s']
+    vals = [start, end]
+    if search:
+        like = '%' + str(search).strip() + '%'
+        parts = []
+        for f in ['name','customer_name','phone_number','complaint_details','complaint_category']:
+            if f == 'name' or f in meta:
+                parts.append(f'{f} like %s')
+                vals.append(like)
+        if parts:
+            where.append('(' + ' or '.join(parts) + ')')
+    if assigned == 'mine' and 'assigned_quality_inspector' in meta:
+        where.append('assigned_quality_inspector=%s')
+        vals.append(frappe.session.user)
+    elif assigned == 'unassigned' and 'assigned_quality_inspector' in meta:
+        where.append("(assigned_quality_inspector is null or assigned_quality_inspector='')")
+    sql = f"select {', '.join(fields)} from `tabCall Center Complaint` where {' and '.join(where)} order by {date_expr} desc limit 10000"
+    rows = frappe.db.sql(sql, vals, as_dict=True)
+    for r in rows:
+        r['dt'] = str(r.get('complaint_datetime') or r.get('creation') or '')
+    return rows, df, dt
+
+
+def _qa_stats(rows):
+    total = len(rows)
+    resolved = sum(1 for r in rows if _qa_status_en(r.get('status')) in {'Resolved','Closed'})
+    under_review = sum(1 for r in rows if _qa_status_en(r.get('status')) == 'Under Review')
+    open_count = sum(1 for r in rows if _qa_status_en(r.get('status')) in {'Draft','Open'})
+    urgent = sum(1 for r in rows if _qa_priority_en(r.get('complaint_priority')) in {'High','Urgent'} and _qa_status_en(r.get('status')) not in {'Resolved','Closed'})
+    reviewed = sum(1 for r in rows if (r.get('investigation_analysis') or r.get('corrective_action') or _qa_status_en(r.get('status')) in {'Resolved','Closed'}))
+    unassigned = sum(1 for r in rows if not r.get('assigned_quality_inspector'))
+    mine = sum(1 for r in rows if r.get('assigned_quality_inspector') == frappe.session.user)
+    by_status = {}
+    by_priority = {}
+    by_category = {}
+    for r in rows:
+        st = _qa_status_en(r.get('status')) or 'غير محدد'
+        pr = _qa_priority_en(r.get('complaint_priority')) or 'غير محدد'
+        cat = r.get('complaint_category') or 'غير محدد'
+        by_status[st] = by_status.get(st, 0) + 1
+        by_priority[pr] = by_priority.get(pr, 0) + 1
+        by_category[cat] = by_category.get(cat, 0) + 1
+    return {'total':total,'open':open_count,'under_review':under_review,'resolved':resolved,'urgent':urgent,'reviewed':reviewed,'unassigned':unassigned,'mine':mine,'by_status':by_status,'by_priority':by_priority,'by_category':by_category}
+
+
+@frappe.whitelist(allow_guest=False)
+def get_quality_dashboard(date_from=None, date_to=None, status='All', priority='All', search='', assigned='All', page=1, page_size=200):
+    if not _qa_allowed():
+        return {'success': False, 'message': 'Permission denied'}
+    rows_all, df, dt = _qa_fetch_rows(date_from, date_to, search, assigned)
+    rows_all = [r for r in rows_all if _qa_status_match(r.get('status'), status) and _qa_priority_match(r.get('complaint_priority'), priority)]
+    page = max(1, int(page or 1)); page_size = max(10, min(int(page_size or 200), 500))
+    start = (page - 1) * page_size
+    rows = rows_all[start:start+page_size]
+    try:
+        emp = frappe.db.get_value('Employee', {'user_id': frappe.session.user}, 'employee_name') or frappe.db.get_value('User', frappe.session.user, 'full_name') or frappe.session.user
+    except Exception:
+        emp = frappe.session.user
+    return {'success': True, 'employee_name': emp, 'user': frappe.session.user, 'date_from': str(df), 'date_to': str(dt), 'stats': _qa_stats(rows_all), 'rows': rows, 'total_rows': len(rows_all), 'page': page, 'page_size': page_size, 'total_complaints': len(rows_all), 'my_count': len(rows), 'my_complaints': rows}
+
+
+@frappe.whitelist(allow_guest=False)
+def get_quality_stats(date_from=None, date_to=None):
+    d = get_quality_dashboard(date_from=date_from, date_to=date_to, page_size=5000)
+    if not d.get('success'):
+        return d
+    st = d.get('stats') or {}
+    return {'success': True, 'employee_name': d.get('employee_name'), 'total_complaints': st.get('total',0), 'resolved_complaints': st.get('resolved',0), 'open_complaints': st.get('open',0)+st.get('under_review',0), 'urgent_complaints': st.get('urgent',0), 'stats': st, 'date_from': d.get('date_from'), 'date_to': d.get('date_to')}
+
+
+@frappe.whitelist(allow_guest=False)
+def update_quality_review(name, assigned_quality_inspector=None, investigation_analysis='', corrective_action='', status='', closing_notes=''):
+    if not _qa_allowed():
+        return {'success': False, 'message': 'Permission denied'}
+    if not name or not frappe.db.exists('Call Center Complaint', name):
+        return {'success': False, 'message': 'Complaint not found'}
+    meta = _qa_meta_fields()
+    values = {}
+    if 'assigned_quality_inspector' in meta:
+        values['assigned_quality_inspector'] = assigned_quality_inspector or frappe.session.user
+    if 'investigation_analysis' in meta:
+        values['investigation_analysis'] = investigation_analysis or ''
+    if 'corrective_action' in meta:
+        values['corrective_action'] = corrective_action or ''
+    if 'closing_notes' in meta:
+        values['closing_notes'] = closing_notes or ''
+    if 'status' in meta:
+        st = _qa_status_store(status)
+        values['status'] = st
+        if _qa_status_en(st) in {'Resolved','Closed'}:
+            if 'resolved_by' in meta:
+                values['resolved_by'] = frappe.session.user
+            if 'resolved_at' in meta:
+                values['resolved_at'] = now_datetime()
+    frappe.db.set_value('Call Center Complaint', name, values, update_modified=True)
+    frappe.db.commit()
+    out = frappe.db.get_value('Call Center Complaint', name, ['name','status','assigned_quality_inspector','investigation_analysis','corrective_action','closing_notes'], as_dict=True)
+    return {'success': True, 'message': 'تم حفظ مراجعة الجودة', 'name': name, 'updated': values, 'complaint': out, 'status': out.get('status') if out else values.get('status')}
+# ===== ROSHDY QUALITY AR/EN STATUS FINAL OVERRIDE END =====
+PY
+chmod 644 "$APP_DIR/api/quality_api.py"
+
+say "3) Patch quality-desk JS to send English canonical values and display Arabic labels"
+python3 - <<'PY'
+from pathlib import Path
+import re
+p=Path('/opt/frappe_crm/apps/restaurant_ops/restaurant_ops/www/quality-desk.html')
+if not p.exists():
+    print('⚠️ quality-desk.html not found')
+    raise SystemExit
+s=p.read_text(errors='ignore')
+s=re.sub(r'<!-- ROSHDY_QUALITY_ARABIC_STATUS_JS_START -->[\s\S]*?<!-- ROSHDY_QUALITY_ARABIC_STATUS_JS_END -->','',s,flags=re.I)
+block=r'''
+<!-- ROSHDY_QUALITY_ARABIC_STATUS_JS_START -->
+<script id="quality-arabic-status-js">
+(function(){
+function statusEn(s){s=String(s||'').trim();var m={'مسودة':'Draft','Draft':'Draft','مفتوح':'Open','مفتوحة':'Open','Open':'Open','قيد المراجعة':'Under Review','قيد مراجعه':'Under Review','Under Review':'Under Review','تم الحل':'Resolved','محلولة':'Resolved','Resolved':'Resolved','مغلق':'Closed','مغلقة':'Closed','Closed':'Closed'};return m[s]||s||'Under Review'}
+function priorityEn(s){s=String(s||'').trim();var m={'منخفضة':'Low','منخفض':'Low','Low':'Low','متوسطة':'Medium','متوسط':'Medium','Medium':'Medium','عالية':'High','عالي':'High','High':'High','عاجلة':'Urgent','عاجل':'Urgent','Urgent':'Urgent'};return m[s]||s}
+function fixMainFilters(){var st=document.getElementById('status');if(st){st.innerHTML='<option value="All">الكل</option><option value="Draft">مسودة</option><option value="Open">مفتوحة</option><option value="Under Review">قيد المراجعة</option><option value="Resolved">تم الحل</option><option value="Closed">مغلقة</option>'}var pr=document.getElementById('priority');if(pr){pr.innerHTML='<option value="All">الكل</option><option value="Low">منخفضة</option><option value="Medium">متوسطة</option><option value="High">عالية</option><option value="Urgent">عاجلة</option>'}}
+function fixModal(){var sel=document.getElementById('m_status');if(sel){var old=statusEn(sel.value||((window.current||{}).status));sel.innerHTML='<option value="Draft">مسودة</option><option value="Open">مفتوحة</option><option value="Under Review">قيد المراجعة</option><option value="Resolved">تم الحل</option><option value="Closed">مغلقة</option>';sel.value=old||'Under Review'}}
+var oldOpen=window.openComplaint;if(typeof oldOpen==='function'){window.openComplaint=async function(name){await oldOpen(name);setTimeout(fixModal,120)}}
+var oldLoad=window.load;if(typeof oldLoad==='function'){window.load=async function(){fixMainFilters();return await oldLoad();}}
+var oldSave=window.saveComplaint;if(typeof oldSave==='function'){window.saveComplaint=async function(){var sel=document.getElementById('m_status');if(sel)sel.value=statusEn(sel.value);return await oldSave();}}
+setTimeout(function(){fixMainFilters();fixModal();},500);
+})();
+</script>
+<!-- ROSHDY_QUALITY_ARABIC_STATUS_JS_END -->
+'''
+if '</body>' in s:
+    s=s.replace('</body>',block+'\n</body>',1)
+else:
+    s+='\n'+block
+p.write_text(s)
+print('✅ quality-desk Arabic/English status JS patched')
+PY
+
+say "4) Clear cache + restart"
+docker exec "$BACKEND" bash -lc "find /home/frappe/frappe-bench/apps/restaurant_ops -name '*.pyc' -delete; find /home/frappe/frappe-bench/apps/restaurant_ops -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true"
+docker exec "$BACKEND" bench --site "$SITE" clear-cache || true
+docker exec "$BACKEND" bench --site "$SITE" clear-website-cache || true
+docker compose restart backend frontend websocket queue-short queue-long scheduler
+sleep 10
+BACKEND="$(docker compose ps -q backend)"
+
+say "5) Validation"
+echo "--- status options current ---"
+docker exec "$BACKEND" bench --site "$SITE" execute frappe.db.get_value --args '["DocField", {"parent":"Call Center Complaint", "fieldname":"status"}, "options"]' || true
+
+echo "--- quality dashboard api ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.quality_api.get_quality_dashboard --kwargs '{"page_size":5}' || true
+
+echo "--- update API smoke ---"
+docker exec "$BACKEND" bench --site "$SITE" execute frappe.get_attr --args '["restaurant_ops.api.quality_api.update_quality_review"]' >/dev/null && echo "update_quality_review OK" || true
+
+echo "--- Page HTTP status ---"
+for page in quality-desk quality-complaint call-report admin-desk; do
+  code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$page" || true)"
+  echo "$page => $code"
+done
+
+say "6) Health Check مهم: Elastix/CDR/AMI + Queue + Call Report"
+echo "--- Asterisk/Elastix diagnostics ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics || true
+
+echo "--- Queue status ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.queue_api.get_queue_status || true
+
+echo "--- Calls report admin sample ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' || true
+
+say "✅ Quality Arabic/English status support fixed يا زعيم"
+echo "الإجابة المختصرة: آه تغيير Select options من English لعربي كان سبب مهم. دلوقتي API بيدعم الاتنين وبيخزن القيمة المناسبة لخيارات الـ DocType الحالية."
+echo "افتح /quality-desk واعمل Ctrl+F5 وجرب الحفظ."
+echo "Backup: $BACKUP_DIR"

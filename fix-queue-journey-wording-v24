@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Roshdy V24: wording polish for Queue Journey report and emails
+# Fixes user feedback:
+# - Page title wording was not professional enough.
+# - "غير محدد بعد انتهاء دورة انتظار" is confusing.
+# - Summary/table column "غير محدد" is not meaningful.
+# New wording:
+# - Page/report title: "تقرير محاولات الرن غير المجابة"
+# - Unknown/timeout fate: "لم يظهر رد أو إغلاق بعد هذه المحاولة"
+# - Summary unknown column/card: "مصير غير محسوم"
+# Safety:
+# - Backup first.
+# - Does NOT touch report_api.py / Elastix / CDR / AMI config.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "❌ docker compose/docker-compose مش موجود"
+  exit 1
+fi
+
+APP_DIR="$ROOT/apps/$APP"
+PKG_DIR="$APP_DIR/$APP"
+API_DIR="$PKG_DIR/api"
+WWW_DIR="$PKG_DIR/www"
+QUEUE_API="$API_DIR/queue_journey_api.py"
+UPPER_API="$API_DIR/upper_management_email_api.py"
+EMAIL_REPORT="$API_DIR/email_report.py"
+PAGE_HTML="$WWW_DIR/queue-journey-report.html"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/FIX_QUEUE_JOURNEY_WORDING_V24_BEFORE_$TS"
+mkdir -p "$BACKUP_DIR"
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend container مش شغال أو مش لاقيه"
+  exit 1
+fi
+
+bench_exec() {
+  "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"
+}
+
+echo "============================================================"
+echo "🔧 Roshdy V24: Queue Journey wording polish"
+echo "📦 Backup: $BACKUP_DIR"
+echo "============================================================"
+
+echo "🧯 Backup files"
+for f in "$QUEUE_API" "$UPPER_API" "$EMAIL_REPORT" "$PAGE_HTML"; do
+  [[ -f "$f" ]] && cp -a "$f" "$BACKUP_DIR/$(basename "$f").before" || true
+done
+
+echo "🧩 Patch wording in API + page + emails"
+export QUEUE_API UPPER_API EMAIL_REPORT PAGE_HTML
+python3 - <<'PY'
+# -*- coding: utf-8 -*-
+from pathlib import Path
+import os
+
+queue_api = Path(os.environ["QUEUE_API"])
+upper_api = Path(os.environ["UPPER_API"])
+email_report = Path(os.environ["EMAIL_REPORT"])
+page_html = Path(os.environ["PAGE_HTML"])
+
+# 1) Queue API: override fate labels with business-friendly wording.
+if queue_api.exists():
+    s = queue_api.read_text(encoding="utf-8", errors="ignore")
+    start = "# BEGIN ROSHDY QUEUE JOURNEY WORDING V24"
+    end = "# END ROSHDY QUEUE JOURNEY WORDING V24"
+    patch = r'''
+# BEGIN ROSHDY QUEUE JOURNEY WORDING V24
+# Final business wording for queue journey fate labels.
+def _fate_label(fate, answered_ext=None, answered_employee=None):
+    if fate == "answered_later_same_extension":
+        return "تم الرد لاحقًا من نفس التحويلة"
+    if fate == "answered_later_other_extension":
+        if answered_employee:
+            return f"تم الرد لاحقًا بواسطة {answered_employee}"
+        if answered_ext:
+            return f"تم الرد لاحقًا بواسطة تحويلة {answered_ext}"
+        return "تم الرد لاحقًا"
+    if fate == "customer_abandoned_after_attempt":
+        return "العميل أغلق بعد المحاولة"
+    if fate == "completed_after_attempt_connect_missing":
+        return "اكتملت لاحقًا لكن لم يظهر موظف الرد"
+    if fate == "timeout_after_attempt_no_final_connect_seen":
+        return "لم يظهر رد أو إغلاق بعد هذه المحاولة"
+    if fate == "journey_unavailable":
+        return "مصير المحاولة غير متاح من ملف الرحلة"
+    if fate == "unknown_after_attempt":
+        return "مصير المحاولة غير محسوم"
+    return "مصير المحاولة غير محسوم"
+# END ROSHDY QUEUE JOURNEY WORDING V24
+'''
+    if start in s and end in s:
+        i = s.index(start); j = s.index(end, i) + len(end); s = s[:i] + patch.strip() + s[j:]
+    else:
+        s = s.rstrip() + "\n\n" + patch.strip() + "\n"
+    compile(s, str(queue_api), "exec")
+    queue_api.write_text(s, encoding="utf-8")
+
+# 2) Replace static wording in page and email modules.
+repls = {
+    "رحلة محاولات الرن التي لم يتم الرد عليها": "تقرير محاولات الرن غير المجابة",
+    "رحله محاولات الرن التي لم يتم الرد عليها": "تقرير محاولات الرن غير المجابة",
+    "رحلة محاولات الرن": "تقرير محاولات الرن غير المجابة",
+    "غير محدد بعد انتهاء دورة انتظار": "لم يظهر رد أو إغلاق بعد هذه المحاولة",
+    "غير محدد بعد انتهاء دوره انتظار": "لم يظهر رد أو إغلاق بعد هذه المحاولة",
+    "غير محدد</div><div class=\"num\" id=\"unknown\"": "مصير غير محسوم</div><div class=\"num\" id=\"unknown\"",
+    "<th>غير محدد</th>": "<th>مصير غير محسوم</th>",
+    "<th>غير محدد</th></tr>": "<th>مصير غير محسوم</th></tr>",
+    "unknown_or_timeout": "unknown_or_timeout",  # no-op, keep machine key
+}
+for p in (page_html, upper_api, email_report):
+    if not p.exists():
+        continue
+    txt = p.read_text(encoding="utf-8", errors="ignore")
+    for a, b in repls.items():
+        txt = txt.replace(a, b)
+    # Page-specific polish: better source label and table headers if present.
+    if p == page_html:
+        txt = txt.replace("Journey source:", "مصدر بيانات الرحلة:")
+        txt = txt.replace("Fallback source:", "مصدر احتياطي:")
+        txt = txt.replace("<th>لم يرد</th>", "<th>لم يرد على الرن</th>")
+        txt = txt.replace("<th>تم الرد لاحقًا بواسطة</th>", "<th>تم التعامل لاحقًا بواسطة</th>")
+        txt = txt.replace("<th>مصير المحاولة</th>", "<th>مصير المحاولة بعد الرن</th>")
+        # If the unknown card did not match exact replacement because of spacing, use a broader replacement.
+        txt = txt.replace("غير محدد<div class=\"num\" id=\"unknown\"", "مصير غير محسوم<div class=\"num\" id=\"unknown\"")
+    p.write_text(txt, encoding="utf-8")
+PY
+
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+[[ -n "$APP_OWNER" ]] && chown "$APP_OWNER" "$QUEUE_API" "$UPPER_API" "$EMAIL_REPORT" "$PAGE_HTML" 2>/dev/null || true
+
+echo "🧹 Clear cache + restart app services"
+bench_exec clear-cache || true
+"${COMPOSE[@]}" restart backend frontend websocket queue-short queue-long scheduler >/dev/null
+sleep 8
+bench_exec clear-cache || true
+
+echo "🧪 Validation"
+set +e
+for p in queue-journey-report admin-desk email-report-customizer call-report; do
+  code="$(curl -k -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$p" 2>/dev/null || echo 000)"
+  echo "$p => $code" | tee -a "$BACKUP_DIR/page_smoke_checks_v24.txt"
+done
+bench_exec execute restaurant_ops.api.queue_journey_api.get_queue_journey_report | tee "$BACKUP_DIR/get_queue_journey_report_v24.txt"
+V1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.upper_management_email_api.verify_queue_journey_in_upper_email | tee "$BACKUP_DIR/verify_upper_journey_v24.txt"
+V2=${PIPESTATUS[0]}
+set -e
+
+if [[ $V1 -ne 0 || $V2 -ne 0 ]]; then
+  echo "❌ Validation failed. راجع: $BACKUP_DIR"
+  exit 1
+fi
+
+if grep -q "غير محدد بعد انتهاء دورة انتظار\|Busy/Declined\|staff_missed" "$BACKUP_DIR/get_queue_journey_report_v24.txt" 2>/dev/null; then
+  echo "⚠️ لسه فيه لفظ تقني/قديم في API output. راجع: $BACKUP_DIR/get_queue_journey_report_v24.txt"
+else
+  echo "✅ API wording looks clean"
+fi
+
+echo "🏥 Health Check - Elastix/CDR/AMI + Queue + Call Report"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$BACKUP_DIR/health_asterisk_bridge.txt"
+H1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status | tee "$BACKUP_DIR/health_queue_status.txt"
+H2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' | tee "$BACKUP_DIR/health_call_report.txt"
+H3=${PIPESTATUS[0]}
+set -e
+
+if [[ $H1 -ne 0 || $H2 -ne 0 || $H3 -ne 0 ]]; then
+  echo "⚠️ Health returned non-zero. راجع: $BACKUP_DIR"
+else
+  echo "✅ Health checks OK"
+fi
+
+echo "============================================================"
+echo "✅ DONE V24"
+echo "📦 Backup folder: $BACKUP_DIR"
+echo "🌐 افتح /queue-journey-report واعمل Ctrl+F5"
+echo "📌 التعديلات: عنوان أنضف + مصير غير محسوم بدل غير محدد + إزالة الجملة المزعجة"
+echo "🛡️ report_api.py / Elastix / CDR / AMI untouched"
+echo "============================================================"

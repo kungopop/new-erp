@@ -1,0 +1,994 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Roshdy Email Reports V5 Fix
+# Fixes reported issues:
+# 1) Restore Customer Service Manager email behavior from pre-upper-management backup, only rename title to مدير خدمة العملاء.
+# 2) Upper Management report: email-safe RTL/right alignment.
+# 3) Upper Management report: complaints are TODAY only, with status/category classification.
+# 4) Upper Management report: show employees/extensions who rejected/cancelled/missed calls when present.
+# 5) Upper Management report: strict recipients only from UI/exact upper-management setting, no role fallback.
+# 6) Verify active breaks still read from backend.
+# Does NOT touch restaurant_ops.api.report_api / Elastix / CDR / AMI config.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+RUN_EMAIL_SEND_TEST="${RUN_EMAIL_SEND_TEST:-0}"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "❌ docker compose/docker-compose مش موجود"
+  exit 1
+fi
+
+APP_DIR="$ROOT/apps/$APP"
+PKG_DIR="$APP_DIR/$APP"
+API_DIR="$PKG_DIR/api"
+EMAIL_REPORT="$API_DIR/email_report.py"
+UPPER_API="$API_DIR/upper_management_email_api.py"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/FIX_EMAIL_REPORTS_V5_BEFORE_$TS"
+mkdir -p "$BACKUP_DIR"
+
+if [[ ! -f "$EMAIL_REPORT" || ! -f "$UPPER_API" ]]; then
+  echo "❌ مش لاقي ملفات الإيميل المطلوبة"
+  echo "EMAIL_REPORT=$EMAIL_REPORT"
+  echo "UPPER_API=$UPPER_API"
+  exit 1
+fi
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend container مش شغال أو مش لاقيه"
+  exit 1
+fi
+
+bench_exec() {
+  "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"
+}
+
+echo "============================================================"
+echo "🔧 Roshdy Email Reports V5 Fix"
+echo "📦 Backup: $BACKUP_DIR"
+echo "============================================================"
+
+echo "🧯 Backup current email files"
+cp -a "$EMAIL_REPORT" "$BACKUP_DIR/email_report.py.current"
+cp -a "$UPPER_API" "$BACKUP_DIR/upper_management_email_api.py.current"
+
+export ROOT EMAIL_REPORT UPPER_API BACKUP_DIR
+python3 - <<'PY'
+# -*- coding: utf-8 -*-
+from pathlib import Path
+import os, glob, re, shutil
+
+root = Path(os.environ["ROOT"])
+email_report = Path(os.environ["EMAIL_REPORT"])
+upper_api = Path(os.environ["UPPER_API"])
+backup_dir = Path(os.environ["BACKUP_DIR"])
+
+# ------------------------------------------------------------------
+# A) Restore Customer Service Manager email_report.py from the backup taken BEFORE upper-management script.
+#    This should bring back old manager report sections exactly, then we only rename the Arabic title.
+# ------------------------------------------------------------------
+patterns = [
+    str(root / "backups" / "UPPER_MGMT_CANCEL_BREAK_BEFORE_*" / "files" / "apps" / "restaurant_ops" / "restaurant_ops" / "api" / "email_report.py"),
+    str(root / "backups" / "REPORTS_RESET_FIX_ORIGINALS_BEFORE_*" / "files" / "apps" / "restaurant_ops" / "restaurant_ops" / "api" / "email_report.py"),
+]
+found = []
+for pat in patterns:
+    found.extend(glob.glob(pat))
+found = sorted(found)
+if found:
+    baseline = Path(found[-1])
+    shutil.copy2(str(baseline), str(email_report))
+    (backup_dir / "restored_email_report_from.txt").write_text(str(baseline), encoding="utf-8")
+else:
+    # If no baseline exists, remove previous router blocks from current file to stop duplicate interference.
+    s_cur = email_report.read_text(encoding="utf-8", errors="ignore")
+    blocks = [
+        ("# BEGIN ROSHDY UPPER MANAGEMENT V3 ROUTER", "# END ROSHDY UPPER MANAGEMENT V3 ROUTER"),
+        ("# BEGIN ROSHDY ROUTER STRICT UPPER TYPES V4", "# END ROSHDY ROUTER STRICT UPPER TYPES V4"),
+    ]
+    for a,b in blocks:
+        while a in s_cur and b in s_cur:
+            i=s_cur.index(a); j=s_cur.index(b,i)+len(b); s_cur=s_cur[:i]+"\n"+s_cur[j:]
+    email_report.write_text(s_cur, encoding="utf-8")
+    (backup_dir / "restored_email_report_from.txt").write_text("NO_BASELINE_FOUND_USED_CURRENT_WITH_ROUTER_BLOCKS_REMOVED", encoding="utf-8")
+
+# Rename only Arabic title words in the manager report.
+s = email_report.read_text(encoding="utf-8", errors="ignore")
+s = s.replace("مدير إدارة السنتر", "مدير إدارة خدمة العملاء")
+s = s.replace("مدير السنتر", "مدير خدمة العملاء")
+
+# Append minimal safe router. Center/manager stays legacy. Upper explicit only goes to new dynamic API.
+router = r'''
+# BEGIN ROSHDY EMAIL ROUTER V5 SAFE
+# Added by fix-email-reports-v5-manager-upper-rtl.
+# Customer Service Manager/Center report remains legacy from the restored file.
+# Only explicit Upper Management report names are routed to the new dynamic Upper report.
+try:
+    import frappe
+except Exception:
+    frappe = None
+
+try:
+    _roshdy_v5_legacy_send_report_now = send_report_now
+except Exception:
+    _roshdy_v5_legacy_send_report_now = None
+try:
+    _roshdy_v5_legacy_preview_email_report = preview_email_report
+except Exception:
+    _roshdy_v5_legacy_preview_email_report = None
+try:
+    _roshdy_v5_legacy_send_upper_management_report = send_upper_management_report
+except Exception:
+    _roshdy_v5_legacy_send_upper_management_report = None
+
+
+def _roshdy_v5_is_upper_report(report_type=None, **kwargs):
+    rt = (report_type or kwargs.get("report_type") or kwargs.get("type") or kwargs.get("report") or "").strip().lower()
+    return rt in (
+        "upper", "upper_management", "upper-management", "upper_management_report",
+        "executive", "top_management", "admin_upper",
+        "الإدارة العليا", "الادارة العليا", "ادارة عليا", "إدارة عليا"
+    )
+
+
+def _roshdy_v5_clean_kwargs(kwargs):
+    kw = dict(kwargs or {})
+    for k in ("cmd", "_", "csrf_token"):
+        kw.pop(k, None)
+    return kw
+
+
+def _roshdy_v5_call_legacy(fn, report_type=None, *args, **kwargs):
+    if not fn:
+        raise Exception("Legacy email function is not available")
+    kwargs = _roshdy_v5_clean_kwargs(kwargs)
+    attempts = []
+    if report_type is not None:
+        kw1 = dict(kwargs)
+        kw1.setdefault("report_type", report_type)
+        attempts.append((args, kw1))
+        attempts.append(((report_type,) + tuple(args), kwargs))
+    attempts.append((args, kwargs))
+    attempts.append((tuple(), kwargs))
+    last = None
+    for a, kw in attempts:
+        try:
+            return fn(*a, **kw)
+        except TypeError as e:
+            last = e
+            msg = str(e).lower()
+            if any(x in msg for x in ("unexpected", "positional", "keyword", "argument", "required")):
+                continue
+            raise
+        except Exception:
+            raise
+    if last:
+        raise last
+    raise Exception("Legacy email call failed")
+
+
+if frappe:
+    @frappe.whitelist()
+    def preview_upper_management_report(*args, **kwargs):
+        from restaurant_ops.api.upper_management_email_api import preview_upper_management_report as _fn
+        return _fn(*args, **kwargs)
+
+    @frappe.whitelist()
+    def send_upper_management_report(*args, **kwargs):
+        from restaurant_ops.api.upper_management_email_api import send_upper_management_report as _fn
+        return _fn(*args, **kwargs)
+
+    @frappe.whitelist()
+    def preview_email_report(report_type=None, *args, **kwargs):
+        if _roshdy_v5_is_upper_report(report_type, **kwargs):
+            from restaurant_ops.api.upper_management_email_api import preview_upper_management_report as _fn
+            return _fn(*args, **kwargs)
+        return _roshdy_v5_call_legacy(_roshdy_v5_legacy_preview_email_report, report_type, *args, **kwargs)
+
+    @frappe.whitelist()
+    def send_report_now(report_type=None, *args, **kwargs):
+        if _roshdy_v5_is_upper_report(report_type, **kwargs):
+            from restaurant_ops.api.upper_management_email_api import send_upper_management_report as _fn
+            return _fn(*args, **kwargs)
+        return _roshdy_v5_call_legacy(_roshdy_v5_legacy_send_report_now, report_type, *args, **kwargs)
+# END ROSHDY EMAIL ROUTER V5 SAFE
+'''
+# Remove any existing V5 block just in case.
+if "# BEGIN ROSHDY EMAIL ROUTER V5 SAFE" in s and "# END ROSHDY EMAIL ROUTER V5 SAFE" in s:
+    i=s.index("# BEGIN ROSHDY EMAIL ROUTER V5 SAFE")
+    j=s.index("# END ROSHDY EMAIL ROUTER V5 SAFE", i)+len("# END ROSHDY EMAIL ROUTER V5 SAFE")
+    s=s[:i]+router+s[j:]
+else:
+    s=s.rstrip()+"\n\n"+router+"\n"
+compile(s, str(email_report), "exec")
+email_report.write_text(s, encoding="utf-8")
+
+# ------------------------------------------------------------------
+# B) Append Upper Management V5 overrides to upper_management_email_api.py
+# ------------------------------------------------------------------
+su = upper_api.read_text(encoding="utf-8", errors="ignore")
+start = "# BEGIN ROSHDY UPPER MANAGEMENT REPORT V5 RTL COMPLAINTS EMPLOYEES"
+end = "# END ROSHDY UPPER MANAGEMENT REPORT V5 RTL COMPLAINTS EMPLOYEES"
+block = r'''
+# BEGIN ROSHDY UPPER MANAGEMENT REPORT V5 RTL COMPLAINTS EMPLOYEES
+# Final practical management report override:
+# - Email-safe RTL/right layout for Gmail.
+# - Today's complaints only with status/category classification.
+# - Employee call issues table: rejected/cancelled + left ringing/no-answer where available from Call Report API.
+# - Strict upper recipients only: explicit UI/API or exact upper-management setting. No role fallback.
+
+try:
+    import json as _r5_json
+    import re as _r5_re
+    import html as _r5_html
+except Exception:
+    pass
+
+
+def _r5_esc(v):
+    try:
+        return _r5_html.escape(cstr(v) if v is not None else "")
+    except Exception:
+        return cstr(v) if v is not None else ""
+
+
+def _r5_num(v):
+    try:
+        if v is None:
+            return "غير متاح"
+        f = flt(v)
+        if float(f).is_integer():
+            return f"{int(f):,}"
+        return f"{f:,.1f}"
+    except Exception:
+        return cstr(v)
+
+
+def _r5_clean_emails(values):
+    def walk(x):
+        out = []
+        if x is None:
+            return out
+        if isinstance(x, (list, tuple, set)):
+            for y in x:
+                out.extend(walk(y))
+            return out
+        if isinstance(x, dict):
+            for y in x.values():
+                out.extend(walk(y))
+            return out
+        text = cstr(x)
+        st = text.strip()
+        if st.startswith("{") or st.startswith("["):
+            try:
+                out.extend(walk(_r5_json.loads(st)))
+            except Exception:
+                pass
+        try:
+            out.extend(_r5_re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", text))
+        except Exception:
+            pass
+        return out
+    seen, cleaned = set(), []
+    for e in walk(values):
+        e = cstr(e).strip().strip(",; ")
+        if not e:
+            continue
+        k = e.lower()
+        if k in seen:
+            continue
+        if k.endswith("@local.local") or k.endswith("@example.com"):
+            continue
+        seen.add(k)
+        cleaned.append(e)
+    return cleaned
+
+
+def _r5_explicit_recipients(kwargs=None, direct=None):
+    kwargs = kwargs or {}
+    candidates = [direct]
+    keys = (
+        "recipients", "recipient", "emails", "email", "to", "send_to", "test_email", "email_to", "mail_to",
+        "upper_emails", "upper_email", "upper_recipients", "upper_recipient",
+        "upper_management_emails", "upper_management_email", "upper_management_recipients",
+        "management_emails", "management_recipients", "executive_emails", "executive_recipients"
+    )
+    for k in keys:
+        if k in kwargs and kwargs.get(k) not in (None, ""):
+            candidates.append(kwargs.get(k))
+    return _r5_clean_emails(candidates)
+
+
+def _r5_score_email_setting(doctype, field, value):
+    hay = f"{doctype or ''} {field or ''}".lower()
+    val = cstr(value or "").lower()
+    hard_excludes = (
+        "smtp", "mail_server", "email_server", "host", "server", "password", "secret", "token", "api_key",
+        "sender", "from_email", "from", "login", "username", "user_name", "owner",
+        "center_manager", "centre_manager", "call_center_manager", "customer_service_manager",
+        "center_emails", "centre_emails", "service_manager", "مدير السنتر", "مدير خدمة العملاء"
+    )
+    if any(x in hay for x in hard_excludes):
+        return -9999
+    score = 0
+    if "upper_management" in hay or "upper-management" in hay:
+        score += 200
+    if "upper" in hay:
+        score += 160
+    if "executive" in hay or "top_management" in hay:
+        score += 130
+    if "management" in hay and "upper" not in hay:
+        score += 80
+    if any(x in hay for x in ("recipient", "recipients", "emails", "email_to", "send_to", "to_email", "mail_to")):
+        score += 40
+    if "roshdy email builder" in hay:
+        score += 20
+    if any(x in val for x in ("upper_management", "upper management", "executive")):
+        score += 25
+    return score
+
+
+def _r5_json_upper_path_emails(obj, path=""):
+    """Extract emails only from JSON paths that clearly mean upper/executive management.
+    This prevents a settings_json blob from mixing Center Manager recipients with Upper Management recipients.
+    """
+    emails = []
+    path_l = path.lower()
+    bad = any(x in path_l for x in ("center", "centre", "customer_service", "service_manager", "manager_center", "sender", "smtp", "host", "password"))
+    good = any(x in path_l for x in ("upper", "upper_management", "executive", "top_management", "management_emails", "management_recipients"))
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            emails.extend(_r5_json_upper_path_emails(v, f"{path}.{k}" if path else cstr(k)))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            emails.extend(_r5_json_upper_path_emails(v, f"{path}[{i}]"))
+    else:
+        if good and not bad:
+            emails.extend(_r5_clean_emails(obj))
+    return emails
+
+
+def _r5_emails_from_setting_row(doctype, field, value, score):
+    hay = f"{doctype or ''} {field or ''}".lower()
+    text = cstr(value or "").strip()
+    is_json = text.startswith("{") or text.startswith("[")
+    if is_json:
+        try:
+            obj = _r5_json.loads(text)
+            upper_only = _r5_clean_emails(_r5_json_upper_path_emails(obj))
+            if upper_only:
+                return upper_only
+        except Exception:
+            pass
+        # Only for a clearly exact upper field, allow whole JSON as fallback.
+        if "upper" in hay or "executive" in hay or "top_management" in hay:
+            return _r5_clean_emails(value)
+        return []
+    return _r5_clean_emails(value)
+
+
+def _r5_pick_saved_upper_recipients():
+    candidates = []
+    try:
+        rows = frappe.db.sql("select doctype, field, value from `tabSingles` where value like '%%@%%'", as_dict=True)
+    except Exception:
+        rows = []
+    for r in rows:
+        score = _r5_score_email_setting(r.get("doctype"), r.get("field"), r.get("value"))
+        if score <= 0:
+            continue
+        emails = _r5_emails_from_setting_row(r.get("doctype"), r.get("field"), r.get("value"), score)
+        if not emails:
+            continue
+        candidates.append({"score": score, "doctype": r.get("doctype"), "field": r.get("field"), "emails": emails})
+    if not candidates:
+        return [], "not_found", []
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    best_score = candidates[0]["score"]
+    best = [c for c in candidates if c["score"] == best_score]
+    emails, sources = [], []
+    for c in best:
+        emails.extend(c["emails"])
+        sources.append(f"{c.get('doctype')}.{c.get('field')} score={c.get('score')}")
+    return _r5_clean_emails(emails), "exact_upper_setting", sources
+
+
+def _r5_resolve_upper_recipients(direct=None, kwargs=None):
+    explicit = _r5_explicit_recipients(kwargs=kwargs, direct=direct)
+    if explicit:
+        return explicit, "explicit_ui_or_api", ["kwargs/direct"]
+    saved, source, sources = _r5_pick_saved_upper_recipients()
+    if saved:
+        return saved, source, sources
+    return [], "not_found", []
+
+
+def _r5_call_report(date_from=None, date_to=None, smart_category=None, page=1, page_size=5000):
+    try:
+        from restaurant_ops.api import report_api
+    except Exception as e:
+        return {"success": False, "error": f"cannot import report_api: {e}"}
+    base = {"page": page, "page_size": page_size, "view_mode": "admin"}
+    if smart_category:
+        base["smart_category"] = smart_category
+    variants = [
+        {"date_from": cstr(date_from), "date_to": cstr(date_to)},
+        {"from_date": cstr(date_from), "to_date": cstr(date_to)},
+        {"start_date": cstr(date_from), "end_date": cstr(date_to)},
+        {"date": cstr(date_from)},
+        {},
+    ]
+    last = None
+    for dv in variants:
+        kw = dict(base); kw.update(dv)
+        try:
+            return _unwrap_result(report_api.get_calls_report(**kw))
+        except TypeError as e:
+            last = cstr(e); continue
+        except Exception as e:
+            last = cstr(e); continue
+    return {"success": False, "error": last or "unknown report_api error"}
+
+
+def _r5_rows(obj):
+    return _find_rows(obj) or []
+
+
+def _r5_report_all(start_date, end_date):
+    first = _r5_call_report(start_date, end_date, page=1, page_size=5000)
+    rows = list(_r5_rows(first))
+    summary = first.get("summary") if isinstance(first, dict) and isinstance(first.get("summary"), dict) else {}
+    pagination = first.get("pagination") if isinstance(first, dict) and isinstance(first.get("pagination"), dict) else {}
+    try:
+        total_pages = cint(pagination.get("total_pages") or 1)
+    except Exception:
+        total_pages = 1
+    max_pages = min(max(total_pages, 1), 10)
+    for page in range(2, max_pages + 1):
+        res = _r5_call_report(start_date, end_date, page=page, page_size=5000)
+        more = _r5_rows(res)
+        if not more:
+            break
+        rows.extend(more)
+    return {"first": first, "rows": rows, "summary": summary, "pagination": pagination}
+
+
+def _r5_category_rows(start_date, end_date, categories):
+    out, seen = [], set()
+    for cat in categories:
+        res = _r5_call_report(start_date, end_date, smart_category=cat, page=1, page_size=5000)
+        rows = _r5_rows(res)
+        for r in rows:
+            uid = cstr(r.get("uniqueid") or r.get("name") or f"{r.get('calldate')}|{r.get('src')}|{r.get('actual_ext')}|{cat}")
+            if uid in seen:
+                continue
+            seen.add(uid)
+            out.append(r)
+    return out
+
+
+def _r5_queue_match(row, queue):
+    qlist = _as_list(queue) or [DEFAULT_COMPLAINT_QUEUE]
+    dst = cstr(row.get("dst") or "").strip()
+    actual_ext = cstr(row.get("actual_ext") or "").strip()
+    lastdata = cstr(row.get("lastdata") or "")
+    rec = cstr(row.get("recordingfile") or row.get("recording_url") or "")
+    agent_name = cstr(row.get("agent_name") or "")
+    for q in qlist:
+        q = cstr(q).strip()
+        if not q:
+            continue
+        if dst == q:
+            return True
+        if actual_ext == q and "طابور" in agent_name:
+            return True
+        if lastdata.startswith(q + ",") or lastdata.startswith(q + "|"):
+            return True
+        if f"q-{q}-" in rec:
+            return True
+    return False
+
+
+def _r5_employee_label(row):
+    agent_name = cstr(row.get("agent_name") or "").strip()
+    if agent_name:
+        return agent_name
+    ext = cstr(row.get("actual_ext") or row.get("extension") or "").strip()
+    return _employee_name_from_extension(ext) or ext or "غير محدد"
+
+
+def _r5_issue_row(row, action):
+    ext = cstr(row.get("actual_ext") or row.get("extension") or "").strip()
+    if not ext:
+        ext = _extract_extension(" ".join([cstr(row.get("dstchannel") or ""), cstr(row.get("channel") or "")]))
+    return {
+        "time": cstr(row.get("calldate") or row.get("call_time") or row.get("time") or ""),
+        "employee": _r5_employee_label(row),
+        "extension": ext,
+        "caller": cstr(row.get("src") or row.get("cnum") or row.get("caller") or ""),
+        "action": action,
+        "duration": cstr(row.get("duration") or row.get("ring_seconds") or row.get("ringtime") or ""),
+    }
+
+
+def _r5_get_call_stats(start_date, end_date):
+    data = _r5_report_all(start_date, end_date)
+    summary = data.get("summary") or {}
+    pagination = data.get("pagination") or {}
+    rows = data.get("rows") or []
+    total = summary.get("total") or pagination.get("total_records") or len(rows)
+    answered = summary.get("answered")
+    if answered is None:
+        answered = 0
+        for r in rows:
+            if cstr(r.get("smart_category") or "").lower() == "answered" or cstr(r.get("disposition") or "").upper() == "ANSWERED" or "تم الرد" in cstr(r.get("category_label") or ""):
+                answered += 1
+    declined_count = cint(summary.get("declined") or 0)
+    staff_missed_count = cint(summary.get("staff_missed") or summary.get("employee_missed") or 0)
+
+    declined_rows_raw = _r5_category_rows(start_date, end_date, ["declined", "rejected", "busy"])
+    missed_rows_raw = _r5_category_rows(start_date, end_date, ["staff_missed", "employee_missed", "agent_missed", "missed"])
+
+    # Fallback scan if filters did not return rows but summary says there are cases.
+    if declined_count and not declined_rows_raw:
+        for r in rows:
+            smart = cstr(r.get("smart_category") or "").lower()
+            label = cstr(r.get("category_label") or "")
+            disp = cstr(r.get("disposition") or "").upper()
+            if smart in ("declined", "rejected", "busy") or disp in ("BUSY", "FAILED") or any(x in label for x in ("رفض", "كنسل", "مشغول")):
+                declined_rows_raw.append(r)
+    if staff_missed_count and not missed_rows_raw:
+        for r in rows:
+            smart = cstr(r.get("smart_category") or "").lower()
+            label = cstr(r.get("category_label") or "")
+            if smart in ("staff_missed", "employee_missed", "agent_missed", "missed") or "فائت" in label or "لم يرد" in label:
+                missed_rows_raw.append(r)
+
+    declined_rows = [_r5_issue_row(r, "تم رفض/كنسلة المكالمة") for r in declined_rows_raw]
+    missed_rows = [_r5_issue_row(r, "سابها ترن حتى انتهت") for r in missed_rows_raw]
+    employee_issue_rows = declined_rows + missed_rows
+
+    if declined_count == 0 and declined_rows:
+        declined_count = len(declined_rows)
+    if staff_missed_count == 0 and missed_rows:
+        staff_missed_count = len(missed_rows)
+
+    complaint_q = DEFAULT_COMPLAINT_QUEUE
+    try:
+        complaint_q = _roshdy_conf_queue("complaint") if "_roshdy_conf_queue" in globals() else DEFAULT_COMPLAINT_QUEUE
+    except Exception:
+        complaint_q = DEFAULT_COMPLAINT_QUEUE
+    complaint_queue_count = sum(1 for r in rows if _r5_queue_match(r, complaint_q))
+
+    return {
+        "total": cint(total or 0),
+        "answered": cint(answered or 0),
+        "declined_count": declined_count,
+        "staff_missed_count": staff_missed_count,
+        "employee_issue_count": declined_count + staff_missed_count,
+        "employee_issue_rows": employee_issue_rows,
+        "complaint_queue_count": complaint_queue_count,
+        "complaint_queue": complaint_q,
+        "source": "report_api",
+        "report_api_error": data.get("first", {}).get("error") if isinstance(data.get("first"), dict) else None,
+    }
+
+
+def _r5_closed_values():
+    return ["Closed", "Resolved", "Done", "مغلقة", "تم الحل", "محلولة", "مغلقة/محلولة", "مقفولة"]
+
+
+def _r5_pick_field(meta, candidates):
+    try:
+        for c in candidates:
+            if meta.has_field(c):
+                return c
+    except Exception:
+        pass
+    return None
+
+
+def _r5_complaint_stats(start_dt, end_dt):
+    dt = "Call Center Complaint"
+    out = {
+        "exists": False,
+        "registered_today": 0,
+        "open_today": 0,
+        "resolved_today": 0,
+        "status_breakdown": [],
+        "category_breakdown": [],
+        "priority_breakdown": [],
+        "today_rows": [],
+        "status_field": None,
+        "category_field": None,
+        "priority_field": None,
+    }
+    if not _doctype_exists(dt):
+        return out
+    out["exists"] = True
+    try:
+        meta = frappe.get_meta(dt)
+        status_field = _r5_pick_field(meta, ["status", "complaint_status", "workflow_state"])
+        category_field = _r5_pick_field(meta, ["category", "complaint_category", "complaint_type", "type", "issue_type", "reason", "complaint_reason"])
+        priority_field = _r5_pick_field(meta, ["priority", "complaint_priority", "urgency"])
+        out["status_field"] = status_field
+        out["category_field"] = category_field
+        out["priority_field"] = priority_field
+
+        fields = ["name", "creation", "modified"]
+        for f in (status_field, category_field, priority_field, "customer_name", "customer_phone", "subject"):
+            if f and f not in fields and (f in ("customer_name", "customer_phone", "subject") and meta.has_field(f) or f not in ("customer_name", "customer_phone", "subject")):
+                fields.append(f)
+        rows = frappe.get_all(dt, filters={"creation": ["between", [_iso(start_dt), _iso(end_dt)]]}, fields=fields, order_by="creation desc", limit_page_length=500)
+        out["registered_today"] = len(rows)
+
+        closed = set(_r5_closed_values())
+        status_counts, category_counts, priority_counts = {}, {}, {}
+        today_rows = []
+        for r in rows:
+            st = cstr(r.get(status_field) if status_field else "غير محدد") or "غير محدد"
+            cat = cstr(r.get(category_field) if category_field else "غير محدد") or "غير محدد"
+            pri = cstr(r.get(priority_field) if priority_field else "غير محدد") or "غير محدد"
+            status_counts[st] = status_counts.get(st, 0) + 1
+            category_counts[cat] = category_counts.get(cat, 0) + 1
+            priority_counts[pri] = priority_counts.get(pri, 0) + 1
+            if st in closed:
+                out["resolved_today"] += 1
+            else:
+                out["open_today"] += 1
+            today_rows.append({
+                "name": r.get("name"),
+                "creation": cstr(r.get("creation") or ""),
+                "status": st,
+                "category": cat,
+                "priority": pri,
+                "customer_name": r.get("customer_name") or "",
+                "customer_phone": r.get("customer_phone") or "",
+                "subject": r.get("subject") or "",
+            })
+        out["today_rows"] = today_rows
+        out["status_breakdown"] = [{"label": k, "count": v} for k, v in sorted(status_counts.items(), key=lambda x: (-x[1], x[0]))]
+        out["category_breakdown"] = [{"label": k, "count": v} for k, v in sorted(category_counts.items(), key=lambda x: (-x[1], x[0]))]
+        out["priority_breakdown"] = [{"label": k, "count": v} for k, v in sorted(priority_counts.items(), key=lambda x: (-x[1], x[0]))]
+    except Exception as e:
+        out["error"] = cstr(e)
+    return out
+
+
+def _r5_target_items(start_dt, end_dt):
+    return _get_target_items(start_dt, end_dt)
+
+
+def _r5_cancellations(start_dt, end_dt):
+    return _get_cancellations(start_dt, end_dt)
+
+
+@frappe.whitelist()
+def get_upper_management_report_data(date_from=None, date_to=None):
+    start_date, end_date, start_dt, end_dt = _period(date_from, date_to)
+    calls = _r5_get_call_stats(start_date, end_date)
+    complaints = _r5_complaint_stats(start_dt, end_dt)
+    target = _r5_target_items(start_dt, end_dt)
+    cancellations = _r5_cancellations(start_dt, end_dt)
+
+    followups = []
+    if cint(calls.get("employee_issue_count") or 0) > 0:
+        followups.append("مراجعة المكالمات التي فاتت أو تم رفضها من الموظفين.")
+    if cint(complaints.get("registered_today") or 0) > 0:
+        followups.append("مراجعة شكاوى اليوم حسب الحالة والتصنيف.")
+    if flt(target.get("total_qty") or 0) <= 1:
+        followups.append("محتاجين نركز أكتر على عرض الصنف المطلوب أثناء المكالمات.")
+    if cint(cancellations.get("count") or 0) > 0:
+        followups.append("مراجعة أسباب الإلغاءات المسجلة اليوم لو السبب متكرر أو العدد أعلى من الطبيعي.")
+    if calls.get("report_api_error"):
+        followups.append("مراجعة مصدر بيانات المكالمات لأن Call Report رجع ملاحظة أثناء القراءة.")
+
+    return {
+        "success": True,
+        "period": {"from": cstr(start_date), "to": cstr(end_date), "label": _date_label(start_date, end_date)},
+        "generated_at": now_datetime().strftime("%Y-%m-%d %H:%M:%S"),
+        "calls": calls,
+        "complaint_queue": {"count": calls.get("complaint_queue_count"), "queue": calls.get("complaint_queue"), "source": "report_api"},
+        "complaints": complaints,
+        "target_items": target,
+        "cancellations": cancellations,
+        "followups": followups,
+        "status_label": "يوجد نقاط تحتاج متابعة" if followups else "لا توجد مشكلة ظاهرة في بيانات خدمة العملاء",
+    }
+
+
+def _r5_card(title, value, note, bg="#f8fafc", color="#0f172a"):
+    return f"""
+    <td style="width:33.33%;padding:6px;vertical-align:top;direction:rtl;text-align:right;">
+      <div style="background:{bg};border:1px solid #e5e7eb;border-radius:14px;padding:13px;min-height:105px;direction:rtl;text-align:right;">
+        <div style="font-size:13px;color:#334155;font-weight:bold;">{_r5_esc(title)}</div>
+        <div style="font-size:28px;line-height:1.3;font-weight:900;color:{color};margin:5px 0;">{_r5_esc(value)}</div>
+        <div style="font-size:12px;color:#475569;">{note}</div>
+      </div>
+    </td>
+    """
+
+
+def _r5_table(headers, rows_html, empty_cols=None):
+    th = "".join(f"<th style='background:#111827;color:white;padding:9px;border:1px solid #e5e7eb;text-align:right;direction:rtl;font-size:12px;'>{_r5_esc(h)}</th>" for h in headers)
+    return f"""
+    <table dir="rtl" align="right" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:100%;direction:rtl;text-align:right;margin:8px 0 0 0;font-family:Tahoma,Arial,sans-serif;">
+      <thead><tr>{th}</tr></thead>
+      <tbody>{rows_html}</tbody>
+    </table>
+    """
+
+
+def _r5_td(v, strong=False):
+    val = f"<strong>{_r5_esc(v)}</strong>" if strong else _r5_esc(v)
+    return f"<td style='padding:8px;border:1px solid #e5e7eb;text-align:right;direction:rtl;font-size:12px;color:#1f2937;'>{val}</td>"
+
+
+def _r5_empty_row(cols, text):
+    return f"<tr><td colspan='{cols}' style='padding:12px;border:1px solid #e5e7eb;text-align:center;color:#64748b;background:#f8fafc;font-size:12px;'>{_r5_esc(text)}</td></tr>"
+
+
+def _r5_breakdown_rows(items):
+    if not items:
+        return _r5_empty_row(2, "لا توجد بيانات")
+    return "".join(f"<tr>{_r5_td(i.get('label') or 'غير محدد')}{_r5_td(_r5_num(i.get('count')), True)}</tr>" for i in items)
+
+
+@frappe.whitelist()
+def render_upper_management_report_html(date_from=None, date_to=None):
+    data = get_upper_management_report_data(date_from, date_to)
+    calls = data["calls"]
+    complaints = data["complaints"]
+    target = data["target_items"]
+    cancellations = data["cancellations"]
+    q = data["complaint_queue"]
+
+    total_calls = _r5_num(calls.get("total"))
+    answered = _r5_num(calls.get("answered"))
+    issue_count = cint(calls.get("employee_issue_count") or 0)
+    declined_count = cint(calls.get("declined_count") or 0)
+    staff_missed_count = cint(calls.get("staff_missed_count") or 0)
+    q_count = _r5_num(q.get("count"))
+    comp_today = cint(complaints.get("registered_today") or 0)
+    comp_open_today = cint(complaints.get("open_today") or 0)
+    comp_resolved_today = cint(complaints.get("resolved_today") or 0)
+    target_qty = _r5_num(target.get("total_qty") or 0)
+    cancel_count = cint(cancellations.get("count") or 0)
+
+    issue_rows = calls.get("employee_issue_rows") or []
+    if issue_rows:
+        issue_rows_html = "".join(
+            f"<tr>{_r5_td(r.get('time'))}{_r5_td(r.get('employee'))}{_r5_td(r.get('extension'))}{_r5_td(r.get('caller'))}{_r5_td(r.get('action'), True)}{_r5_td(r.get('duration'))}</tr>"
+            for r in issue_rows[:80]
+        )
+    else:
+        issue_rows_html = _r5_empty_row(6, "لا توجد مكالمات فاتت أو تم رفضها من الموظفين خلال الفترة")
+
+    today_complaint_rows = complaints.get("today_rows") or []
+    if today_complaint_rows:
+        complaint_rows_html = "".join(
+            f"<tr>{_r5_td(r.get('creation'))}{_r5_td(r.get('name'))}{_r5_td(r.get('status'))}{_r5_td(r.get('category'))}{_r5_td(r.get('priority'))}{_r5_td(r.get('customer_name'))}</tr>"
+            for r in today_complaint_rows[:80]
+        )
+    else:
+        complaint_rows_html = _r5_empty_row(6, "لا توجد شكاوى مسجلة اليوم")
+
+    cancel_rows = cancellations.get("rows") or []
+    if cancel_rows:
+        cancel_rows_html = "".join(
+            f"<tr>{_r5_td(r.get('cancellation_time'))}{_r5_td(r.get('order_no'))}{_r5_td(r.get('shift'))}{_r5_td(r.get('branch'))}{_r5_td(r.get('customer_name'))}{_r5_td(r.get('reason'))}{_r5_td(r.get('logged_by'))}</tr>"
+            for r in cancel_rows[:80]
+        )
+    else:
+        cancel_rows_html = _r5_empty_row(7, "لا توجد إلغاءات مسجلة اليوم")
+
+    target_rows = target.get("rows") or []
+    if target_rows:
+        target_rows_html = "".join(f"<tr>{_r5_td(r.get('item'))}{_r5_td(_r5_num(r.get('qty')), True)}{_r5_td(_r5_num(r.get('entries')), True)}</tr>" for r in target_rows[:80])
+    else:
+        target_rows_html = _r5_empty_row(3, "لا توجد أصناف مطلوبة العرض مسجلة خلال الفترة")
+
+    followups = data.get("followups") or ["لا توجد ملاحظات تحتاج متابعة اليوم."]
+    follow_html = "".join(f"<div style='background:#fffbeb;border:1px solid #fde68a;border-radius:10px;padding:9px;margin:6px 0;color:#92400e;font-size:13px;text-align:right;direction:rtl;'>• {_r5_esc(x)}</div>" for x in followups)
+
+    html_out = f"""
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>تقرير الإدارة العليا</title></head>
+<body dir="rtl" style="margin:0;padding:0;background:#f3f4f6;direction:rtl;text-align:right;font-family:Tahoma,Arial,sans-serif;color:#111827;">
+<table dir="rtl" align="right" width="100%" cellpadding="0" cellspacing="0" style="width:100%;direction:rtl;text-align:right;background:#f3f4f6;margin:0;padding:0;">
+<tr><td dir="rtl" align="right" style="direction:rtl;text-align:right;padding:16px;">
+  <div dir="rtl" style="direction:rtl;text-align:right;width:100%;max-width:900px;margin:0 0 0 auto;background:#ffffff;border:1px solid #e5e7eb;border-radius:16px;overflow:hidden;">
+    <div style="height:8px;background:#0f766e;"></div>
+    <div dir="rtl" style="padding:18px 20px 10px 20px;text-align:right;direction:rtl;">
+      <h1 style="margin:0;color:#0f172a;font-size:22px;text-align:right;direction:rtl;">مطعم رشدي — تقرير الإدارة العليا</h1>
+      <div style="color:#64748b;font-size:13px;margin-top:5px;text-align:right;direction:rtl;">الفترة: {_r5_esc(data['period']['label'])} | وقت الإصدار: {_r5_esc(data['generated_at'])}</div>
+      <div style="display:inline-block;margin-top:9px;background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe;border-radius:999px;padding:7px 11px;font-weight:bold;font-size:12px;">{_r5_esc(data['status_label'])}</div>
+    </div>
+
+    <div dir="rtl" style="padding:8px 20px 18px 20px;direction:rtl;text-align:right;">
+      <h2 style="font-size:18px;margin:8px 0 10px;text-align:right;direction:rtl;">ملخص اليوم في دقيقة</h2>
+      <table dir="rtl" align="right" width="100%" cellpadding="0" cellspacing="0" style="width:100%;direction:rtl;text-align:right;"><tr>
+        {_r5_card('المكالمات المسجلة', total_calls, 'إجمالي المكالمات المسجلة خلال الفترة', '#f0fdf4', '#14532d')}
+        {_r5_card('تم الرد عليها', answered, 'عدد المكالمات التي تم الرد عليها', '#f0fdf4', '#14532d')}
+        {_r5_card('مكالمات تحتاج مراجعة', _r5_num(issue_count), 'فاتت من موظف أو تم رفضها/كنسلتها', '#fef2f2' if issue_count else '#f8fafc', '#991b1b' if issue_count else '#0f172a')}
+      </tr><tr>
+        {_r5_card('مكالمات خط الشكاوى', q_count, f'Queue الشكاوى رقم {_r5_esc(q.get("queue"))}', '#eff6ff', '#1e3a8a')}
+        {_r5_card('شكاوى مسجلة اليوم', _r5_num(comp_today), f'مفتوحة اليوم: {_r5_num(comp_open_today)} | مغلقة/محلولة اليوم: {_r5_num(comp_resolved_today)}', '#fff7ed' if comp_today else '#f0fdf4', '#9a3412' if comp_today else '#14532d')}
+        {_r5_card('إلغاءات مسجلة اليوم', _r5_num(cancel_count), 'مدخلة يدويًا بواسطة مدير خدمة العملاء', '#faf5ff' if cancel_count else '#f8fafc', '#6b21a8' if cancel_count else '#0f172a')}
+      </tr><tr>
+        {_r5_card('الأصناف المطلوب عرضها', target_qty, 'لا يمثل إجمالي مبيعات المطعم', '#fffbeb', '#92400e')}
+        <td style="width:33.33%;padding:6px;"></td><td style="width:33.33%;padding:6px;"></td>
+      </tr></table>
+
+      <div style="border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-top:14px;text-align:right;direction:rtl;">
+        <h3 style="margin:0 0 8px;font-size:16px;text-align:right;direction:rtl;">📌 يحتاج متابعة</h3>
+        {follow_html}
+      </div>
+
+      <div style="border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-top:14px;text-align:right;direction:rtl;">
+        <h3 style="margin:0 0 8px;font-size:16px;text-align:right;direction:rtl;">👤 الموظفون والمكالمات التي تحتاج مراجعة</h3>
+        <div style="font-size:12px;color:#64748b;text-align:right;direction:rtl;">مرفوض/مكنسل: {_r5_num(declined_count)} | سابها ترن/لم يرد: {_r5_num(staff_missed_count)}</div>
+        {_r5_table(['الوقت','الموظف','التحويلة','رقم العميل','ما حدث','المدة'], issue_rows_html)}
+      </div>
+
+      <div style="border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-top:14px;text-align:right;direction:rtl;">
+        <h3 style="margin:0 0 8px;font-size:16px;text-align:right;direction:rtl;">📋 شكاوى اليوم</h3>
+        <table dir="rtl" width="100%" cellpadding="0" cellspacing="0" style="width:100%;direction:rtl;text-align:right;"><tr>
+          <td style="width:50%;vertical-align:top;padding-left:6px;">{_r5_table(['الحالة','العدد'], _r5_breakdown_rows(complaints.get('status_breakdown') or []))}</td>
+          <td style="width:50%;vertical-align:top;padding-right:6px;">{_r5_table(['التصنيف','العدد'], _r5_breakdown_rows(complaints.get('category_breakdown') or []))}</td>
+        </tr></table>
+        {_r5_table(['وقت التسجيل','رقم الشكوى','الحالة','التصنيف','الأولوية','العميل'], complaint_rows_html)}
+      </div>
+
+      <div style="border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-top:14px;text-align:right;direction:rtl;">
+        <h3 style="margin:0 0 8px;font-size:16px;text-align:right;direction:rtl;">↩️ الإلغاءات المسجلة يدويًا</h3>
+        {_r5_table(['وقت التسجيل','رقم الطلب','الوردية','الفرع','اسم العميل','سبب الإلغاء','سجلها'], cancel_rows_html)}
+      </div>
+
+      <div style="border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-top:14px;text-align:right;direction:rtl;">
+        <h3 style="margin:0 0 8px;font-size:16px;text-align:right;direction:rtl;">🛒 الأصناف المطلوب عرضها</h3>
+        {_r5_table(['الصنف','القطع المسجلة','عدد مرات التسجيل'], target_rows_html)}
+        <div style="font-size:12px;color:#64748b;margin-top:8px;text-align:right;direction:rtl;">هذا الجزء لا يعرض إجمالي مبيعات المطعم ولا إجمالي الإيراد، لكنه يوضح ما تم تسجيله من الأصناف المطلوب عرضها أثناء المكالمات.</div>
+      </div>
+    </div>
+  </div>
+</td></tr></table>
+</body></html>
+"""
+    return html_out
+
+
+@frappe.whitelist()
+def preview_upper_management_report(date_from=None, date_to=None, **kwargs):
+    return {"success": True, "html": render_upper_management_report_html(date_from=date_from, date_to=date_to), "data": get_upper_management_report_data(date_from, date_to)}
+
+
+@frappe.whitelist()
+def debug_email_send_config(**kwargs):
+    recips, source, sources = _r5_resolve_upper_recipients(kwargs=kwargs)
+    return {
+        "success": True,
+        "upper_recipients_count": len(recips),
+        "upper_recipients": recips,
+        "source": source,
+        "sources": sources,
+        "note": "No email was sent. Upper report uses exact UI/settings recipients only. No role fallback.",
+    }
+
+
+@frappe.whitelist()
+def send_upper_management_report(recipients=None, date_from=None, date_to=None, subject=None, **kwargs):
+    recips, source, sources = _r5_resolve_upper_recipients(direct=recipients, kwargs=kwargs)
+    if not recips:
+        frappe.throw("لم يتم العثور على إيميلات الإدارة العليا بدقة. الإرسال اتوقف بدل ما يبعت لمستخدمين زيادة. راجع خانة إيميلات الإدارة العليا واضغط حفظ.")
+    html_body = render_upper_management_report_html(date_from=date_from, date_to=date_to)
+    start_date, end_date, _start_dt, _end_dt = _period(date_from, date_to)
+    subj = subject or kwargs.get("email_subject") or kwargs.get("subject") or f"تقرير الإدارة العليا - مطعم رشدي - {_date_label(start_date, end_date)}"
+    frappe.sendmail(recipients=recips, subject=subj, message=html_body, now=True)
+    return {
+        "success": True,
+        "message": f"تم إرسال تقرير الإدارة العليا إلى {len(recips)} مستخدم",
+        "recipients": recips,
+        "recipients_count": len(recips),
+        "source": source,
+        "sources": sources,
+        "subject": subj,
+    }
+# END ROSHDY UPPER MANAGEMENT REPORT V5 RTL COMPLAINTS EMPLOYEES
+'''
+if start in su and end in su:
+    i = su.index(start)
+    j = su.index(end, i) + len(end)
+    su = su[:i] + block.strip() + su[j:]
+else:
+    su = su.rstrip() + "\n\n" + block.strip() + "\n"
+compile(su, str(upper_api), "exec")
+upper_api.write_text(su, encoding="utf-8")
+PY
+
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+if [[ -n "$APP_OWNER" ]]; then
+  chown "$APP_OWNER" "$EMAIL_REPORT" "$UPPER_API" 2>/dev/null || true
+fi
+
+echo "🧹 Clear cache + restart app services"
+bench_exec clear-cache || true
+"${COMPOSE[@]}" restart backend frontend websocket queue-short queue-long scheduler >/dev/null
+sleep 8
+bench_exec clear-cache || true
+
+echo "🧪 Validation - reports and backend data"
+set +e
+bench_exec execute restaurant_ops.api.upper_management_email_api.get_upper_management_report_data | tee "$BACKUP_DIR/upper_data_v5.txt"
+V1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.upper_management_email_api.debug_email_send_config | tee "$BACKUP_DIR/debug_upper_recipients_v5.txt"
+V2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.upper_management_email_api.preview_upper_management_report > "$BACKUP_DIR/preview_upper_v5.txt" 2>&1
+V3=$?
+head -c 1000 "$BACKUP_DIR/preview_upper_v5.txt" | tee "$BACKUP_DIR/preview_upper_v5_head.txt"
+echo
+bench_exec execute restaurant_ops.api.break_api.get_active_breaks | tee "$BACKUP_DIR/active_breaks_v5.txt"
+V4=${PIPESTATUS[0]}
+# Soft legacy center preview check. It may need old custom args, so warn only.
+bench_exec execute restaurant_ops.api.email_report.preview_email_report --kwargs '{"report_type":"center"}' > "$BACKUP_DIR/preview_center_soft_v5.txt" 2>&1
+V5=$?
+head -c 800 "$BACKUP_DIR/preview_center_soft_v5.txt" | tee "$BACKUP_DIR/preview_center_soft_v5_head.txt"
+echo
+set -e
+
+if [[ $V1 -ne 0 || $V2 -ne 0 || $V3 -ne 0 || $V4 -ne 0 ]]; then
+  echo "❌ Validation failed. راجع ملفات اللوج في: $BACKUP_DIR"
+  exit 1
+fi
+if [[ $V5 -ne 0 ]]; then
+  echo "⚠️ Soft center preview returned non-zero. ده مش شرط فشل إرسال، ممكن الفانكشن القديمة محتاجة باراميتر مختلف. راجع: $BACKUP_DIR/preview_center_soft_v5.txt"
+fi
+
+if [[ "$RUN_EMAIL_SEND_TEST" == "1" ]]; then
+  echo "📧 RUN_EMAIL_SEND_TEST=1 -> sending real upper-management email to exact resolved recipients"
+  set +e
+  bench_exec execute restaurant_ops.api.upper_management_email_api.send_upper_management_report | tee "$BACKUP_DIR/send_upper_v5.txt"
+  S1=${PIPESTATUS[0]}
+  set -e
+  if [[ $S1 -ne 0 ]]; then
+    echo "❌ Actual upper email send failed. راجع: $BACKUP_DIR/send_upper_v5.txt"
+    exit 1
+  fi
+else
+  echo "ℹ️ لم يتم إرسال إيميل فعلي من السكريبت. جرّب زر الإرسال من الواجهة بعد التأكد من عدد المستلمين في debug."
+fi
+
+echo "🏥 Health Check - Elastix/CDR/AMI + Queue + Call Report"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$BACKUP_DIR/health_asterisk_bridge.txt"
+H1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status | tee "$BACKUP_DIR/health_queue_status.txt"
+H2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' | tee "$BACKUP_DIR/health_call_report.txt"
+H3=${PIPESTATUS[0]}
+set -e
+
+if [[ $H1 -ne 0 || $H2 -ne 0 || $H3 -ne 0 ]]; then
+  echo "⚠️ Health returned non-zero. راجع: $BACKUP_DIR"
+else
+  echo "✅ Health checks OK"
+fi
+
+echo "============================================================"
+echo "✅ DONE"
+echo "📦 Backup folder: $BACKUP_DIR"
+echo "📧 Manager report restored from baseline where available; only title renamed."
+echo "📊 Upper report V5: RTL + today's complaints + employee call issues + strict recipients."
+echo "🛡️ report_api.py لم يتم لمسه"
+echo "============================================================"

@@ -1,0 +1,534 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Rebuild /admin-desk with the SAME route/name, clean from scratch.
+# Also rebuild /break-admin with active-break admin controls.
+# Keeps other pages/features intact.
+# Does NOT touch report_api.py / Elastix / CDR / AMI config.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "❌ docker compose/docker-compose مش موجود"
+  exit 1
+fi
+
+APP_DIR="$ROOT/apps/$APP"
+PKG_DIR="$APP_DIR/$APP"
+WWW_DIR="$PKG_DIR/www"
+API_DIR="$PKG_DIR/api"
+ADMIN_HTML="$WWW_DIR/admin-desk.html"
+BREAK_ADMIN_HTML="$WWW_DIR/break-admin.html"
+BREAK_API="$API_DIR/break_api.py"
+UPPER_API="$API_DIR/upper_management_email_api.py"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/REBUILD_ADMIN_DESK_V9_BEFORE_$TS"
+mkdir -p "$BACKUP_DIR"
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend container مش شغال أو مش لاقيه"
+  exit 1
+fi
+
+bench_exec() {
+  "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"
+}
+
+echo "============================================================"
+echo "🏗️ Rebuild Admin Desk V9 same-name"
+echo "📦 Backup: $BACKUP_DIR"
+echo "============================================================"
+
+echo "🧯 Backup files + bench backup"
+for f in "$ADMIN_HTML" "$BREAK_ADMIN_HTML" "$BREAK_API" "$UPPER_API"; do
+  [[ -f "$f" ]] && cp -a "$f" "$BACKUP_DIR/$(basename "$f").before"
+done
+bench_exec backup --with-files | tee "$BACKUP_DIR/bench_backup_output.txt"
+
+echo "🧩 Patch backend endpoints: active breaks + cancellations"
+export BREAK_API UPPER_API
+python3 - <<'PY'
+# -*- coding: utf-8 -*-
+from pathlib import Path
+import os
+
+break_api = Path(os.environ["BREAK_API"])
+upper_api = Path(os.environ["UPPER_API"])
+
+if break_api.exists():
+    s = break_api.read_text(encoding="utf-8", errors="ignore")
+    start = "# BEGIN ROSHDY BREAK API V9 FINAL SERVER TRUTH"
+    end = "# END ROSHDY BREAK API V9 FINAL SERVER TRUTH"
+    patch = r'''
+# BEGIN ROSHDY BREAK API V9 FINAL SERVER TRUTH
+# Final direct break endpoints for Admin Desk / Break Admin.
+# Server is the source of truth for active status and duration.
+try:
+    import frappe
+    from frappe.utils import now_datetime, get_datetime, flt, cstr
+except Exception:
+    frappe = None
+
+
+def _v9_break_admin_allowed():
+    try:
+        if frappe.session.user == "Administrator":
+            return True
+        roles = set(frappe.get_roles(frappe.session.user))
+        return bool(roles.intersection({"System Manager", "Call Center Admin", "Restaurant Manager", "Break Admin"}))
+    except Exception:
+        return False
+
+
+def _v9_employee_name(emp):
+    if not emp:
+        return "غير محدد"
+    try:
+        return frappe.db.get_value("Employee", emp, "employee_name") or emp
+    except Exception:
+        return emp
+
+
+def _v9_break_limit_minutes(break_type=None):
+    default = 30.0
+    try:
+        conf = getattr(frappe.local, "conf", {}) or {}
+        if conf.get("break_overdue_minutes"):
+            return flt(conf.get("break_overdue_minutes")) or default
+    except Exception:
+        pass
+    if break_type:
+        try:
+            if frappe.db.exists("DocType", "Break Type") and frappe.db.exists("Break Type", break_type):
+                doc = frappe.get_doc("Break Type", break_type)
+                for fn in ("max_duration_minutes", "allowed_minutes", "duration_minutes", "break_minutes", "max_minutes", "time_limit_minutes", "duration", "minutes", "limit_minutes"):
+                    if hasattr(doc, fn) and flt(getattr(doc, fn) or 0) > 0:
+                        return flt(getattr(doc, fn))
+        except Exception:
+            pass
+    return default
+
+
+def _v9_duration_minutes(start_time, end_time=None):
+    if not start_time:
+        return 0.0
+    try:
+        st = get_datetime(start_time)
+        en = get_datetime(end_time) if end_time else now_datetime()
+        return round(max((en - st).total_seconds(), 0) / 60.0, 1)
+    except Exception:
+        return 0.0
+
+
+@frappe.whitelist()
+def get_active_breaks():
+    if not _v9_break_admin_allowed():
+        frappe.throw("غير مسموح")
+    dt = "Employee Break Log"
+    if not frappe.db.exists("DocType", dt):
+        return {"success": False, "active_count": 0, "overdue_count": 0, "rows": [], "error": "Employee Break Log not found"}
+    rows = frappe.db.sql("""
+        select name, employee, break_type, break_date, status, start_time, end_time,
+               duration_seconds, duration_minutes, extension_at_start, notes, creation, owner,
+               closed_by, closure_type
+        from `tabEmployee Break Log`
+        where ifnull(docstatus,0) < 2
+          and (
+                lower(ifnull(status,'')) in ('active','نشط')
+                or (
+                    (end_time is null or end_time='')
+                    and lower(ifnull(status,'')) not in ('finished','closed','ended','cancelled','canceled','completed','منتهي','مغلق','ملغي')
+                )
+          )
+        order by coalesce(start_time, creation) asc
+        limit 500
+    """, as_dict=True)
+    server_now = now_datetime()
+    out = []
+    overdue_count = 0
+    for r in rows:
+        dur = _v9_duration_minutes(r.get("start_time"))
+        limit = _v9_break_limit_minutes(r.get("break_type"))
+        overdue = dur >= limit
+        if overdue:
+            overdue_count += 1
+        out.append({
+            "name": r.get("name"),
+            "employee": r.get("employee"),
+            "employee_name": _v9_employee_name(r.get("employee")),
+            "break_type": r.get("break_type") or "غير محدد",
+            "start_time": cstr(r.get("start_time") or ""),
+            "duration_minutes": dur,
+            "limit_minutes": limit,
+            "overdue": overdue,
+            "overdue_minutes": round(max(dur - limit, 0), 1),
+            "extension": r.get("extension_at_start") or "",
+            "notes": r.get("notes") or "",
+        })
+    return {"success": True, "server_now": server_now.strftime("%Y-%m-%d %H:%M:%S"), "active_count": len(out), "overdue_count": overdue_count, "rows": out}
+
+
+@frappe.whitelist()
+def admin_end_break(break_log=None, note=None):
+    if not _v9_break_admin_allowed():
+        frappe.throw("غير مسموح: إنهاء البريك من الإدارة فقط")
+    if not break_log:
+        frappe.throw("break_log مطلوب")
+    dt = "Employee Break Log"
+    if not frappe.db.exists(dt, break_log):
+        frappe.throw("سجل البريك غير موجود")
+    doc = frappe.get_doc(dt, break_log)
+    now = now_datetime()
+    dur_seconds = 0
+    if doc.get("start_time"):
+        dur_seconds = int(max((now - get_datetime(doc.get("start_time"))).total_seconds(), 0))
+    dur_minutes = round(dur_seconds / 60.0, 2)
+    admin_user = frappe.session.user
+    admin_label = frappe.db.get_value("User", admin_user, "full_name") or admin_user
+    old_notes = cstr(doc.get("notes") or "")
+    append_note = f"\n[Admin Close] تم إنهاء البريك بواسطة {admin_label} في {now.strftime('%Y-%m-%d %H:%M:%S')}"
+    if note:
+        append_note += f" - ملاحظة: {note}"
+    updates = {
+        "status": "finished",
+        "end_time": now,
+        "duration_seconds": dur_seconds,
+        "duration_minutes": dur_minutes,
+        "closed_by": admin_user,
+        "closure_type": "admin",
+        "notes": (old_notes + append_note).strip(),
+    }
+    try:
+        meta = frappe.get_meta(dt)
+        if meta.has_field("admin_close_acknowledged"):
+            updates["admin_close_acknowledged"] = 0
+        if meta.has_field("admin_close_message"):
+            updates["admin_close_message"] = f"تم إنهاء البريك بواسطة {admin_label}"
+    except Exception:
+        pass
+    frappe.db.set_value(dt, break_log, updates, update_modified=True)
+    frappe.db.commit()
+    try:
+        from restaurant_ops.api.break_notifications import notify_employee_break_closed, publish_active_breaks_changed
+        notify_employee_break_closed(break_log, doc.get("employee"), admin_label)
+        publish_active_breaks_changed()
+    except Exception:
+        pass
+    return {"success": True, "message": "تم إنهاء البريك", "break_log": break_log, "closed_by": admin_label, "duration_minutes": dur_minutes}
+# END ROSHDY BREAK API V9 FINAL SERVER TRUTH
+'''
+    if start in s and end in s:
+        i = s.index(start); j = s.index(end, i) + len(end); s = s[:i] + patch.strip() + s[j:]
+    else:
+        s = s.rstrip() + "\n\n" + patch.strip() + "\n"
+    compile(s, str(break_api), "exec")
+    break_api.write_text(s, encoding="utf-8")
+
+if upper_api.exists():
+    s = upper_api.read_text(encoding="utf-8", errors="ignore")
+    start = "# BEGIN ROSHDY CANCELLATION API V9 FINAL"
+    end = "# END ROSHDY CANCELLATION API V9 FINAL"
+    patch = r'''
+# BEGIN ROSHDY CANCELLATION API V9 FINAL
+# Manual order cancellations for Admin Desk and Upper Management Report.
+try:
+    import frappe
+    from frappe.utils import now_datetime, get_datetime, getdate, cstr, cint
+except Exception:
+    pass
+
+
+def _v9_can_manage_cancellations():
+    try:
+        if frappe.session.user == "Administrator":
+            return True
+        roles = set(frappe.get_roles(frappe.session.user))
+        return bool(roles.intersection({"System Manager", "Call Center Admin", "Restaurant Manager"}))
+    except Exception:
+        return False
+
+
+@frappe.whitelist()
+def create_order_cancellation(order_no=None, shift=None, branch=None, customer_name=None, customer_phone=None, reason=None, notes=None, cancellation_time=None, **kwargs):
+    ensure_order_cancellation_doctype()
+    if not _v9_can_manage_cancellations():
+        frappe.throw("غير مسموح: تسجيل الإلغاءات متاح لمدير خدمة العملاء أو مدير النظام فقط")
+    order_no = cstr(order_no or kwargs.get("order") or kwargs.get("order_id") or kwargs.get("order_number") or "").strip()
+    shift = cstr(shift or kwargs.get("shift_name") or "غير محدد").strip()
+    branch = cstr(branch or kwargs.get("store") or kwargs.get("branch_name") or "").strip()
+    customer_name = cstr(customer_name or kwargs.get("customer") or kwargs.get("client_name") or "").strip()
+    customer_phone = cstr(customer_phone or kwargs.get("phone") or kwargs.get("mobile") or "").strip()
+    reason = cstr(reason or kwargs.get("cancel_reason") or kwargs.get("cancellation_reason") or "").strip()
+    notes = cstr(notes or kwargs.get("note") or kwargs.get("remarks") or "").strip()
+    if not order_no:
+        frappe.throw("رقم الطلب مطلوب")
+    if not branch:
+        frappe.throw("الفرع مطلوب")
+    if not reason:
+        frappe.throw("سبب الإلغاء مطلوب")
+    ct = get_datetime(cancellation_time) if cancellation_time else now_datetime()
+    doc = frappe.get_doc({
+        "doctype": CANCELLATION_DOCTYPE,
+        "order_no": order_no,
+        "cancellation_time": ct,
+        "report_date": getdate(ct),
+        "shift": shift or "غير محدد",
+        "branch": branch,
+        "customer_name": customer_name,
+        "customer_phone": customer_phone,
+        "reason": reason,
+        "notes": notes,
+        "logged_by": frappe.session.user,
+        "source": "manual",
+    })
+    doc.insert(ignore_permissions=True)
+    frappe.db.commit()
+    return {"success": True, "name": doc.name, "message": "تم تسجيل الإلغاء بنجاح"}
+
+
+@frappe.whitelist()
+def list_order_cancellations(date_from=None, date_to=None, limit=200, **kwargs):
+    ensure_order_cancellation_doctype()
+    start_date, end_date, start_dt, end_dt = _period(date_from, date_to)
+    rows = frappe.get_all(
+        CANCELLATION_DOCTYPE,
+        filters={"cancellation_time": ["between", [_iso(start_dt), _iso(end_dt)]]},
+        fields=["name", "order_no", "cancellation_time", "shift", "branch", "customer_name", "customer_phone", "reason", "notes", "logged_by", "creation"],
+        order_by="cancellation_time desc, creation desc",
+        limit_page_length=cint(limit) or 200,
+    )
+    return {"success": True, "count": len(rows), "rows": rows}
+# END ROSHDY CANCELLATION API V9 FINAL
+'''
+    if start in s and end in s:
+        i = s.index(start); j = s.index(end, i) + len(end); s = s[:i] + patch.strip() + s[j:]
+    else:
+        s = s.rstrip() + "\n\n" + patch.strip() + "\n"
+    compile(s, str(upper_api), "exec")
+    upper_api.write_text(s, encoding="utf-8")
+PY
+
+echo "🏗️ Write clean admin-desk.html from scratch"
+cat > "$ADMIN_HTML" <<'HTML'
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>لوحة إدارة الكول سنتر | مطعم رشدي</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;font-family:'Segoe UI',Tahoma,Arial,sans-serif}
+:root{--blue:#1F4E79;--dark:#24292e;--side:#2b3137;--bg:#f4f7f6;--border:#e1e4e8;--green:#16a34a;--red:#dc3545;--orange:#fd7e14;--purple:#6f42c1}
+body{background:var(--bg);color:#222;min-height:100vh;direction:rtl;overflow-x:hidden}.app-header{height:64px;background:var(--dark);color:#fff;padding:0 22px;display:flex;justify-content:space-between;align-items:center;border-bottom:3.5px solid var(--blue);box-shadow:0 2px 8px rgba(0,0,0,.16);position:sticky;top:0;z-index:50}.logo{font-size:20px;font-weight:900;display:flex;align-items:center;gap:10px}.user-info{display:flex;align-items:center;gap:12px;font-size:14px}.badge-admin{background:#d29922;color:white;padding:5px 12px;border-radius:20px;font-size:13px;font-weight:900}.btn-logout,.head-btn{background:transparent;border:1.5px solid rgba(255,255,255,.62);color:white;padding:7px 12px;border-radius:8px;cursor:pointer;font-size:13px;font-weight:900}.head-btn{background:#111827;border-color:#394150}.admin-layout{display:grid;grid-template-columns:240px 1fr;min-height:calc(100vh - 64px);transition:.22s}.admin-layout.side-collapsed{grid-template-columns:62px 1fr}.admin-sidebar{background:var(--side);color:white;padding:18px 13px;min-height:calc(100vh - 64px);transition:.22s;overflow:hidden}.admin-layout.side-collapsed .admin-sidebar a span,.admin-layout.side-collapsed .admin-sidebar h5{display:none}.admin-layout.side-collapsed .admin-sidebar a{text-align:center;padding:13px 6px;font-size:0}.admin-layout.side-collapsed .admin-sidebar a b{font-size:18px}.admin-sidebar h5{color:#8b949e;font-size:12px;text-transform:uppercase;margin:18px 0 10px;letter-spacing:.5px}.admin-sidebar a{display:block;padding:12px 14px;color:#c9d1d9;text-decoration:none;border-radius:8px;font-size:14px;margin-bottom:5px;transition:.16s;white-space:nowrap}.admin-sidebar a:hover{background:rgba(255,255,255,.1);color:white}.admin-sidebar a.active{background:var(--blue);color:white;font-weight:900}.main-content{padding:28px;min-width:0}.page-title{font-size:25px;font-weight:900;color:var(--blue);margin-bottom:22px;text-align:center}.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:18px;margin-bottom:28px}.stat-card{background:white;border-radius:13px;padding:20px 17px;box-shadow:0 4px 13px rgba(0,0,0,.055);border-right:5px solid;text-align:right;min-height:108px}.stat-card.blue{border-color:var(--blue)}.stat-card.green{border-color:var(--green)}.stat-card.red{border-color:var(--red)}.stat-card.orange{border-color:var(--orange)}.stat-card.purple{border-color:var(--purple)}.stat-card .label{color:#666;font-size:14px;margin-bottom:8px;font-weight:700}.stat-card .value{font-size:31px;font-weight:900;color:var(--blue)}.cards-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(215px,1fr));gap:20px}.mod-card{background:white;border:2px solid var(--border);border-radius:14px;padding:28px 14px;text-align:center;cursor:pointer;transition:.22s;text-decoration:none;color:inherit;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:146px}.mod-card:hover{transform:translateY(-4px);box-shadow:0 12px 28px rgba(31,78,121,.15);border-color:var(--blue)}.mod-card .icon{font-size:43px;margin-bottom:12px}.mod-card .lbl{font-weight:900;font-size:16px;color:#222}.mod-card .desc{font-size:12px;color:#777;margin-top:6px}.mod-card.warn{border-color:#fde68a}.mod-card.green{border-color:#bbf7d0}.mod-card .mini-badge{position:absolute;background:#0f4c81;color:#fff;border-radius:999px;min-width:24px;height:24px;display:inline-flex;align-items:center;justify-content:center;font-size:12px;font-weight:900;margin-top:-116px;margin-right:145px}#global-queue-widget{position:fixed;left:22px;bottom:22px;z-index:90;background:#14532d;color:#fff;border:2px solid rgba(255,255,255,.92);border-radius:16px;box-shadow:0 12px 34px rgba(0,0,0,.35);padding:13px 15px;min-width:255px;direction:rtl;display:flex;align-items:center;gap:12px;transition:.2s}#global-queue-widget .gq-ico{font-size:31px}#global-queue-widget .gq-title{font-size:14px;font-weight:900;margin-bottom:3px}#global-queue-widget .gq-line{font-size:13px;opacity:.96}#global-queue-widget b{font-family:Consolas,monospace;background:rgba(255,255,255,.16);padding:1px 7px;border-radius:7px;margin:0 2px}#global-queue-widget.alert{background:#c0392b}@keyframes gqShake{0%{transform:translate(1px,1px) rotate(0)}20%{transform:translate(-2px,0) rotate(1deg)}40%{transform:translate(1px,-1px) rotate(1deg)}60%{transform:translate(-2px,1px) rotate(0)}80%{transform:translate(-1px,-1px) rotate(1deg)}100%{transform:translate(1px,-2px) rotate(-1deg)}}#global-queue-widget.shake{animation:gqShake .62s infinite}.bell-wrap{position:relative}.bell-btn{background:#111827;color:white;border:2px solid #fd7e14;border-radius:999px;padding:9px 13px;box-shadow:0 8px 22px rgba(0,0,0,.25);cursor:pointer;font-weight:900}.bell-btn .count{background:#dc3545;border-radius:999px;padding:2px 7px;margin-inline-start:6px}.bell-menu{display:none;position:absolute;top:48px;left:0;width:390px;max-width:calc(100vw - 28px);background:#fff;color:#111827;border:1px solid #dbe2ea;border-radius:16px;box-shadow:0 18px 55px rgba(15,23,42,.25);overflow:hidden;text-align:right;z-index:200}.bell-menu.open{display:block}.bell-head{background:#111827;color:white;padding:12px 14px;font-weight:900;display:flex;justify-content:space-between}.bell-body{max-height:420px;overflow:auto;padding:10px}.note-item{border:1px solid #e5e7eb;border-radius:12px;padding:10px;margin-bottom:8px;background:#f8fafc}.note-item.overdue{background:#fef2f2;border-color:#fecaca}.small{font-size:12px;color:#64748b}.btn{border:0;border-radius:9px;padding:8px 11px;cursor:pointer;font-weight:900}.btn.red{background:#dc2626;color:#fff}.btn.green{background:#16a34a;color:#fff}.btn.blue{background:#0f4c81;color:#fff}.btn.gray{background:#e5e7eb;color:#111827}.modal-back{position:fixed;inset:0;background:rgba(15,23,42,.62);z-index:250;display:none;align-items:center;justify-content:center;padding:16px}.modal{width:760px;max-width:100%;max-height:90vh;background:#fff;border-radius:18px;overflow:hidden;box-shadow:0 35px 90px rgba(0,0,0,.35);direction:rtl;text-align:right}.modal h3{margin:0;background:#111827;color:#fff;padding:14px 16px}.form{padding:14px;display:grid;grid-template-columns:1fr 1fr;gap:10px}.field{display:flex;flex-direction:column;gap:5px}.field.full{grid-column:1/-1}.field label{font-size:12px;color:#334155;font-weight:900}.field input,.field select,.field textarea{border:1px solid #cbd5e1;border-radius:10px;padding:10px}.actions{display:flex;gap:8px;padding:12px 14px;border-top:1px solid #e5e7eb}.table-wrap{overflow:auto;padding:14px}.data-table{width:100%;min-width:760px;border-collapse:collapse;font-size:13px}.data-table th{background:#111827;color:#fff;padding:9px;border:1px solid #e5e7eb;text-align:right}.data-table td{padding:8px;border:1px solid #e5e7eb;text-align:right}.overdue-row{background:#fef2f2}.toast{position:fixed;right:18px;bottom:18px;z-index:300;background:#111827;color:#fff;border-radius:12px;padding:12px 14px;display:none;max-width:390px;box-shadow:0 12px 35px rgba(0,0,0,.25);direction:rtl;text-align:right}@media(max-width:900px){.app-header{height:auto;min-height:64px;gap:10px;flex-wrap:wrap}.admin-layout{grid-template-columns:1fr}.admin-sidebar{position:fixed;right:0;top:64px;width:245px;z-index:120;transform:translateX(0);box-shadow:-10px 0 24px rgba(0,0,0,.18)}.admin-layout.side-collapsed .admin-sidebar{transform:translateX(105%)}.main-content{padding:18px}.cards-grid{grid-template-columns:repeat(auto-fit,minmax(165px,1fr))}.form{grid-template-columns:1fr}.bell-menu{left:-8px;top:46px}#global-queue-widget{left:10px;right:10px;bottom:12px;min-width:0}}
+</style>
+</head>
+<body>
+<header class="app-header">
+  <div class="logo"><button class="head-btn" id="sideToggle">☰</button><span>🍔</span> مطعم رشدي — لوحة إدارة الكول سنتر</div>
+  <div class="user-info">
+    <div class="bell-wrap">
+      <button class="bell-btn" id="bellBtn">🔔 <span class="count" id="bellCount">0</span></button>
+      <div class="bell-menu" id="bellMenu"><div class="bell-head"><span>إشعارات الإدارة</span><button class="btn gray" onclick="closeBell()">×</button></div><div class="bell-body" id="bellBody">جاري التحميل...</div></div>
+    </div>
+    <span id="ad-name">جاري التحميل...</span>
+    <span class="badge-admin">👑 Call Center Admin</span>
+    <button class="btn-logout" onclick="doLogout()">خروج</button>
+  </div>
+</header>
+
+<div class="admin-layout" id="layout">
+  <aside class="admin-sidebar">
+    <h5>الأنظمة اليومية</h5>
+    <a href="/admin-desk" class="active"><b>🏠</b> <span>لوحة التحكم</span></a>
+    <a href="/app/call-center-complaint"><b>📋</b> <span>كل الشكاوى</span></a>
+    <a href="/break-admin"><b>⏱️</b> <span>تقرير البريكات</span></a>
+    <a href="/call-report"><b>📞</b> <span>تقرير المكالمات</span></a>
+    <a href="/user-management"><b>👥</b> <span>إدارة الموظفين</span></a>
+    <a href="/sales-report"><b>💰</b> <span>تقرير المبيعات</span></a>
+    <a href="javascript:void(0)" onclick="openCancelReport()"><b>↩️</b> <span>تقرير الإلغاءات</span></a>
+    <h5>إعدادات النظام</h5>
+    <a href="/settings"><b>⚙️</b> <span>إعدادات الشيفت والإيميل</span></a>
+    <a href="/agent-notices"><b>📢</b> <span>تنبيهات الإيجنت</span></a>
+    <a href="/app"><b>🔧</b> <span>لوحة ERPNext الشاملة</span></a>
+  </aside>
+
+  <main class="main-content">
+    <div class="page-title" id="ad-welcome">🏠 نظرة عامة على أداء اليوم — أهلاً جاري التحميل... 👋</div>
+    <section class="stats-grid">
+      <div class="stat-card blue"><div class="label">بريكات نشطة الآن</div><div class="value" id="s-active-brk">0</div></div>
+      <div class="stat-card green"><div class="label">مكالمات في الانتظار</div><div class="value" id="s-waiting">0</div></div>
+      <div class="stat-card red"><div class="label">شكاوى مفتوحة</div><div class="value" id="s-comp-open">0</div></div>
+      <div class="stat-card orange"><div class="label">شكاوى محلولة اليوم</div><div class="value" id="s-comp-today">0</div></div>
+      <div class="stat-card purple"><div class="label">مكالمات اليوم</div><div class="value" id="s-calls">0</div></div>
+      <div class="stat-card blue"><div class="label">إلغاءات مسجلة اليوم</div><div class="value" id="s-cancels">0</div></div>
+    </section>
+
+    <section class="cards-grid">
+      <a href="/app/call-center-complaint/new?call_center_complaint=new-1" class="mod-card"><div class="icon">➕</div><div class="lbl">شكوى جديدة</div><div class="desc">إضافة شكوى فوراً</div></a>
+      <a href="/app/call-center-complaint" class="mod-card"><div class="icon">📋</div><div class="lbl">كل الشكاوى</div><div class="desc">إدارة ومتابعة الحالات</div></a>
+      <a href="/call-report" class="mod-card"><div class="icon">📞</div><div class="lbl">تقرير المكالمات</div><div class="desc">عرض وتحليل وتشغيل الصوت</div></a>
+      <a href="/break-admin" class="mod-card warn"><div class="icon">⏱️</div><div class="lbl">تقرير البريكات</div><div class="desc">البريكات النشطة والإنهاء عن بعد</div></a>
+      <a href="/user-management" class="mod-card"><div class="icon">👥</div><div class="lbl">إدارة اليوزرات</div><div class="desc">إضافة وتعديل وصلاحيات</div></a>
+      <a href="/agent-notices" class="mod-card"><div class="icon">📢</div><div class="lbl">تنبيهات الإيجنت</div><div class="desc">Lost items وتعليمات</div></a>
+      <a href="javascript:void(0)" onclick="openCancelForm()" class="mod-card green"><div class="icon">↩️</div><div class="lbl">تسجيل إلغاء طلب</div><div class="desc">إضافة إلغاء يدوي للتقرير</div></a>
+      <a href="javascript:void(0)" onclick="openCancelReport()" class="mod-card"><div class="icon">📄</div><div class="lbl">تقرير الإلغاءات</div><div class="desc">إلغاءات اليوم المسجلة يدوياً</div><span class="mini-badge" id="cancelBadge">0</span></a>
+      <a href="/hr-ops" class="mod-card"><div class="icon">🧾</div><div class="lbl">HR Ops</div><div class="desc">أذونات وتحميلات ومرتبات</div></a>
+      <a href="/sales-report" class="mod-card"><div class="icon">💰</div><div class="lbl">تقرير المبيعات</div><div class="desc">أداء المبيعات لكل موظف</div></a>
+      <a href="/settings" class="mod-card"><div class="icon">⚙️</div><div class="lbl">الإعدادات</div><div class="desc">إعدادات الشيفت والإيميل</div></a>
+      <a href="/app" class="mod-card"><div class="icon">🔧</div><div class="lbl">ERPNext كامل</div><div class="desc">الوصول للنظام الشامل</div></a>
+    </section>
+  </main>
+</div>
+
+<div id="global-queue-widget"><div class="gq-ico">📞</div><div><div class="gq-title">عداد انتظار المكالمات Live</div><div class="gq-line">أوردرات: <b id="gq-orders">0</b> | شكاوى: <b id="gq-complaints">0</b> | الإجمالي: <b id="gq-total">0</b></div></div></div>
+
+<div class="modal-back" id="modalBack"><div class="modal"><h3 id="modalTitle">Modal</h3><div id="modalContent"></div></div></div>
+<div class="toast" id="toast"></div>
+
+<script>
+function qs(o){var p=new URLSearchParams();Object.keys(o||{}).forEach(function(k){var v=o[k];if(v!==undefined&&v!==null&&v!=="")p.append(k,v)});return p.toString()}
+async function api(method,args){try{var q=qs(args||{});var r=await fetch('/api/method/'+method+(q?'?'+q:''),{method:'GET',credentials:'same-origin',cache:'no-store',headers:{'Accept':'application/json'}});var j=await r.json();if(j.exc)throw j;return j.message||j}catch(e){console.error(method,e);return null}}
+function esc(s){return String(s||'').replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
+function toast(msg){var t=document.getElementById('toast');t.textContent=msg;t.style.display='block';setTimeout(function(){t.style.display='none'},4200)}
+function closeModal(){document.getElementById('modalBack').style.display='none'}
+function showModal(title,html){document.getElementById('modalTitle').textContent=title;document.getElementById('modalContent').innerHTML=html;document.getElementById('modalBack').style.display='flex'}
+function closeBell(){document.getElementById('bellMenu').classList.remove('open')}
+async function doLogout(){try{await fetch('/api/method/logout',{method:'GET',credentials:'same-origin',cache:'no-store'})}catch(e){}window.location.href='/login'}
+
+document.getElementById('sideToggle').onclick=function(){document.getElementById('layout').classList.toggle('side-collapsed')};
+document.getElementById('bellBtn').onclick=function(e){e.stopPropagation();document.getElementById('bellMenu').classList.toggle('open');refreshNotifications()};
+document.addEventListener('click',function(e){var b=document.getElementById('bellMenu');if(b.classList.contains('open')&&!b.contains(e.target)&&e.target.id!=='bellBtn')closeBell()});
+document.getElementById('modalBack').addEventListener('click',function(e){if(e.target.id==='modalBack')closeModal()});
+
+async function refreshStats(){
+  var d=await api('restaurant_ops.api.admin_api.get_admin_dashboard_stats');
+  if(d&&d.employee_name){document.getElementById('ad-name').textContent=d.employee_name;document.getElementById('ad-welcome').textContent='🏠 نظرة عامة على أداء اليوم — أهلاً '+d.employee_name+' 👋'}
+  if(d){document.getElementById('s-comp-open').textContent=d.open_complaints||0;document.getElementById('s-comp-today').textContent=d.today_complaints||0;document.getElementById('s-calls').textContent=d.today_calls||0}
+}
+async function refreshQueue(){var d=await api('restaurant_ops.api.queue_api.get_queue_status')||{orders:0,complaints:0,total:0};document.getElementById('gq-orders').textContent=d.orders||0;document.getElementById('gq-complaints').textContent=d.complaints||0;document.getElementById('gq-total').textContent=d.total||0;document.getElementById('s-waiting').textContent=d.total||0;var w=document.getElementById('global-queue-widget');if((d.total||0)>0)w.classList.add('alert','shake');else w.classList.remove('alert','shake')}
+async function getActiveBreaks(){return await api('restaurant_ops.api.break_api.get_active_breaks')||{active_count:0,overdue_count:0,rows:[]}}
+async function refreshBreakCount(){var d=await getActiveBreaks();document.getElementById('s-active-brk').textContent=d.active_count||0;document.getElementById('bellCount').textContent=(d.active_count||0);return d}
+async function getExtraRequests(){var m=['restaurant','_ops.api.hr_ops','_api.list_extra_break_requests'].join('');return await api(m,{status:'Pending'})||[]}
+async function refreshNotifications(){var br=await refreshBreakCount();var reqs=await getExtraRequests();var total=(br.active_count||0)+(reqs.length||0);document.getElementById('bellCount').textContent=total;var html='';if((br.rows||[]).length){html+=(br.rows||[]).map(function(r){return '<div class="note-item '+(r.overdue?'overdue':'')+'"><b>'+(r.overdue?'⚠️ ':'⏱️ ')+esc(r.employee_name||r.employee)+'</b><div>داخل بريك '+esc(r.break_type)+' من '+esc(r.duration_minutes)+' دقيقة</div>'+(r.overdue?'<div style="color:#b91c1c;font-weight:900">عدى الحد بـ '+esc(r.overdue_minutes)+' دقيقة</div>':'')+'<div class="small">بدأ: '+esc(r.start_time)+'</div><button class="btn red" style="margin-top:7px" onclick="endBreak(\''+esc(r.name)+'\')">إنهاء البريك</button></div>'}).join('')}
+if(reqs.length){html+=reqs.map(function(x){return '<div class="note-item"><b>➕ طلب بريك إضافي</b><div>'+esc(x.employee_name||x.employee||'موظف')+'</div><div class="small">راجع HR Ops للموافقة</div><button class="btn blue" style="margin-top:7px" onclick="location.href=\'/hr-ops\'">فتح HR Ops</button></div>'}).join('')}
+if(!html)html='<div class="small">لا توجد إشعارات حالياً</div>';document.getElementById('bellBody').innerHTML=html}
+async function endBreak(name){if(!confirm('تأكيد إنهاء البريك؟'))return;var r=await api('restaurant_ops.api.break_api.admin_end_break',{break_log:name});if(r&&r.success){toast(r.message||'تم إنهاء البريك');refreshAll()}else toast((r&&r.message)||'فشل إنهاء البريك')}
+async function refreshCancels(){var r=await api('restaurant_ops.api.upper_management_email_api.list_order_cancellations')||{count:0,rows:[]};document.getElementById('s-cancels').textContent=r.count||0;document.getElementById('cancelBadge').textContent=r.count||0;return r}
+function openCancelForm(){showModal('↩️ تسجيل إلغاء طلب','<div class="form"><div class="field"><label>رقم الطلب *</label><input id="c-order"></div><div class="field"><label>الوردية *</label><select id="c-shift"><option>صباحية</option><option>مسائية</option><option>ليلية</option><option>غير محدد</option></select></div><div class="field"><label>الفرع *</label><input id="c-branch"></div><div class="field"><label>اسم العميل</label><input id="c-customer"></div><div class="field"><label>رقم العميل</label><input id="c-phone"></div><div class="field"><label>سبب الإلغاء *</label><input id="c-reason"></div><div class="field full"><label>ملاحظات</label><textarea id="c-notes" rows="3"></textarea></div></div><div class="actions"><button class="btn green" onclick="saveCancel()">حفظ الإلغاء</button><button class="btn gray" onclick="closeModal()">إغلاق</button></div>')}
+async function saveCancel(){var args={order_no:document.getElementById('c-order').value.trim(),shift:document.getElementById('c-shift').value,branch:document.getElementById('c-branch').value.trim(),customer_name:document.getElementById('c-customer').value.trim(),customer_phone:document.getElementById('c-phone').value.trim(),reason:document.getElementById('c-reason').value.trim(),notes:document.getElementById('c-notes').value.trim()};if(!args.order_no||!args.branch||!args.reason){toast('رقم الطلب والفرع وسبب الإلغاء مطلوبين');return}var r=await api('restaurant_ops.api.upper_management_email_api.create_order_cancellation',args);if(r&&r.success){toast('تم تسجيل الإلغاء بنجاح');openCancelReport()}else toast((r&&r.message)||'فشل تسجيل الإلغاء')}
+async function openCancelReport(){var r=await refreshCancels();var rows=r.rows||[];var html='<div class="table-wrap">';if(!rows.length)html+='<div style="padding:15px;background:#f8fafc;border-radius:10px;color:#64748b;text-align:center">لا توجد إلغاءات مسجلة اليوم</div>';else html+='<table class="data-table"><thead><tr><th>وقت التسجيل</th><th>رقم الطلب</th><th>الوردية</th><th>الفرع</th><th>العميل</th><th>السبب</th><th>سجلها</th></tr></thead><tbody>'+rows.map(function(r){return '<tr><td>'+esc(r.cancellation_time)+'</td><td>'+esc(r.order_no)+'</td><td>'+esc(r.shift)+'</td><td>'+esc(r.branch)+'</td><td>'+esc(r.customer_name)+'</td><td>'+esc(r.reason)+'</td><td>'+esc(r.logged_by)+'</td></tr>'}).join('')+'</tbody></table>';html+='</div><div class="actions"><button class="btn green" onclick="openCancelForm()">تسجيل إلغاء جديد</button><button class="btn gray" onclick="closeModal()">إغلاق</button></div>';showModal('📄 تقرير الإلغاءات اليوم',html)}
+async function refreshAll(){refreshStats();refreshQueue();refreshBreakCount();refreshCancels();}
+refreshAll();refreshNotifications();setInterval(refreshStats,8000);setInterval(refreshQueue,3000);setInterval(refreshBreakCount,8000);setInterval(refreshCancels,20000);setInterval(refreshNotifications,15000);
+</script>
+</body>
+</html>
+HTML
+
+echo "🏗️ Write clean break-admin.html from scratch"
+cat > "$BREAK_ADMIN_HTML" <<'HTML'
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>تقرير البريكات</title>
+<style>*{box-sizing:border-box;font-family:Tahoma,Arial}body{margin:0;background:#eef2f7;direction:rtl;color:#111827}.top{background:#20262d;color:white;padding:14px 22px;border-bottom:4px solid #1F4E79;display:flex;justify-content:space-between;align-items:center}.top a{color:#fff;text-decoration:none;border:1px solid #64748b;border-radius:10px;padding:8px 12px}.wrap{padding:22px;max-width:1500px;margin:auto}.panel{background:#fff;border:1px solid #d8dee9;border-radius:16px;box-shadow:0 10px 28px #0001;margin-bottom:16px;overflow:hidden}.head{padding:14px 16px;border-bottom:1px solid #e5e7eb;display:flex;justify-content:space-between;gap:10px;align-items:center}.body{padding:16px}.grid{display:grid;grid-template-columns:repeat(6,1fr);gap:10px}label{font-weight:800;color:#475569;font-size:12px}input,select{width:100%;border:1px solid #d1d5db;border-radius:10px;padding:9px}.btn{border:0;border-radius:10px;padding:10px 13px;background:#1F4E79;color:#fff;font-weight:800;cursor:pointer;margin:3px}.green{background:#16a34a}.orange{background:#f97316}.red{background:#dc2626}.gray{background:#e5e7eb;color:#111827}.table{width:100%;border-collapse:collapse;min-width:1000px}.table th{background:#111827;color:#fff;padding:9px}.table td{border:1px solid #e5e7eb;padding:8px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}.card{background:#fff;border:1px solid #ddd;border-radius:12px;padding:12px}.num{font-size:28px;color:#1F4E79;font-weight:bold}.scroll{overflow:auto}.overdue{background:#fef2f2}.muted{color:#64748b;font-size:13px}.toast{position:fixed;right:18px;bottom:18px;background:#111827;color:#fff;padding:12px 14px;border-radius:12px;display:none;z-index:99}@media(max-width:900px){.grid{grid-template-columns:1fr 1fr}.wrap{padding:12px}.table{min-width:850px}}</style>
+</head><body>
+<div class="top"><b>⏱️ تقرير البريكات</b><div><a href="/admin-desk">Admin Desk</a></div></div>
+<div class="wrap">
+  <div class="panel"><div class="head"><div><b>البريكات النشطة الآن</b><div class="muted">محسوبة من السيرفر، وبإمكان الأدمن إنهاء أي بريك نشط.</div></div><button class="btn" onclick="loadActive()">تحديث</button></div><div class="body scroll" id="activeBox">جاري التحميل...</div></div>
+  <div class="panel"><div class="head"><b>الفلاتر</b></div><div class="body"><div class="grid"><div><label>من تاريخ</label><input type="date" id="df"></div><div><label>إلى تاريخ</label><input type="date" id="dt"></div><div><label>من ساعة</label><input id="st" value="00:00"></div><div><label>إلى ساعة</label><input id="et" value="23:59"></div><div><label>الموظف</label><select id="emp"></select></div><div><label>الحالة</label><select id="status"><option>All</option><option>active</option><option>finished</option><option>Completed</option></select></div></div><br><button class="btn green" onclick="load()">تحديث</button><button class="btn orange" onclick="window.print()">طباعة/PDF</button><button class="btn" onclick="csv()">CSV Excel</button></div></div>
+  <div class="cards"><div class="card">إجمالي البريكات<div class="num" id="total">0</div></div><div class="card">إجمالي الدقائق<div class="num" id="mins">0</div></div></div><br>
+  <div class="panel"><div class="head"><b>ملخص الموظفين</b></div><div class="body scroll"><table class="table"><thead><tr><th>الموظف</th><th>عدد</th><th>الدقائق</th></tr></thead><tbody id="byemp"></tbody></table></div></div>
+  <div class="panel"><div class="head"><b>تفاصيل البريكات</b></div><div class="body scroll"><table class="table"><thead><tr><th>رقم</th><th>الموظف</th><th>النوع</th><th>الحالة</th><th>بداية</th><th>نهاية</th><th>الدقائق</th><th>التحويلة</th></tr></thead><tbody id="rows"></tbody></table></div></div>
+</div><div id="toast" class="toast"></div>
+<script>
+let last=null;function M(a){return a.join('')}function toast(x){let t=document.getElementById('toast');t.textContent=x;t.style.display='block';setTimeout(()=>t.style.display='none',3500)}async function api(m,args){let qs=new URLSearchParams();args=args||{};Object.keys(args).forEach(k=>{if(args[k]!==undefined&&args[k]!==null&&args[k]!=="")qs.append(k,args[k])});let r=await fetch('/api/method/'+m+(qs.toString()?'?'+qs.toString():''),{method:'GET',credentials:'same-origin',cache:'no-store'});let j=await r.json();if(j.exc)throw j;return j.message||j}function today(){return new Date().toISOString().slice(0,10)}function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+async function loadActive(){try{let d=await api('restaurant_ops.api.break_api.get_active_breaks');let box=document.getElementById('activeBox');let rows=d.rows||[];if(!rows.length){box.innerHTML='<div class="muted" style="text-align:center;padding:14px;background:#f8fafc;border-radius:10px">لا توجد بريكات نشطة حالياً</div>';return}box.innerHTML='<div style="margin-bottom:8px"><b>الإجمالي: '+(d.active_count||rows.length)+'</b> | <b style="color:#dc2626">عدت الوقت: '+(d.overdue_count||0)+'</b> | <span class="muted">آخر تحديث: '+esc(d.server_now||'')+'</span></div><table class="table"><thead><tr><th>الموظف</th><th>نوع البريك</th><th>بدأ من</th><th>المدة</th><th>الحد</th><th>الحالة</th><th>إجراء</th></tr></thead><tbody>'+rows.map(r=>'<tr class="'+(r.overdue?'overdue':'')+'"><td>'+esc(r.employee_name||r.employee)+'</td><td>'+esc(r.break_type)+'</td><td>'+esc(r.start_time)+'</td><td><b>'+esc(r.duration_minutes)+' دقيقة</b></td><td>'+esc(r.limit_minutes)+' دقيقة</td><td>'+(r.overdue?'⚠️ عدى الوقت بـ '+esc(r.overdue_minutes)+' دقيقة':'داخل الوقت')+'</td><td><button class="btn red" onclick="endBreak(\''+esc(r.name)+'\')">إنهاء البريك</button></td></tr>').join('')+'</tbody></table>'}catch(e){console.error(e);activeBox.innerHTML='<div style="color:#b91c1c;background:#fef2f2;padding:14px;border-radius:10px">فشل تحميل البريكات النشطة</div>'}}
+async function endBreak(name){if(!confirm('تأكيد إنهاء البريك؟'))return;let r=await api('restaurant_ops.api.break_api.admin_end_break',{break_log:name});if(r&&r.success){toast(r.message||'تم إنهاء البريك');loadActive();load()}else toast('فشل إنهاء البريك')}
+async function emps(){let d=await api(M(['restaurant','_ops.api.ops_reports','_api.list_employees']));emp.innerHTML='<option value="">الكل</option>'+((d&&d.employees)||[]).map(e=>'<option value="'+e.name+'">'+e.employee_name+'</option>').join('')}async function load(){last=await api(M(['restaurant','_ops.api.ops_reports','_api.get_break_report']),{date_from:df.value,date_to:dt.value,start_time:st.value,end_time:et.value,employee:emp.value,status:status.value});if(!last||!last.success){alert((last&&last.message)||'Error');return}total.textContent=last.summary.total_breaks;mins.textContent=last.summary.total_minutes;byemp.innerHTML=last.by_employee.map(x=>'<tr><td>'+esc(x.employee_name)+'</td><td>'+x.count+'</td><td>'+x.minutes+'</td></tr>').join('');rows.innerHTML=last.rows.map(r=>'<tr><td>'+esc(r.name)+'</td><td>'+esc(r.employee_name||r.employee)+'</td><td>'+esc(r.break_type)+'</td><td>'+esc(r.status)+'</td><td>'+esc(r.start_time_text)+'</td><td>'+esc(r.end_time_text)+'</td><td>'+esc(r.duration_minutes_calc)+'</td><td>'+esc(r.extension_at_start||'')+'</td></tr>').join('')}function csv(){if(!last)return;let blob=new Blob(['\ufeff'+(last.csv||'')],{type:'text/csv;charset=utf-8'});let a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='break-report.csv';a.click()}df.value=today();dt.value=today();emps().then(()=>{load();loadActive()});setInterval(loadActive,10000);
+</script>
+</body></html>
+HTML
+
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+if [[ -n "$APP_OWNER" ]]; then
+  chown "$APP_OWNER" "$ADMIN_HTML" "$BREAK_ADMIN_HTML" "$BREAK_API" "$UPPER_API" 2>/dev/null || true
+fi
+
+echo "🧹 Clear cache + restart app services"
+bench_exec clear-cache || true
+"${COMPOSE[@]}" restart backend frontend websocket queue-short queue-long scheduler >/dev/null
+sleep 8
+bench_exec clear-cache || true
+
+echo "🧪 Critical page smoke checks"
+set +e
+for p in admin-desk break-admin call-report email-report-customizer sales-report; do
+  code="$(curl -k -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$p" 2>/dev/null || echo 000)"
+  echo "$p => $code" | tee -a "$BACKUP_DIR/page_smoke_checks_after_v9.txt"
+done
+set -e
+
+if ! grep -q "admin-desk => 200" "$BACKUP_DIR/page_smoke_checks_after_v9.txt"; then
+  echo "❌ admin-desk وقع بعد V9. هنعمل Auto Restore للصفحات."
+  [[ -f "$BACKUP_DIR/admin-desk.html.before" ]] && cp -a "$BACKUP_DIR/admin-desk.html.before" "$ADMIN_HTML"
+  [[ -f "$BACKUP_DIR/break-admin.html.before" ]] && cp -a "$BACKUP_DIR/break-admin.html.before" "$BREAK_ADMIN_HTML"
+  [[ -n "$APP_OWNER" ]] && chown "$APP_OWNER" "$ADMIN_HTML" "$BREAK_ADMIN_HTML" 2>/dev/null || true
+  bench_exec clear-cache || true
+  "${COMPOSE[@]}" restart backend frontend websocket >/dev/null
+  sleep 6
+  bench_exec clear-cache || true
+  "${COMPOSE[@]}" logs --tail=250 backend > "$BACKUP_DIR/backend_logs_after_v9_failure.txt" 2>&1 || true
+  echo "📄 Logs: $BACKUP_DIR/backend_logs_after_v9_failure.txt"
+  exit 1
+fi
+
+echo "🧪 Backend validation"
+set +e
+bench_exec execute restaurant_ops.api.break_api.get_active_breaks | tee "$BACKUP_DIR/active_breaks_v9.txt"
+V1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.upper_management_email_api.list_order_cancellations | tee "$BACKUP_DIR/cancellations_v9.txt"
+V2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.upper_management_email_api.get_upper_management_report_data | tee "$BACKUP_DIR/upper_data_v9.txt"
+V3=${PIPESTATUS[0]}
+set -e
+
+if [[ $V1 -ne 0 || $V2 -ne 0 || $V3 -ne 0 ]]; then
+  echo "❌ Backend validation failed. راجع: $BACKUP_DIR"
+  exit 1
+fi
+
+echo "🏥 Health Check - Elastix/CDR/AMI + Queue + Call Report"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$BACKUP_DIR/health_asterisk_bridge.txt"
+H1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status | tee "$BACKUP_DIR/health_queue_status.txt"
+H2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' | tee "$BACKUP_DIR/health_call_report.txt"
+H3=${PIPESTATUS[0]}
+set -e
+
+if [[ $H1 -ne 0 || $H2 -ne 0 || $H3 -ne 0 ]]; then
+  echo "⚠️ Health returned non-zero. راجع: $BACKUP_DIR"
+else
+  echo "✅ Health checks OK"
+fi
+
+echo "============================================================"
+echo "✅ DONE V9"
+echo "📦 Backup folder: $BACKUP_DIR"
+echo "🏠 /admin-desk rebuilt from scratch with same name"
+echo "⏱️ /break-admin rebuilt with active breaks + End action"
+echo "↩️ cancellations visible and saved via backend"
+echo "🔔 bell opens admin notifications only"
+echo "☰ sidebar collapse is native to the rebuilt page"
+echo "🛡️ report_api.py لم يتم لمسه"
+echo "============================================================"

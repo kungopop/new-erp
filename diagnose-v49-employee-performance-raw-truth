@@ -1,0 +1,391 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Roshdy V49 Diagnostic ONLY - Employee Performance raw truth audit
+# READ ONLY: no app-code edits, no restarts, no Elastix writes, no log delete/compress/rotate.
+# Purpose: audit why V46/V48 employee-performance numbers look unfair, before rebuilding production logic.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+TARGET_DATE="${TARGET_DATE:-$(date -d 'yesterday' +%F)}"
+CONF_FILE="${CONF_FILE:-/opt/frappe_crm/queue_journey.conf}"
+[[ -f "$CONF_FILE" ]] && source "$CONF_FILE"
+
+ELASTIX_SSH="${ELASTIX_SSH:-root@10.11.1.253}"
+QUEUE_LOG="${QUEUE_LOG:-/var/log/asterisk/queue_log}"
+QUEUES="${QUEUES:-1234,123}"
+MAX_LINES="${MAX_LINES:-900000}"
+SSH_KEY="${SSH_KEY:-/root/.ssh/id_rsa_roshdy_queue_journey}"
+PASSWORD_FILE="${PASSWORD_FILE:-/root/.roshdy_elastix_root.pass}"
+
+cd "$ROOT"
+if docker compose version >/dev/null 2>&1; then COMPOSE=(docker compose); else COMPOSE=(docker-compose); fi
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then echo "❌ backend مش شغال"; exit 1; fi
+bench_exec(){ "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"; }
+
+TS="$(date +%Y%m%d_%H%M%S)"
+OUT_DIR="$ROOT/backups/DIAG_V49_EMPLOYEE_PERF_RAW_TRUTH_${TARGET_DATE}_$TS"
+mkdir -p "$OUT_DIR/raw" "$OUT_DIR/health"
+
+START_EPOCH="$(date -d "$TARGET_DATE 10:00:00" +%s)"
+END_EPOCH="$(date -d "$TARGET_DATE +1 day 05:00:00" +%s)"
+START_TXT="$(date -d "@$START_EPOCH" '+%F %T')"
+END_TXT="$(date -d "@$END_EPOCH" '+%F %T')"
+
+cat <<EOF | tee "$OUT_DIR/00_README.txt"
+============================================================
+Roshdy V49 Employee Performance RAW TRUTH Diagnostic
+Target operational day: $TARGET_DATE
+Window: $START_TXT -> $END_TXT
+Queues: $QUEUES
+Generated: $TS
+READ ONLY: no app-code edits, no restarts, no Elastix writes.
+============================================================
+EOF
+
+SSH_OPTS=(-o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/root/.ssh/known_hosts)
+if [[ -n "$SSH_KEY" && -f "$SSH_KEY" ]]; then
+  SSH_OPTS=(-i "$SSH_KEY" -o IdentitiesOnly=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/root/.ssh/known_hosts -o PreferredAuthentications=publickey -o BatchMode=yes)
+fi
+ssh_remote_to_stdout(){
+  local remote_cmd="$1"
+  # Password first because the password file is already intentionally saved for Elastix read-only fetches.
+  if [[ -n "${PASSWORD_FILE:-}" && -f "$PASSWORD_FILE" ]] && command -v sshpass >/dev/null 2>&1; then
+    if sshpass -f "$PASSWORD_FILE" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$ELASTIX_SSH" "$remote_cmd" 2>"$OUT_DIR/raw/ssh_password.err"; then
+      return 0
+    fi
+  fi
+  if ssh "${SSH_OPTS[@]}" "$ELASTIX_SSH" "$remote_cmd" 2>"$OUT_DIR/raw/ssh_key.err"; then
+    return 0
+  fi
+  echo "❌ SSH read failed" >&2
+  [[ -s "$OUT_DIR/raw/ssh_password.err" ]] && { echo "--- password attempt ---" >&2; cat "$OUT_DIR/raw/ssh_password.err" >&2; }
+  [[ -s "$OUT_DIR/raw/ssh_key.err" ]] && { echo "--- key attempt ---" >&2; cat "$OUT_DIR/raw/ssh_key.err" >&2; }
+  return 1
+}
+
+echo "🧾 Step 1: Fetch queue_log lines for operational day (read-only)"
+REMOTE_CMD="tail -n '$MAX_LINES' '$QUEUE_LOG' | awk -F'|' -v s='$START_EPOCH' -v e='$END_EPOCH' 'BEGIN{split(\"$QUEUES\",q,\",\"); for(i in q) allow[q[i]]=1} (\$1>=s && \$1<e && allow[\$3]) {print}'"
+ssh_remote_to_stdout "$REMOTE_CMD" > "$OUT_DIR/raw/queue_log_operational_raw.txt"
+wc -l "$OUT_DIR/raw/queue_log_operational_raw.txt" | tee "$OUT_DIR/raw/queue_log_line_count.txt"
+
+cat > "$OUT_DIR/raw/v49_analyzer.py" <<'PYAN'
+# -*- coding: utf-8 -*-
+import sys, os, re, json
+from collections import defaultdict, Counter
+from datetime import datetime, timedelta, time
+
+import frappe
+from frappe.utils import cstr, cint, flt, get_datetime
+
+raw_path, target_date, queues_s = sys.argv[1:4]
+SITE = os.environ.get('FRAPPE_SITE') or 'crm.local'
+frappe.init(site=SITE)
+frappe.connect()
+
+QUEUES = {"1234": "طلبات", "123": "شكاوى"}
+queues = {q.strip() for q in queues_s.split(',') if q.strip()}
+
+def parse_dt(v):
+    try:
+        if not v: return None
+        if isinstance(v, datetime): return v
+        return get_datetime(v)
+    except Exception:
+        return None
+
+def fmt(dt):
+    return dt.strftime('%Y-%m-%d %H:%M:%S') if dt else ''
+
+def ext_from_agent(agent):
+    agent=cstr(agent or '')
+    for pat in (r'(?:Local|SIP|PJSIP|Agent)/(\d{3,6})', r'^(\d{3,6})$', r'\b(\d{3,6})\b'):
+        m=re.search(pat, agent, re.I)
+        if m and m.group(1) not in ('123','1234'):
+            return m.group(1)
+    return ''
+
+def normalize_phone(phone):
+    s=re.sub(r'\D+','',cstr(phone or ''))
+    if not s: return ''
+    if s.startswith('00'): s=s[2:]
+    if s.startswith('20') and len(s)>=11: s='0'+s[2:]
+    if len(s)==10 and s[:2] in ('10','11','12','15'): s='0'+s
+    if len(s)==9 and s[:2] in ('50','55','57','48','45','40','47','46','64','66','68','82','84','86','88','92','93','95','96','97'): s='0'+s
+    return s
+
+def table_columns(table):
+    try:
+        return [r.get('Field') for r in frappe.db.sql('describe `%s`' % table, as_dict=True)]
+    except Exception:
+        return []
+
+# Operational bounds
+D=datetime.strptime(target_date[:10], '%Y-%m-%d').date()
+start=datetime.combine(D,time(10,0,0)); split=datetime.combine(D,time(20,0,0)); end=datetime.combine(D+timedelta(days=1),time(5,0,0))
+
+# Parse queue_log events
+events=[]; event_counts=Counter(); queue_counts=Counter(); by_call=defaultdict(list)
+with open(raw_path,'r',errors='ignore') as f:
+    for line in f:
+        line=line.rstrip('\n')
+        if not line: continue
+        p=line.split('|')
+        if len(p)<5: continue
+        try: ts=int(float(p[0]))
+        except Exception: continue
+        dt=datetime.fromtimestamp(ts)
+        callid,queue,agent,event=p[1],p[2],p[3],p[4]
+        if queues and queue not in queues: continue
+        row={'time_epoch':ts,'time_text':fmt(dt),'callid':callid,'queue':queue,'agent':agent,'agent_ext':ext_from_agent(agent),'event':event,'data':p[5:],'raw':line}
+        events.append(row); event_counts[event]+=1; queue_counts[queue]+=1
+        by_call[callid].append(row)
+for cid in by_call: by_call[cid].sort(key=lambda x:x['time_epoch'])
+
+# Extension sessions, with stale-open inference by next selection of same employee/user
+session_debug=[]; sessions=[]; session_error=''
+try:
+    if frappe.db.exists('DocType','Extension Session'):
+        cols=table_columns('tabExtension Session')
+        start_col='started_at' if 'started_at' in cols else 'creation'
+        end_col='released_at' if 'released_at' in cols else None
+        emp_col='employee' if 'employee' in cols else None
+        user_col='user' if 'user' in cols else None
+        q_start=start-timedelta(days=3); q_end=end+timedelta(days=2)
+        fields=['s.name','s.extension',('s.`%s` as start_dt'%start_col),('s.`%s` as end_dt'%end_col) if end_col else 'NULL as end_dt',('s.`%s` as employee'%emp_col) if emp_col else 'NULL as employee',('s.`%s` as user'%user_col) if user_col else 'NULL as user','s.creation']
+        sql='''
+            select {fields}, coalesce(e.employee_name, {emp_expr}, {user_expr}, s.name) as employee_name
+            from `tabExtension Session` s
+            left join `tabEmployee` e on ({emp_join}) or ({user_join})
+            where s.extension is not null and s.extension != ''
+              and coalesce(s.`{start_col}`, s.creation) < %s
+              and ({end_cond})
+            order by coalesce(s.`{start_col}`, s.creation) asc
+        '''.format(fields=', '.join(fields), emp_expr=('s.`%s`'%emp_col) if emp_col else 'NULL', user_expr=('s.`%s`'%user_col) if user_col else 'NULL', emp_join=('e.name=s.`%s`'%emp_col) if emp_col else '1=0', user_join=('e.user_id=s.`%s`'%user_col) if user_col else '1=0', start_col=start_col, end_cond=("s.`%s` is null or s.`%s` > %%s"%(end_col,end_col)) if end_col else '1=1')
+        rows=frappe.db.sql(sql,(fmt(q_end),fmt(q_start)),as_dict=True)
+        for r in rows:
+            st=parse_dt(r.get('start_dt') or r.get('creation')); en=parse_dt(r.get('end_dt'))
+            if not st: continue
+            emp_key=cstr(r.get('employee') or r.get('user') or r.get('employee_name') or '').strip()
+            sessions.append({'name':cstr(r.get('name')),'extension':cstr(r.get('extension')).strip(),'employee':cstr(r.get('employee_name') or r.get('employee') or r.get('user') or '').strip(),'employee_key':emp_key,'start':st,'end_raw':en,'end':en})
+        by_emp=defaultdict(list)
+        for s in sessions: by_emp[s.get('employee_key') or s.get('employee')].append(s)
+        for emp, arr in by_emp.items():
+            arr.sort(key=lambda x:x['start'])
+            for i, sess in enumerate(arr[:-1]):
+                nxt=arr[i+1]
+                if not sess.get('end') or sess['end'] > nxt['start']:
+                    sess['end_inferred_from_next_selection']=fmt(nxt['start'])
+                    sess['end']=nxt['start']
+        for sess in sessions:
+            if not sess.get('end'): sess['end']=end+timedelta(days=2)
+        active=[]
+        for s in sessions:
+            if s['start']<end and s['end']>start:
+                active.append(s)
+        session_debug=[{k:(fmt(v) if isinstance(v,datetime) else v) for k,v in s.items()} for s in active]
+except Exception as e:
+    session_error=cstr(e)
+
+def emp_at(ext, when):
+    ext=cstr(ext or '').strip(); dt=parse_dt(when)
+    if not ext or not dt: return ''
+    c=[s for s in sessions if s['extension']==ext and s['start']<=dt<s['end']]
+    if not c: return ''
+    c.sort(key=lambda x:x['start'], reverse=True)
+    return c[0].get('employee') or ''
+
+# CDR queue rows, read-only
+cdr_rows=[]; cdr_error=''
+def sql_quote(s): return "'" + cstr(s).replace('\\','\\\\').replace("'","''") + "'"
+try:
+    from restaurant_ops.api.asterisk_bridge import query_asterisk_cdr
+    sql='''
+        SELECT calldate, src, cnum, dst, channel, dstchannel, lastapp, lastdata, duration, billsec, disposition, uniqueid, recordingfile
+        FROM cdr
+        WHERE calldate >= {start} AND calldate < {end}
+          AND lastapp='Queue' AND dst IN ('123','1234')
+        ORDER BY calldate ASC
+    '''.format(start=sql_quote(fmt(start)), end=sql_quote(fmt(end)))
+    cdr_rows=query_asterisk_cdr(sql) or []
+except Exception as e:
+    cdr_error=cstr(e)
+cdr_by_uid={cstr(r.get('uniqueid')):r for r in cdr_rows if r.get('uniqueid')}
+
+# Build raw/fair metrics
+connect_rows=[]; ring_rows=[]; call_summaries=[]
+for cid, evs in by_call.items():
+    phone=''; queue=evs[0].get('queue') if evs else ''; enter=None
+    for e in evs:
+        if e['event']=='ENTERQUEUE':
+            enter=parse_dt(e.get('time_text')) or enter
+            for d0 in e.get('data') or []:
+                if re.search(r'\d{5,}',cstr(d0)):
+                    phone=cstr(d0); break
+    connects=[e for e in evs if e['event']=='CONNECT']
+    completes=[e for e in evs if e['event'] in ('COMPLETEAGENT','COMPLETECALLER')]
+    abandons=[e for e in evs if e['event']=='ABANDON']
+    outcome='answered' if connects else ('abandoned' if abandons else 'unknown')
+    call_summaries.append({'callid':cid,'queue':queue,'caller_raw':phone,'caller':normalize_phone(phone),'events':[e['event'] for e in evs],'outcome':outcome})
+    for con in connects:
+        data=con.get('data') or []
+        hold=flt(data[0]) if len(data)>0 else None
+        ring=flt(data[2]) if len(data)>2 else None
+        ext=con.get('agent_ext') or ext_from_agent(con.get('agent'))
+        emp=emp_at(ext, con.get('time_text'))
+        # talk from complete after connect; if absent CDR fallback
+        comp=next((x for x in evs if x['event'] in ('COMPLETEAGENT','COMPLETECALLER') and x['time_epoch']>=con['time_epoch']), None)
+        talk=None
+        if comp:
+            cd=comp.get('data') or []
+            if len(cd)>1: talk=flt(cd[1])
+        if talk is None:
+            cdr=cdr_by_uid.get(cid) or {}; talk=flt(cdr.get('billsec') or cdr.get('duration') or 0)
+        connect_rows.append({'time':con.get('time_text'),'callid':cid,'queue':queue,'caller':normalize_phone(phone),'extension':ext,'employee':emp or '', 'employee_or_extension':emp or ('تحويلة '+ext if ext else 'غير محدد'),'customer_wait_to_answer_seconds':hold,'agent_pickup_seconds':ring,'talk_seconds':talk,'has_session_mapping':bool(emp)})
+    for rn in [e for e in evs if e['event'] in ('RINGNOANSWER','RINGCANCELED','AGENTDUMP')]:
+        ext=rn.get('agent_ext') or ext_from_agent(rn.get('agent'))
+        emp=emp_at(ext, rn.get('time_text'))
+        raw=(rn.get('data') or [0])[0]
+        rsec=round(flt(raw)/1000.0,1) if flt(raw)>100 else flt(raw)
+        later=[x for x in evs if x['time_epoch']>rn['time_epoch']]
+        nxt=next((x for x in later if x['event'] in ('CONNECT','ABANDON','EXITWITHTIMEOUT','EXITEMPTY','EXITWITHKEY')), None)
+        fate='unknown'; answered_ext=''
+        if nxt:
+            if nxt['event']=='CONNECT':
+                answered_ext=nxt.get('agent_ext') or ext_from_agent(nxt.get('agent'))
+                fate='answered_later_same_extension' if answered_ext==ext else 'answered_later_other_extension'
+            elif nxt['event']=='ABANDON': fate='customer_abandoned_after_ring'
+            else: fate='timeout_or_exit'
+        ring_rows.append({'time':rn.get('time_text'),'callid':cid,'queue':queue,'caller':normalize_phone(phone),'extension':ext,'employee':emp or '', 'employee_or_extension':emp or ('تحويلة '+ext if ext else 'غير محدد'),'ring_seconds':rsec,'has_session_mapping':bool(emp),'fate':fate,'answered_extension':answered_ext})
+
+# Aggregate candidates
+ans_by=defaultdict(lambda:{'answered_calls':0,'mapped_calls':0,'customer_wait_values':[],'agent_pickup_values':[],'talk_values':[],'extensions':set(),'orders':0,'complaints':0})
+for r in connect_rows:
+    key=('emp|'+r['employee']) if r.get('employee') else ('ext|'+r.get('extension',''))
+    a=ans_by[key]; a['label']=r.get('employee_or_extension'); a['answered_calls']+=1; a['mapped_calls']+=1 if r.get('has_session_mapping') else 0; a['extensions'].add(r.get('extension'))
+    if r.get('customer_wait_to_answer_seconds') is not None: a['customer_wait_values'].append(r.get('customer_wait_to_answer_seconds'))
+    if r.get('agent_pickup_seconds') not in (None,0): a['agent_pickup_values'].append(r.get('agent_pickup_seconds'))
+    if r.get('talk_seconds') is not None: a['talk_values'].append(r.get('talk_seconds'))
+    if r.get('queue')=='1234': a['orders']+=1
+    elif r.get('queue')=='123': a['complaints']+=1
+
+ring_raw_by_ext=Counter(r['extension'] for r in ring_rows if r.get('extension'))
+ring_dedup_by_ext=Counter()
+seen=set()
+for r in ring_rows:
+    k=(r.get('callid'),r.get('extension'))
+    if k in seen: continue
+    seen.add(k); ring_dedup_by_ext[r.get('extension')]+=1
+ring_active_by=Counter(); ring_active_dedup_by=Counter(); seen2=set()
+for r in ring_rows:
+    key=('emp|'+r['employee']) if r.get('employee') else None
+    if key:
+        ring_active_by[key]+=1
+        dk=(key,r.get('callid'))
+        if dk not in seen2:
+            seen2.add(dk); ring_active_dedup_by[key]+=1
+
+answer_summary=[]
+for key,a in ans_by.items():
+    def avg(v): return round(sum(v)/len(v),2) if v else None
+    answer_summary.append({'key':key,'label':a.get('label'),'extensions':sorted([x for x in a['extensions'] if x]),'answered_calls':a['answered_calls'],'session_mapped_calls':a['mapped_calls'],'orders':a['orders'],'complaints':a['complaints'],'avg_customer_wait_seconds':avg(a['customer_wait_values']),'max_customer_wait_seconds':max(a['customer_wait_values']) if a['customer_wait_values'] else None,'avg_agent_pickup_seconds':avg(a['agent_pickup_values']),'max_agent_pickup_seconds':max(a['agent_pickup_values']) if a['agent_pickup_values'] else None,'avg_talk_seconds':avg(a['talk_values']),'max_talk_seconds':max(a['talk_values']) if a['talk_values'] else None,'fair_no_answer_calls_active_session_dedup':ring_active_dedup_by.get(key,0),'raw_no_answer_attempts_active_session':ring_active_by.get(key,0)})
+answer_summary.sort(key=lambda x:(-x['answered_calls'], -x['fair_no_answer_calls_active_session_dedup'], x['label'] or ''))
+
+# Existing snapshot, if any
+existing=None; existing_error=''
+try:
+    snap_path=frappe.get_site_path('private','files','employee_performance',f'employee_performance_{target_date}.json')
+    if os.path.exists(snap_path):
+        with open(snap_path,encoding='utf-8') as f: existing=json.load(f)
+except Exception as e:
+    existing_error=cstr(e)
+
+# Find suspicious differences
+problems=[]
+if existing:
+    problems.append('Existing production snapshot exists; compare existing.employees against fair_candidate.answer_summary.')
+if ring_raw_by_ext:
+    top_ext, top_cnt=ring_raw_by_ext.most_common(1)[0]
+    ded=ring_dedup_by_ext.get(top_ext,0)
+    problems.append(f'Raw no-answer attempts top extension {top_ext} = {top_cnt}; dedup by call/ext = {ded}. Raw attempts are not equal to missed customer calls.')
+unmapped=sum(1 for r in connect_rows if not r.get('has_session_mapping'))
+if unmapped:
+    problems.append(f'{unmapped} answered CONNECT rows have no exact employee session mapping; they should not be attributed to an employee without a verified session.')
+
+out={'success':True,'generated_at':fmt(datetime.now()),'target_date':target_date,'window':{'start':fmt(start),'split':fmt(split),'end':fmt(end)},'definitions':{'customer_wait_to_answer_seconds':'وقت انتظار العميل من دخول الطابور حتى الرد CONNECT. ده مؤشر خدمة وليس تقييم موظف وحده.','agent_pickup_seconds':'وقت رن التحويلة التي ردت فعليًا قبل ما الموظف يلتقط المكالمة. ده هو الأنسب لسرعة رد الموظف.','talk_seconds':'مدة الكلام من COMPLETE event أو CDR billsec عند الحاجة.','raw_no_answer_attempts':'عدد أحداث RINGNOANSWER الخام. قد تتكرر لنفس المكالمة ونفس التحويلة، وليست عدد عملاء ضاعوا.','fair_no_answer_calls_active_session_dedup':'عدد مكالمات فريدة رنت على تحويلة مربوطة بموظف وقتها ولم يتم الرد من هذه الرنة. ده الأقرب للعد العادل.'},'queue_log':{'events_loaded':len(events),'calls_seen':len(by_call),'event_counts':dict(event_counts),'queue_counts':dict(queue_counts)},'cdr':{'rows':len(cdr_rows),'error':cdr_error},'sessions':{'rows_used':len(session_debug),'error':session_error,'sample':session_debug[:80]},'phone_normalization_examples':{x:normalize_phone(x) for x in ['01028567017','+201028567017','201028567017','0502727789','+20502727789','20502727789']},'raw_no_answer_by_extension':dict(ring_raw_by_ext.most_common()),'dedup_no_answer_by_extension_call':dict(ring_dedup_by_ext.most_common()),'fair_candidate_employee_summary':answer_summary,'connect_rows_sample':connect_rows[:200],'ring_rows_sample':ring_rows[:200],'existing_snapshot':{'found':bool(existing),'version':(existing or {}).get('version') if existing else None,'generated_at':(existing or {}).get('generated_at') if existing else None,'summary':(existing or {}).get('summary') if existing else None,'employees_sample':(existing or {}).get('employees',[])[:30] if existing else [],'error':existing_error},'problems_detected':problems}
+print(json.dumps(out,ensure_ascii=False,indent=2,default=str))
+try: frappe.destroy()
+except Exception: pass
+PYAN
+
+echo "🧪 Step 2: Run analyzer inside backend container"
+"${COMPOSE[@]}" cp "$OUT_DIR/raw/v49_analyzer.py" "backend:/tmp/v49_analyzer.py" 2>/dev/null || docker cp "$OUT_DIR/raw/v49_analyzer.py" "$BACKEND:/tmp/v49_analyzer.py"
+"${COMPOSE[@]}" cp "$OUT_DIR/raw/queue_log_operational_raw.txt" "backend:/tmp/v49_queue_log_operational_raw.txt" 2>/dev/null || docker cp "$OUT_DIR/raw/queue_log_operational_raw.txt" "$BACKEND:/tmp/v49_queue_log_operational_raw.txt"
+"${COMPOSE[@]}" exec -T -e FRAPPE_SITE="$SITE" backend bash -lc "cd /home/frappe/frappe-bench && python /tmp/v49_analyzer.py /tmp/v49_queue_log_operational_raw.txt '$TARGET_DATE' '$QUEUES'" > "$OUT_DIR/analysis.json" 2> "$OUT_DIR/analyzer_stderr.txt" || true
+
+python3 - "$OUT_DIR/analysis.json" "$OUT_DIR/summary.md" <<'PYMD'
+import sys,json
+p,out=sys.argv[1:3]
+try:
+    d=json.load(open(p,encoding='utf-8'))
+except Exception as e:
+    open(out,'w',encoding='utf-8').write('# V49 Diagnostic failed\n\nSee analyzer_stderr.txt\n\n'+str(e)+'\n')
+    raise SystemExit
+lines=[]
+lines.append('# V49 Employee Performance Raw Truth Diagnostic')
+lines.append('')
+lines.append(f"Target date: `{d.get('target_date')}`")
+lines.append(f"Window: `{(d.get('window') or {}).get('start')}` -> `{(d.get('window') or {}).get('end')}`")
+lines.append('')
+lines.append('## Key counts')
+q=d.get('queue_log') or {}; c=d.get('cdr') or {}; s=d.get('sessions') or {}
+lines.append(f"- Queue events loaded: `{q.get('events_loaded')}`")
+lines.append(f"- Calls seen in queue_log: `{q.get('calls_seen')}`")
+lines.append(f"- CDR queue rows: `{c.get('rows')}`")
+lines.append(f"- Extension session rows used: `{s.get('rows_used')}`")
+lines.append('')
+lines.append('## Metric definitions')
+for k,v in (d.get('definitions') or {}).items(): lines.append(f"- **{k}**: {v}")
+lines.append('')
+lines.append('## Raw no-answer by extension')
+for k,v in list((d.get('raw_no_answer_by_extension') or {}).items())[:20]: lines.append(f"- `{k}`: {v}")
+lines.append('')
+lines.append('## Dedup no-answer by extension/call')
+for k,v in list((d.get('dedup_no_answer_by_extension_call') or {}).items())[:20]: lines.append(f"- `{k}`: {v}")
+lines.append('')
+lines.append('## Fair candidate summary top rows')
+lines.append('| الاسم/التحويلة | التحويلات | ردود | طلبات | شكاوى | متوسط انتظار العميل | متوسط التقاط الموظف | متوسط الكلام | محاولات رن بدون رد عادلة |')
+lines.append('|---|---:|---:|---:|---:|---:|---:|---:|---:|')
+for r in (d.get('fair_candidate_employee_summary') or [])[:25]:
+    lines.append('| {label} | {exts} | {answered} | {orders} | {complaints} | {cw} | {ap} | {talk} | {miss} |'.format(label=str(r.get('label') or '').replace('|','/'), exts=', '.join(r.get('extensions') or []), answered=r.get('answered_calls'), orders=r.get('orders'), complaints=r.get('complaints'), cw=r.get('avg_customer_wait_seconds'), ap=r.get('avg_agent_pickup_seconds'), talk=r.get('avg_talk_seconds'), miss=r.get('fair_no_answer_calls_active_session_dedup')))
+lines.append('')
+lines.append('## Problems detected')
+for x in d.get('problems_detected') or []: lines.append('- '+x)
+open(out,'w',encoding='utf-8').write('\n'.join(lines)+'\n')
+PYMD
+
+# Health checks read-only.
+echo "🏥 Step 3: Health checks" | tee -a "$OUT_DIR/00_README.txt"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics > "$OUT_DIR/health/asterisk_bridge.json" 2>&1
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status > "$OUT_DIR/health/queue_status.json" 2>&1
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' > "$OUT_DIR/health/call_report.json" 2>&1
+set -e
+
+cat > "$OUT_DIR/99_SUMMARY.txt" <<EOF
+DONE - V49 RAW TRUTH DIAGNOSTIC ONLY
+Output folder: $OUT_DIR
+Zip file: $ROOT/backups/$(basename "$OUT_DIR").zip
+
+No app code was edited, no services restarted, no Elastix writes.
+Open summary.md first, then analysis.json if needed.
+EOF
+(
+  cd "$ROOT/backups"
+  zip -qr "$(basename "$OUT_DIR").zip" "$(basename "$OUT_DIR")"
+) || true
+
+cat "$OUT_DIR/99_SUMMARY.txt"
+ls -lh "$ROOT/backups/$(basename "$OUT_DIR").zip" 2>/dev/null || true

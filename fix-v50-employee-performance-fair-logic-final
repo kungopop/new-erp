@@ -1,0 +1,727 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Roshdy V50 - Employee Performance FAIR logic rebuild
+# Rebuilds employee-performance calculation from clear definitions:
+# - Employee pickup speed = CONNECT field 3 (time ringing on answering extension), NOT full customer queue wait.
+# - Long no-answer ring = RINGNOANSWER >= 15 seconds, de-duplicated by call+extension.
+# - Raw short/noisy RINGNOANSWER events are not used for employee judgement.
+# - Employee mapping only when Extension Session is valid at event time; otherwise row stays as extension.
+# Safety: no report_api.py edits, no Elastix writes, no CDR/AMI config edits, no queue_log modification.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+else
+  COMPOSE=(docker-compose)
+fi
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend مش شغال"
+  exit 1
+fi
+bench_exec(){ "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"; }
+
+APP_DIR="$ROOT/apps/$APP"
+PKG_DIR="$APP_DIR/$APP"
+API_DIR="$PKG_DIR/api"
+WWW_DIR="$PKG_DIR/www"
+EMP_API="$API_DIR/employee_performance_api.py"
+EMP_HTML="$WWW_DIR/employee-performance.html"
+EMP_SCRIPT="$ROOT/scripts/roshdy_employee_performance_generate_v46"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/FIX_V50_EMPLOYEE_PERF_FAIR_LOGIC_BEFORE_$TS"
+mkdir -p "$BACKUP_DIR/files"
+
+cat <<EOF
+============================================================
+⚖️ Roshdy V50: Employee Performance FAIR Logic
+📦 Backup: $BACKUP_DIR
+🛡️ report_api.py / Elastix / CDR / AMI untouched
+============================================================
+EOF
+
+for f in "$EMP_API" "$EMP_HTML" "$EMP_SCRIPT"; do
+  [[ -e "$f" ]] && cp -a "$f" "$BACKUP_DIR/files/$(basename "$f").before" || true
+done
+
+echo "🧩 Step 1: Append V50 fair builder override"
+python3 - <<'PYPATCH'
+from pathlib import Path
+p=Path('/opt/frappe_crm/apps/restaurant_ops/restaurant_ops/api/employee_performance_api.py')
+s=p.read_text(encoding='utf-8',errors='ignore')
+a='# BEGIN ROSHDY EMP PERF FAIR LOGIC V50'
+b='# END ROSHDY EMP PERF FAIR LOGIC V50'
+while a in s and b in s:
+    i=s.index(a); j=s.index(b,i)+len(b); s=s[:i]+'\n'+s[j:]
+block=r'''
+# BEGIN ROSHDY EMP PERF FAIR LOGIC V50
+# Final fair employee-performance builder.
+# IMPORTANT DEFINITIONS:
+# - avg_wait_seconds / wait_min / wait_max are kept for UI compatibility but now mean AGENT PICKUP SECONDS,
+#   i.e. CONNECT event third data field: how long the answering extension rang before pickup.
+# - customer_wait_seconds is kept separately: how long the customer waited in queue before any answer.
+# - ringnoanswer is not raw RINGNOANSWER count. It counts only long ring attempts >= 15 seconds,
+#   de-duplicated by callid+extension, and attributed only by exact session at ring time when possible.
+
+from collections import defaultdict as _v50_defaultdict, Counter as _v50_Counter
+from datetime import datetime as _v50_datetime, timedelta as _v50_timedelta
+import re as _v50_re
+
+V50_NO_ANSWER_THRESHOLD_SECONDS = 15
+
+
+def _v50_label(emp, ext):
+    emp = cstr(emp or '').strip()
+    ext = cstr(ext or '').strip()
+    if emp:
+        return emp
+    return ('تحويلة ' + ext) if ext else 'غير محدد'
+
+
+def _v50_key(emp, ext):
+    emp = cstr(emp or '').strip()
+    ext = cstr(ext or '').strip()
+    if emp:
+        return 'emp|' + emp
+    return 'ext|' + ext
+
+
+def _v50_sec_from_ring_raw(v):
+    try:
+        x = flt(v or 0)
+        return round(x / 1000.0, 1) if x > 100 else x
+    except Exception:
+        return 0
+
+
+def _v50_session_context(start_dt, split_dt, end_dt):
+    """Return exact employee-at-extension-at-time resolver.
+
+    One employee should have one effective extension at a time. If a stale session stays open,
+    its effective end is inferred from the next session selected by the same employee/user.
+    """
+    start = _parse_dt(start_dt)
+    split = _parse_dt(split_dt)
+    end = _parse_dt(end_dt)
+    rows = []
+    try:
+        if not frappe.db.exists('DocType', 'Extension Session'):
+            raise Exception('Extension Session doctype missing')
+        cols = _table_columns('tabExtension Session')
+        if 'extension' not in cols:
+            raise Exception('extension column missing')
+        st_col = 'started_at' if 'started_at' in cols else 'creation'
+        en_col = 'released_at' if 'released_at' in cols else None
+        emp_col = 'employee' if 'employee' in cols else None
+        user_col = 'user' if 'user' in cols else None
+        q_start = start - _v50_timedelta(days=3)
+        q_end = end + _v50_timedelta(days=2)
+        fields = [
+            's.name', 's.extension', 's.creation',
+            ('s.`%s` as start_dt' % st_col),
+            ('s.`%s` as end_dt' % en_col) if en_col else 'NULL as end_dt',
+            ('s.`%s` as employee' % emp_col) if emp_col else 'NULL as employee',
+            ('s.`%s` as user' % user_col) if user_col else 'NULL as user',
+        ]
+        sql = """
+            select {fields}, coalesce(e.employee_name, {emp_expr}, {user_expr}, s.name) as employee_name
+            from `tabExtension Session` s
+            left join `tabEmployee` e on ({emp_join}) or ({user_join})
+            where s.extension is not null and s.extension != ''
+              and coalesce(s.`{st_col}`, s.creation) < %s
+              and ({end_cond})
+            order by coalesce(s.`{st_col}`, s.creation) asc
+        """.format(
+            fields=', '.join(fields),
+            emp_expr=('s.`%s`' % emp_col) if emp_col else 'NULL',
+            user_expr=('s.`%s`' % user_col) if user_col else 'NULL',
+            emp_join=('e.name=s.`%s`' % emp_col) if emp_col else '1=0',
+            user_join=('e.user_id=s.`%s`' % user_col) if user_col else '1=0',
+            st_col=st_col,
+            end_cond=("s.`%s` is null or s.`%s` > %%s" % (en_col, en_col)) if en_col else '1=1',
+        )
+        raw_rows = frappe.db.sql(sql, (q_end.strftime('%Y-%m-%d %H:%M:%S'), q_start.strftime('%Y-%m-%d %H:%M:%S')), as_dict=True)
+        for r in raw_rows:
+            st = _parse_dt(r.get('start_dt') or r.get('creation'))
+            en = _parse_dt(r.get('end_dt'))
+            if not st:
+                continue
+            emp_key = cstr(r.get('employee') or r.get('user') or r.get('employee_name') or '').strip()
+            rows.append({
+                'name': cstr(r.get('name')),
+                'extension': cstr(r.get('extension')).strip(),
+                'employee': cstr(r.get('employee_name') or r.get('employee') or r.get('user') or '').strip(),
+                'employee_key': emp_key,
+                'start': st,
+                'end_raw': en,
+                'end': en,
+            })
+    except Exception:
+        rows = []
+
+    by_emp = _v50_defaultdict(list)
+    for r in rows:
+        by_emp[r.get('employee_key') or r.get('employee')].append(r)
+    for emp, arr in by_emp.items():
+        arr.sort(key=lambda x: x['start'])
+        for i, sess in enumerate(arr[:-1]):
+            nxt = arr[i + 1]
+            if not sess.get('end') or sess['end'] > nxt['start']:
+                sess['end'] = nxt['start']
+                sess['end_inferred'] = True
+    for r in rows:
+        if not r.get('end'):
+            r['end'] = end + _v50_timedelta(days=2)
+
+    active = []
+    for r in rows:
+        if r['extension'] and r['start'] < end and r['end'] > start:
+            x = dict(r)
+            x['ov_start'] = max(r['start'], start)
+            x['ov_end'] = min(r['end'], end)
+            if x['ov_end'] > x['ov_start']:
+                active.append(x)
+
+    def emp_at(ext, when):
+        ext = cstr(ext or '').strip()
+        dt = _parse_dt(when)
+        if not ext or not dt:
+            return ''
+        candidates = [r for r in active if r['extension'] == ext and r['start'] <= dt < r['end']]
+        if not candidates:
+            return ''
+        candidates.sort(key=lambda x: x['start'], reverse=True)
+        return candidates[0].get('employee') or ''
+
+    by_key = _v50_defaultdict(lambda: {'employee': '', 'extensions': set(), 'session_minutes_est': 0, 'session_morning_minutes_est': 0, 'session_evening_minutes_est': 0})
+    for r in active:
+        emp = r.get('employee') or ''
+        key = _v50_key(emp, r.get('extension'))
+        b = by_key[key]
+        b['employee'] = _v50_label(emp, r.get('extension'))
+        b['extensions'].add(r.get('extension'))
+        minutes = max(0, int((r['ov_end'] - r['ov_start']).total_seconds() / 60))
+        b['session_minutes_est'] += minutes
+        m1 = max(0, int((min(r['ov_end'], split) - r['ov_start']).total_seconds() / 60)) if r['ov_start'] < split else 0
+        m2 = max(0, int((r['ov_end'] - max(r['ov_start'], split)).total_seconds() / 60)) if r['ov_end'] > split else 0
+        b['session_morning_minutes_est'] += m1
+        b['session_evening_minutes_est'] += m2
+
+    def peak(a, b):
+        pts = []
+        for r in active:
+            st = max(r['ov_start'], a); en = min(r['ov_end'], b)
+            if en > st:
+                pts.append((st, 1, r['extension']))
+                pts.append((en, -1, r['extension']))
+        pts.sort(key=lambda x: (x[0], -x[1]))
+        cur = set(); mx = 0
+        for t, typ, ext in pts:
+            if typ > 0: cur.add(ext)
+            else: cur.discard(ext)
+            mx = max(mx, len(cur))
+        return mx
+
+    return {'emp_at': emp_at, 'sessions': active, 'by_key': by_key, 'peak_morning': peak(start, split), 'peak_evening': peak(split, end)}
+
+
+def _v50_add_answer(bucket, call):
+    n = bucket
+    n['answered_calls'] += 1
+    if call.get('queue') == '1234': n['orders_calls'] += 1
+    elif call.get('queue') == '123': n['complaints_calls'] += 1
+    if call.get('shift') == 'صباحي': n['morning_calls'] += 1
+    elif call.get('shift') == 'مسائي': n['evening_calls'] += 1
+    pickup = call.get('agent_pickup_seconds')
+    if pickup is not None:
+        n['pickup_total'] += flt(pickup)
+        n['pickup_values'].append(flt(pickup))
+    cust = call.get('customer_wait_seconds')
+    if cust is not None:
+        n['customer_wait_total'] += flt(cust)
+        n['customer_wait_values'].append(flt(cust))
+    talk = flt(call.get('talk_seconds') or 0)
+    n['talk_total'] += talk
+    n['talk_values'].append(talk)
+    n['talk_max'] = max(n['talk_max'], talk)
+    if call.get('new_customer'):
+        n['new_customers'] += 1
+    n['calls'].append(call)
+
+
+@frappe.whitelist()
+def build_snapshot_from_queue_events(target_date=None, events_rel_path=None):
+    target_date = cstr(target_date or _last_complete_date().isoformat())[:10]
+    d, start, split, end = _operational_bounds(target_date)
+    start_s = start.strftime('%Y-%m-%d %H:%M:%S')
+    split_s = split.strftime('%Y-%m-%d %H:%M:%S')
+    end_s = end.strftime('%Y-%m-%d %H:%M:%S')
+    sess = _v50_session_context(start_s, split_s, end_s)
+    emp_at = sess['emp_at']
+
+    events = _read_events(events_rel_path)
+    by_call = _v50_defaultdict(list)
+    event_counts = _v50_Counter(); queue_counts = _v50_Counter()
+    for e in events:
+        event_counts[cstr(e.get('event'))] += 1
+        queue_counts[cstr(e.get('queue'))] += 1
+        cid = cstr(e.get('callid') or '')
+        if cid:
+            by_call[cid].append(e)
+    for cid in by_call:
+        by_call[cid].sort(key=lambda x: flt(x.get('time_epoch') or 0))
+
+    cdr_rows, cdr_error = _cdr_rows(start_s, end_s)
+    cdr_by_uid = {cstr(r.get('uniqueid')): r for r in cdr_rows if r.get('uniqueid')}
+
+    calls = {}
+    long_no_answer_rows = []
+    raw_rna_count = 0
+    raw_rna_by_ext = _v50_Counter()
+    ignored_short_rna = 0
+    seen_long_no_answer = set()
+
+    for cid, evs in by_call.items():
+        phone = ''; did = ''; queue = ''; enter_time = None
+        for e in evs:
+            if not queue and e.get('queue'):
+                queue = cstr(e.get('queue'))
+            if e.get('event') == 'DID' and e.get('data'):
+                did = cstr((e.get('data') or [''])[0])
+            if e.get('event') == 'ENTERQUEUE':
+                enter_time = _parse_dt(e.get('time_text')) or enter_time
+                for x in (e.get('data') or []):
+                    if _v50_re.search(r'\d{5,}', cstr(x)):
+                        phone = cstr(x); break
+        connects = [e for e in evs if e.get('event') == 'CONNECT']
+        completes = [e for e in evs if e.get('event') in ('COMPLETEAGENT', 'COMPLETECALLER')]
+        abandons = [e for e in evs if e.get('event') == 'ABANDON']
+        outcome = 'answered' if connects else ('abandoned' if abandons else 'unknown')
+        cdr = cdr_by_uid.get(cid) or {}
+        if not phone:
+            phone = cstr(cdr.get('src') or cdr.get('cnum') or '')
+        if not queue:
+            queue = cstr(cdr.get('dst') or '')
+
+        # Fair no-answer rings: threshold >= 15 sec, de-duplicated by call+extension.
+        for rn in [x for x in evs if x.get('event') in ('RINGNOANSWER', 'RINGCANCELED', 'AGENTDUMP')]:
+            ext = cstr(rn.get('agent_ext') or _ext_from_agent(rn.get('agent')))
+            if not ext:
+                continue
+            raw_rna_count += 1
+            raw_rna_by_ext[ext] += 1
+            ring_sec = _v50_sec_from_ring_raw(((rn.get('data') or [0])[0] or 0))
+            if ring_sec < V50_NO_ANSWER_THRESHOLD_SECONDS:
+                ignored_short_rna += 1
+                continue
+            dedup_key = (cid, ext)
+            if dedup_key in seen_long_no_answer:
+                continue
+            seen_long_no_answer.add(dedup_key)
+            remp = emp_at(ext, rn.get('time_text'))
+            later = [x for x in evs if flt(x.get('time_epoch') or 0) > flt(rn.get('time_epoch') or 0)]
+            nxt = next((x for x in later if x.get('event') in ('CONNECT', 'ABANDON', 'EXITWITHTIMEOUT', 'EXITEMPTY', 'EXITWITHKEY')), None)
+            fate = 'غير محسوم'; answered_ext = ''
+            if nxt:
+                if nxt.get('event') == 'CONNECT':
+                    answered_ext = cstr(nxt.get('agent_ext') or _ext_from_agent(nxt.get('agent')))
+                    fate = 'تم الرد لاحقًا من نفس التحويلة' if answered_ext == ext else 'تم الرد لاحقًا من تحويلة أخرى'
+                elif nxt.get('event') == 'ABANDON':
+                    fate = 'العميل أغلق بعد الرن'
+                else:
+                    fate = 'انتهت مهلة الطابور بعد الرن'
+            long_no_answer_rows.append({
+                'time': _fmt_dt(rn.get('time_text')),
+                'callid': cid,
+                'queue': queue,
+                'queue_label': QUEUES.get(queue, queue),
+                'caller': normalize_phone(phone),
+                'caller_raw': phone,
+                'extension': ext,
+                'employee': _v50_label(remp, ext),
+                'employee_resolution': 'session_at_ring_time' if remp else 'extension_only',
+                'ring_seconds': ring_sec,
+                'fate': fate,
+                'answered_extension': answered_ext,
+            })
+
+        # One answered row per CONNECT, normally one per callid.
+        if connects:
+            con = connects[0]
+            ans_ext = cstr(con.get('agent_ext') or _ext_from_agent(con.get('agent')))
+            answer_time = _parse_dt(con.get('time_text'))
+            data = con.get('data') or []
+            customer_wait = None; pickup = None
+            try: customer_wait = flt(data[0]) if len(data) > 0 else None
+            except Exception: customer_wait = None
+            try: pickup = flt(data[2]) if len(data) > 2 else None
+            except Exception: pickup = None
+            if customer_wait is None and enter_time and answer_time:
+                customer_wait = max(0, (answer_time - enter_time).total_seconds())
+            talk_seconds = None
+            if completes:
+                comp = completes[-1]
+                cd = comp.get('data') or []
+                try: talk_seconds = flt(cd[1]) if len(cd) > 1 else None
+                except Exception: talk_seconds = None
+            if talk_seconds is None:
+                talk_seconds = flt(cdr.get('billsec') or cdr.get('duration') or 0)
+            emp = emp_at(ans_ext, con.get('time_text')) if ans_ext else ''
+            call = {
+                'callid': cid,
+                'queue': queue,
+                'queue_label': QUEUES.get(queue, queue),
+                'did': did or cstr(cdr.get('did') or ''),
+                'caller_raw': phone,
+                'caller': normalize_phone(phone),
+                'enter_time': _fmt_dt(enter_time or answer_time),
+                'answer_time': _fmt_dt(answer_time),
+                'answered_extension': ans_ext,
+                'answered_employee': _v50_label(emp, ans_ext),
+                # UI compatibility: wait_seconds now means fair employee pickup seconds.
+                'wait_seconds': pickup if pickup is not None else 0,
+                'agent_pickup_seconds': pickup,
+                'customer_wait_seconds': customer_wait,
+                'talk_seconds': talk_seconds or 0,
+                'duration_seconds': flt(cdr.get('duration') or 0) or (talk_seconds or 0),
+                'outcome': outcome,
+                'shift': _shift_name(enter_time or answer_time, target_date),
+                'recording_url': cstr(cdr.get('recording_url') or ''),
+                'recordingfile': cstr(cdr.get('recordingfile') or ''),
+                'employee_resolution': 'session_at_call_time' if emp else 'extension_only',
+                'cdr_found': bool(cdr),
+            }
+            calls[cid] = call
+
+    # Add CDR answered rows not found in queue events. Pickup is unknown, so it does not affect pickup averages.
+    for r in cdr_rows:
+        cid = cstr(r.get('uniqueid') or '')
+        if not cid or cid in calls:
+            continue
+        if cstr(r.get('disposition')).upper() != 'ANSWERED':
+            continue
+        ext = _actual_ext_from_cdr(r)
+        if not ext:
+            continue
+        dt = _parse_dt(r.get('calldate'))
+        phone = cstr(r.get('src') or r.get('cnum') or '')
+        emp = emp_at(ext, _fmt_dt(dt))
+        calls[cid] = {
+            'callid': cid,
+            'queue': cstr(r.get('dst') or ''),
+            'queue_label': QUEUES.get(cstr(r.get('dst') or ''), cstr(r.get('dst') or '')),
+            'did': '',
+            'caller_raw': phone,
+            'caller': normalize_phone(phone),
+            'enter_time': _fmt_dt(dt),
+            'answer_time': _fmt_dt(dt),
+            'answered_extension': ext,
+            'answered_employee': _v50_label(emp, ext),
+            'wait_seconds': None,
+            'agent_pickup_seconds': None,
+            'customer_wait_seconds': None,
+            'talk_seconds': flt(r.get('billsec') or r.get('duration') or 0),
+            'duration_seconds': flt(r.get('duration') or r.get('billsec') or 0),
+            'outcome': 'answered',
+            'shift': _shift_name(dt, target_date),
+            'recording_url': cstr(r.get('recording_url') or ''),
+            'recordingfile': cstr(r.get('recordingfile') or ''),
+            'employee_resolution': 'session_at_call_time' if emp else 'extension_only_cdr_fallback',
+            'cdr_found': True,
+        }
+
+    answered_calls = [c for c in calls.values() if c.get('outcome') == 'answered' and c.get('answered_extension')]
+    phones = sorted({c.get('caller') for c in answered_calls if c.get('caller')})
+    seen_map = _historical_seen_map(phones, start_s)
+    for c in answered_calls:
+        h = seen_map.get(c.get('caller') or '') or {}
+        c['new_customer'] = bool(c.get('caller') and not h.get('seen_before'))
+        c['customer_first_seen_before'] = h.get('first_seen') or ''
+        c['customer_previous_count'] = h.get('previous_count') or 0
+
+    buckets = _v50_defaultdict(lambda: {
+        'key': '', 'employee': '', 'extension': '', 'extensions': set(),
+        'answered_calls': 0, 'orders_calls': 0, 'complaints_calls': 0,
+        'morning_calls': 0, 'evening_calls': 0,
+        'pickup_total': 0, 'pickup_values': [],
+        'customer_wait_total': 0, 'customer_wait_values': [],
+        'talk_total': 0, 'talk_values': [], 'talk_max': 0,
+        'ringnoanswer': 0, 'long_no_answer_rows': [],
+        'raw_ringnoanswer': 0, 'ignored_short_ringnoanswer': 0,
+        'new_customers': 0, 'calls': [],
+    })
+
+    for c in answered_calls:
+        ext = c.get('answered_extension') or ''
+        emp = c.get('answered_employee') if c.get('employee_resolution') == 'session_at_call_time' else ''
+        key = _v50_key(emp, ext)
+        b = buckets[key]
+        b['key'] = key
+        b['employee'] = _v50_label(emp, ext)
+        if ext: b['extensions'].add(ext)
+        _v50_add_answer(b, c)
+
+    for r in long_no_answer_rows:
+        ext = r.get('extension') or ''
+        emp = r.get('employee') if r.get('employee_resolution') == 'session_at_ring_time' else ''
+        key = _v50_key(emp if emp and not emp.startswith('تحويلة ') else '', ext)
+        b = buckets[key]
+        b['key'] = key
+        b['employee'] = _v50_label(emp if emp and not emp.startswith('تحويلة ') else '', ext)
+        if ext: b['extensions'].add(ext)
+        b['ringnoanswer'] += 1
+        b['long_no_answer_rows'].append(r)
+
+    # Attach raw counts as diagnostic-only, not visible as judgement.
+    for ext, cnt in raw_rna_by_ext.items():
+        # attach to extension-only bucket if no exact employee bucket claims it; otherwise add to all buckets containing ext is misleading.
+        key = _v50_key('', ext)
+        buckets[key]['raw_ringnoanswer'] += cnt
+
+    # Session durations / selected extensions.
+    for key, sv in (sess.get('by_key') or {}).items():
+        b = buckets[key]
+        b['key'] = key
+        if sv.get('employee'): b['employee'] = sv.get('employee')
+        b['extensions'].update(sv.get('extensions') or [])
+        b['session_minutes_est'] = sv.get('session_minutes_est') or 0
+        b['session_morning_minutes_est'] = sv.get('session_morning_minutes_est') or 0
+        b['session_evening_minutes_est'] = sv.get('session_evening_minutes_est') or 0
+
+    presence = _load_presence(target_date, start_s, split_s, end_s)
+    for ext, pv in (presence.get('by_extension') or {}).items():
+        for b in buckets.values():
+            if ext in (b.get('extensions') or set()):
+                b['online_minutes_est'] = b.get('online_minutes_est', 0) + (pv.get('online_minutes_est') or 0)
+                b['offline_minutes_est'] = b.get('offline_minutes_est', 0) + (pv.get('offline_minutes_est') or 0)
+
+    employees = []
+    for key, b in buckets.items():
+        exts = sorted([x for x in (b.get('extensions') or set()) if x])
+        # Hide empty pure session rows only if no calls and no long no-answer.
+        if not b.get('answered_calls') and not b.get('ringnoanswer') and not b.get('session_minutes_est'):
+            continue
+        b['extensions'] = exts
+        b['extension'] = ', '.join(exts)
+        if not b.get('employee'):
+            b['employee'] = _v50_label('', exts[0] if exts else '')
+        pv = b.get('pickup_values') or []
+        tv = b.get('talk_values') or []
+        cv = b.get('customer_wait_values') or []
+        b['avg_wait_seconds'] = round(sum(pv) / len(pv), 2) if pv else 0
+        b['wait_min'] = min(pv) if pv else 0
+        b['wait_max'] = max(pv) if pv else 0
+        b['avg_talk_seconds'] = round(sum(tv) / len(tv), 2) if tv else 0
+        b['avg_customer_wait_seconds'] = round(sum(cv) / len(cv), 2) if cv else 0
+        b['max_customer_wait_seconds'] = max(cv) if cv else 0
+        b['longest_call'] = max(b.get('calls') or [], key=lambda x: flt(x.get('talk_seconds') or 0), default=None)
+        b['calls'] = sorted(b.get('calls') or [], key=lambda x: cstr(x.get('enter_time') or ''), reverse=True)
+        b['long_no_answer_rows'] = sorted(b.get('long_no_answer_rows') or [], key=lambda x: cstr(x.get('time') or ''), reverse=True)
+        b['metric_note'] = 'زمن التقاط المكالمة محسوب من لحظة رن التحويلة التي ردت فعليًا، ورن بدون رد لا يحتسب إلا إذا استمر 15 ثانية فأكثر.'
+        # Remove internal lists to keep JSON lighter.
+        b.pop('pickup_values', None); b.pop('talk_values', None); b.pop('customer_wait_values', None)
+        employees.append(dict(b))
+    employees.sort(key=lambda x: (-(cint(x.get('answered_calls') or 0)), -(cint(x.get('ringnoanswer') or 0)), cstr(x.get('employee')), cstr(x.get('extension'))))
+
+    new_customer_calls = [c for c in answered_calls if c.get('new_customer')]
+    pickup_values = [flt(c.get('agent_pickup_seconds')) for c in answered_calls if c.get('agent_pickup_seconds') is not None]
+    customer_wait_values = [flt(c.get('customer_wait_seconds')) for c in answered_calls if c.get('customer_wait_seconds') is not None]
+    talk_values = [flt(c.get('talk_seconds') or 0) for c in answered_calls]
+    slowest = max(answered_calls, key=lambda x: flt(x.get('agent_pickup_seconds') or 0), default=None)
+    fastest = min([c for c in answered_calls if c.get('agent_pickup_seconds') is not None], key=lambda x: flt(x.get('agent_pickup_seconds') or 999999), default=None)
+    longest = max(answered_calls, key=lambda x: flt(x.get('talk_seconds') or 0), default=None)
+    abandoned_count = len([1 for cid, evs in by_call.items() if any(e.get('event') == 'ABANDON' for e in evs) and not any(e.get('event') == 'CONNECT' for e in evs)])
+    morning_keys = {_v50_key(c.get('answered_employee') if c.get('employee_resolution') == 'session_at_call_time' else '', c.get('answered_extension')) for c in answered_calls if c.get('shift') == 'صباحي'}
+    evening_keys = {_v50_key(c.get('answered_employee') if c.get('employee_resolution') == 'session_at_call_time' else '', c.get('answered_extension')) for c in answered_calls if c.get('shift') == 'مسائي'}
+
+    snapshot = {
+        'success': True,
+        'version': 'V50',
+        'generated_at': now_datetime().strftime('%Y-%m-%d %H:%M:%S'),
+        'target_date': target_date,
+        'start_dt': start_s,
+        'split_dt': split_s,
+        'end_dt': end_s,
+        'metric_definitions': {
+            'avg_wait_seconds': 'زمن التقاط الموظف للمكالمة بعد أن رنت على تحويلته، وليس كامل انتظار العميل في الطابور.',
+            'customer_wait_seconds': 'زمن انتظار العميل من دخول الطابور حتى الرد، مؤشر خدمة عامة وليس تقييم موظف منفرد.',
+            'ringnoanswer': 'رن طويل بدون رد: RINGNOANSWER لمدة 15 ثانية أو أكثر، مع حذف التكرار لنفس المكالمة ونفس التحويلة.',
+            'raw_ringnoanswer': 'العدد الخام من Asterisk وقد يحتوي رن 0-2 ثانية وتكرارات؛ لا يستخدم للحكم على الموظف.',
+        },
+        'source': {
+            'events_rel_path': events_rel_path,
+            'events_loaded': len(events),
+            'event_counts': dict(event_counts),
+            'queue_event_counts': dict(queue_counts),
+            'cdr_rows': len(cdr_rows),
+            'cdr_error': cdr_error,
+            'session_rows_used': len(sess.get('sessions') or []),
+            'presence_available': presence.get('available'),
+            'presence_samples': presence.get('samples'),
+            'raw_ringnoanswer_total': raw_rna_count,
+            'ignored_short_ringnoanswer_under_15s': ignored_short_rna,
+            'fair_long_no_answer_total': len(long_no_answer_rows),
+            'no_answer_threshold_seconds': V50_NO_ANSWER_THRESHOLD_SECONDS,
+        },
+        'summary': {
+            'performance_rows_count': len([e for e in employees if cint(e.get('answered_calls') or 0) or cint(e.get('ringnoanswer') or 0)]),
+            'employees_count': len([e for e in employees if cint(e.get('answered_calls') or 0) or cint(e.get('ringnoanswer') or 0)]),
+            'confirmed_employee_rows': len([e for e in employees if cstr(e.get('key')).startswith('emp|') and (cint(e.get('answered_calls') or 0) or cint(e.get('ringnoanswer') or 0))]),
+            'extension_only_rows': len([e for e in employees if cstr(e.get('key')).startswith('ext|') and (cint(e.get('answered_calls') or 0) or cint(e.get('ringnoanswer') or 0))]),
+            'answered_calls': len(answered_calls),
+            'orders_calls': len([c for c in answered_calls if c.get('queue') == '1234']),
+            'complaints_calls': len([c for c in answered_calls if c.get('queue') == '123']),
+            'abandoned_calls': abandoned_count,
+            'ringnoanswer_attempts': len(long_no_answer_rows),
+            'raw_ringnoanswer_attempts': raw_rna_count,
+            'ignored_short_ringnoanswer_under_15s': ignored_short_rna,
+            'new_customers': len(new_customer_calls),
+            'avg_wait_seconds': round(sum(pickup_values) / len(pickup_values), 2) if pickup_values else 0,
+            'avg_customer_wait_seconds': round(sum(customer_wait_values) / len(customer_wait_values), 2) if customer_wait_values else 0,
+            'avg_talk_seconds': round(sum(talk_values) / len(talk_values), 2) if talk_values else 0,
+            'fastest_answer': fastest,
+            'slowest_answer': slowest,
+            'longest_call': longest,
+            'morning': {
+                'from': start_s, 'to': split_s,
+                'answered_calls': len([c for c in answered_calls if c.get('shift') == 'صباحي']),
+                'active_extensions_estimated': len(morning_keys),
+                'peak_selected_extensions': sess.get('peak_morning'),
+                'peak_online_extensions': presence.get('peak_online_morning'),
+            },
+            'evening': {
+                'from': split_s, 'to': end_s,
+                'answered_calls': len([c for c in answered_calls if c.get('shift') == 'مسائي']),
+                'active_extensions_estimated': len(evening_keys),
+                'peak_selected_extensions': sess.get('peak_evening'),
+                'peak_online_extensions': presence.get('peak_online_evening'),
+            },
+        },
+        'employees': employees,
+        'new_customers': sorted(new_customer_calls, key=lambda x: cstr(x.get('enter_time') or '')),
+        'long_no_answer_rows': sorted(long_no_answer_rows, key=lambda x: cstr(x.get('time') or ''), reverse=True),
+        'calls': sorted(answered_calls, key=lambda x: cstr(x.get('enter_time') or ''), reverse=True),
+    }
+    path = _save_snapshot(snapshot, target_date)
+    frappe.db.commit()
+    return {'success': True, 'target_date': target_date, 'path': path, 'version': 'V50', 'summary': snapshot['summary']}
+
+# END ROSHDY EMP PERF FAIR LOGIC V50
+'''
+s=s.rstrip()+"\n\n"+block+"\n"
+p.write_text(s,encoding='utf-8')
+print('patched', p)
+PYPATCH
+
+echo "🧩 Step 2: Polish /employee-performance labels for fair metrics"
+python3 - <<'PYUI'
+from pathlib import Path
+p=Path('/opt/frappe_crm/apps/restaurant_ops/restaurant_ops/www/employee-performance.html')
+s=p.read_text(encoding='utf-8',errors='ignore')
+repls={
+    'عدد الموظفين النشطين':'صفوف أداء نشطة',
+    'عدد الموظفين/التحويلات اللي اشتغلوا':'صفوف أداء نشطة',
+    'متوسط سرعة الرد':'متوسط التقاط المكالمة',
+    'أبطأ رد':'أبطأ التقاط',
+    'أسرع رد':'أسرع التقاط',
+    'متوسط الرد':'متوسط التقاط',
+    'محاولات رن بدون رد':'رن طويل بدون رد',
+    'سرعة الرد':'زمن التقاط الموظف',
+    'مدة المكالمة':'مدة الكلام',
+}
+for a,b in repls.items():
+    s=s.replace(a,b)
+old='يتم عرض الأيام المكتملة فقط لضمان دقة التقييم. اليوم الحالي لا يظهر إلا بعد اكتمال اليوم التشغيلي وانتهاء المعالجة.'
+new='يتم عرض الأيام المكتملة فقط. متوسط التقاط المكالمة محسوب من لحظة رن التحويلة التي ردت فعليًا. و"رن طويل بدون رد" لا يُحسب إلا إذا استمر الرن 15 ثانية أو أكثر مع حذف التكرار.'
+s=s.replace(old,new)
+# Keep details table using c.wait_seconds; now it means pickup seconds by API V50.
+# Make source/hints prefer selected extension peak if no SIP presence.
+s=s.replace("cEmployees.textContent=s.employees_count||0;", "cEmployees.textContent=s.performance_rows_count||s.employees_count||0;")
+s=s.replace("cMorning.textContent=((s.morning||{}).peak_online_extensions ?? (s.morning||{}).active_extensions_estimated ?? 0); cEvening.textContent=((s.evening||{}).peak_online_extensions ?? (s.evening||{}).active_extensions_estimated ?? 0);", "cMorning.textContent=((s.morning||{}).peak_online_extensions ?? (s.morning||{}).peak_selected_extensions ?? (s.morning||{}).active_extensions_estimated ?? 0); cEvening.textContent=((s.evening||{}).peak_online_extensions ?? (s.evening||{}).peak_selected_extensions ?? (s.evening||{}).active_extensions_estimated ?? 0);")
+s=s.replace("cMorningHint.textContent=(s.morning&&s.morning.peak_online_extensions!=null)?'من قراءات التواجد':'تقدير من نشاط المكالمات'; cEveningHint.textContent=(s.evening&&s.evening.peak_online_extensions!=null)?'من قراءات التواجد':'تقدير من نشاط المكالمات';", "cMorningHint.textContent=(s.morning&&s.morning.peak_online_extensions!=null)?'من قراءات التواجد':((s.morning&&s.morning.peak_selected_extensions!=null)?'من تسجيل التحويلات':'تقدير من نشاط المكالمات'); cEveningHint.textContent=(s.evening&&s.evening.peak_online_extensions!=null)?'من قراءات التواجد':((s.evening&&s.evening.peak_selected_extensions!=null)?'من تسجيل التحويلات':'تقدير من نشاط المكالمات');")
+# If V47 modal details exists, add clearer popup note in showEmp.
+s=s.replace("' | رن طويل بدون رد: '+esc(e.ringnoanswer||0)+'", "' | رن طويل بدون رد: '+esc(e.ringnoanswer||0)+'<br>ملاحظة: الرن القصير أقل من 15 ثانية لا يتم احتسابه كرن بدون رد.'+")
+p.write_text(s,encoding='utf-8')
+print('patched', p)
+PYUI
+
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+[[ -n "$APP_OWNER" ]] && chown "$APP_OWNER" "$EMP_API" "$EMP_HTML" 2>/dev/null || true
+
+echo "🧪 Step 3: Syntax validation"
+python3 -m py_compile "$EMP_API"
+bash -n "$EMP_SCRIPT"
+python3 - <<'PYCHECK'
+from pathlib import Path
+s=Path('/opt/frappe_crm/apps/restaurant_ops/restaurant_ops/www/employee-performance.html').read_text(encoding='utf-8',errors='ignore')
+for bad in ['RINGNOANSWER','محاولات رن بدون رد','متوسط سرعة الرد']:
+    if bad in s:
+        raise SystemExit('bad UI text still exists: '+bad)
+print('UI text check OK')
+PYCHECK
+
+echo "🧹 Step 4: Restart ERP services only for API reload"
+bench_exec clear-cache || true
+SERVICES="$(${COMPOSE[@]} ps --services 2>/dev/null || true)"
+for svc in backend frontend websocket queue-short queue-long scheduler; do
+  if grep -qx "$svc" <<< "$SERVICES"; then
+    echo "restart $svc"
+    "${COMPOSE[@]}" restart "$svc" >/dev/null
+  fi
+done
+sleep 10
+bench_exec clear-cache || true
+
+echo "🧩 Step 5: Rebuild yesterday snapshot with fair V50 logic"
+TARGET_DATE="$(date -d 'yesterday' +%F)" "$EMP_SCRIPT" 2>&1 | tee "$BACKUP_DIR/rebuild_yesterday_v50.txt"
+
+echo "🧪 Step 6: Validation"
+VAL_DIR="$BACKUP_DIR/validation"
+mkdir -p "$VAL_DIR"
+set +e
+for page in employee-performance admin-desk call-report; do
+  code="$(curl -k -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$page" 2>/dev/null || echo 000)"
+  echo "$page => $code" | tee -a "$VAL_DIR/page_smoke_checks.txt"
+done
+bench_exec execute restaurant_ops.api.employee_performance_api.get_dashboard | tee "$VAL_DIR/employee_dashboard_v50.json"
+V1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.employee_performance_api.debug_status | tee "$VAL_DIR/employee_debug_status.json"
+V2=${PIPESTATUS[0]}
+set -e
+if [[ $V1 -ne 0 || $V2 -ne 0 ]]; then
+  echo "❌ Employee API validation failed. راجع $VAL_DIR"
+  exit 1
+fi
+
+echo "🏥 Step 7: Health check"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$VAL_DIR/health_asterisk_bridge.json"
+H1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status | tee "$VAL_DIR/health_queue_status.json"
+H2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' | tee "$VAL_DIR/health_call_report.json"
+H3=${PIPESTATUS[0]}
+set -e
+if [[ $H1 -ne 0 || $H2 -ne 0 || $H3 -ne 0 ]]; then
+  echo "⚠️ Health check فيه تحذير/فشل. راجع $VAL_DIR"
+  exit 1
+fi
+
+cat <<EOF
+============================================================
+✅ DONE V50 FAIR LOGIC
+📦 Backup/log folder: $BACKUP_DIR
+✅ Average/Fastest/Slowest pickup now use actual agent pickup seconds from CONNECT
+✅ Long no-answer ring now counts only >=15 seconds and de-duplicates call+extension
+✅ Raw noisy RINGNOANSWER is kept only in source diagnostics, not used for judgement
+✅ Current day snapshot rebuilt
+🛡️ report_api.py / Elastix / CDR / AMI untouched
+============================================================
+EOF

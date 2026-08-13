@@ -1,0 +1,422 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Emergency recovery after V6 admin UI broke /admin-desk with 417.
+# Also fixes Upper Management employee-call issue logic to NOT count generic declined/busy calls as employee mistakes.
+# Safe scope:
+# - Restores/cleans admin-desk and break-admin HTML from latest pre-V6 backup if available.
+# - Removes risky injected floating UI blocks.
+# - Adds only a small safe break panel to /break-admin wrapped in Jinja raw.
+# - Keeps cancellation DocType/API; does not delete data.
+# - Does NOT touch restaurant_ops.api.report_api / Elastix / CDR / AMI config.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "❌ docker compose/docker-compose مش موجود"
+  exit 1
+fi
+
+APP_DIR="$ROOT/apps/$APP"
+PKG_DIR="$APP_DIR/$APP"
+WWW_DIR="$PKG_DIR/www"
+API_DIR="$PKG_DIR/api"
+ADMIN_HTML="$WWW_DIR/admin-desk.html"
+BREAK_ADMIN_HTML="$WWW_DIR/break-admin.html"
+UPPER_API="$API_DIR/upper_management_email_api.py"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/EMERGENCY_RESTORE_ADMIN_STRICT_REPORT_BEFORE_$TS"
+mkdir -p "$BACKUP_DIR"
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend container مش شغال أو مش لاقيه"
+  exit 1
+fi
+
+bench_exec() {
+  "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"
+}
+
+echo "============================================================"
+echo "🚨 Emergency Restore Admin + Strict Report Logic"
+echo "📦 Backup: $BACKUP_DIR"
+echo "============================================================"
+
+for f in "$ADMIN_HTML" "$BREAK_ADMIN_HTML" "$UPPER_API"; do
+  [[ -f "$f" ]] && cp -a "$f" "$BACKUP_DIR/$(basename "$f").current"
+done
+
+export ROOT ADMIN_HTML BREAK_ADMIN_HTML UPPER_API BACKUP_DIR
+python3 - <<'PY'
+# -*- coding: utf-8 -*-
+from pathlib import Path
+import os, glob, shutil, re
+
+root = Path(os.environ["ROOT"])
+admin = Path(os.environ["ADMIN_HTML"])
+break_admin = Path(os.environ["BREAK_ADMIN_HTML"])
+upper_api = Path(os.environ["UPPER_API"])
+backup_dir = Path(os.environ["BACKUP_DIR"])
+
+BLOCKS = [
+    ("<!-- BEGIN ROSHDY ADMIN LIVE TOOLS -->", "<!-- END ROSHDY ADMIN LIVE TOOLS -->"),
+    ("<!-- BEGIN ROSHDY ADMIN DESK V6 POLISH -->", "<!-- END ROSHDY ADMIN DESK V6 POLISH -->"),
+    ("<!-- BEGIN ROSHDY BREAK ADMIN V6 PANEL -->", "<!-- END ROSHDY BREAK ADMIN V6 PANEL -->"),
+    ("<!-- BEGIN ROSHDY BREAK ADMIN SAFE PANEL AFTER 417 -->", "<!-- END ROSHDY BREAK ADMIN SAFE PANEL AFTER 417 -->"),
+]
+
+def remove_blocks_text(s):
+    for a, b in BLOCKS:
+        while a in s and b in s:
+            i = s.index(a)
+            j = s.index(b, i) + len(b)
+            s = s[:i] + "\n" + s[j:]
+    return s
+
+def latest_backup_file(name):
+    patterns = [
+        str(root / "backups" / "FIX_EMAIL_REPORTS_V5_BEFORE_*" / "ui_v6" / f"{name}.before_v6"),
+        str(root / "backups" / "UPPER_MGMT_CANCEL_BREAK_BEFORE_*" / "files" / "apps" / "restaurant_ops" / "restaurant_ops" / "www" / name),
+        str(root / "backups" / "REPORTS_RESET_FIX_ORIGINALS_BEFORE_*" / "files" / "apps" / "restaurant_ops" / "restaurant_ops" / "www" / name),
+    ]
+    found = []
+    for p in patterns:
+        found += glob.glob(p)
+    return Path(sorted(found)[-1]) if found else None
+
+def restore_or_clean(path, name):
+    src = latest_backup_file(name)
+    if src and src.exists():
+        shutil.copy2(str(src), str(path))
+        (backup_dir / f"restore_source_{name}.txt").write_text(str(src), encoding="utf-8")
+    if path.exists():
+        s = path.read_text(encoding="utf-8", errors="ignore")
+        s = remove_blocks_text(s)
+        path.write_text(s, encoding="utf-8")
+
+restore_or_clean(admin, "admin-desk.html")
+restore_or_clean(break_admin, "break-admin.html")
+
+# Add a tiny, safer break panel to /break-admin only. It is wrapped in raw so Jinja will not parse JS braces.
+safe_break_panel = r'''
+<!-- BEGIN ROSHDY BREAK ADMIN SAFE PANEL AFTER 417 -->
+{% raw %}
+<div id="roshdy-safe-break-panel" dir="rtl" style="max-width:1150px;margin:16px auto;padding:14px;background:#fff;border:1px solid #d9dee7;border-radius:14px;font-family:Tahoma,Arial,sans-serif;text-align:right;box-shadow:0 3px 12px rgba(15,23,42,.08)">
+  <h2 style="margin:0 0 8px;color:#0f172a;font-size:20px">⏱️ البريكات النشطة الآن</h2>
+  <div style="color:#64748b;font-size:13px;margin-bottom:10px">المدة والـ Overdue محسوبين من السيرفر، وليس من ساعة جهاز الموظف.</div>
+  <div id="roshdy-safe-break-content">جاري التحميل...</div>
+</div>
+<script>
+(function(){
+  if(window.RoshdySafeBreakPanel417) return;
+  function csrf(){return (window.frappe&&frappe.csrf_token)||window.csrf_token||'';}
+  function esc(s){return String(s||'').replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+  function call(method,args){args=args||{};return fetch('/api/method/'+method,{method:'POST',headers:{'Content-Type':'application/json','X-Frappe-CSRF-Token':csrf()},body:JSON.stringify(args),credentials:'same-origin'}).then(function(r){return r.json();}).then(function(j){if(j.exc){throw j;} return j.message||j;});}
+  function render(res){res=res||{};var rows=res.rows||[], el=document.getElementById('roshdy-safe-break-content'); if(!el)return; if(!rows.length){el.innerHTML='<div style="padding:14px;text-align:center;color:#64748b;background:#f8fafc;border-radius:10px">لا توجد بريكات نشطة حالياً</div>';return;} var html='<div style="margin-bottom:8px"><b>الإجمالي: '+esc(res.active_count||rows.length)+'</b> | <b style="color:#dc2626">عدت الوقت: '+esc(res.overdue_count||0)+'</b></div><div style="overflow:auto"><table style="min-width:850px;width:100%;border-collapse:collapse;font-size:13px"><thead><tr><th>الموظف</th><th>نوع البريك</th><th>بدأ من</th><th>المدة</th><th>الحد</th><th>الحالة</th><th>إجراء</th></tr></thead><tbody>'; rows.forEach(function(r){var over=!!r.overdue;var extra=over?Math.max((Number(r.duration_minutes||0)-Number(r.limit_minutes||0)),0).toFixed(1):'0';html+='<tr style="background:'+(over?'#fef2f2':'#fff')+'"><td>'+esc(r.employee_name||r.employee)+'</td><td>'+esc(r.break_type||'')+'</td><td>'+esc(r.start_time||'')+'</td><td><b>'+esc(r.duration_minutes)+' دقيقة</b></td><td>'+esc(r.limit_minutes)+' دقيقة</td><td>'+(over?'⚠️ عدى الوقت بـ '+extra+' دقيقة':'داخل الوقت')+'</td><td><button data-break="'+esc(r.name)+'" style="background:#dc2626;color:white;border:0;border-radius:8px;padding:7px 10px;cursor:pointer">إنهاء</button></td></tr>';}); html+='</tbody></table></div>'; el.innerHTML=html; el.querySelectorAll('button[data-break]').forEach(function(btn){btn.onclick=function(){if(!confirm('تأكيد إنهاء البريك؟'))return; call('restaurant_ops.api.break_api.admin_end_break',{break_log:btn.getAttribute('data-break')}).then(refresh).catch(function(e){console.error(e);alert('فشل إنهاء البريك');});};});}
+  function refresh(){call('restaurant_ops.api.break_api.get_active_breaks',{}).then(render).catch(function(e){console.error(e);var el=document.getElementById('roshdy-safe-break-content'); if(el)el.innerHTML='<div style="padding:14px;color:#b91c1c;background:#fef2f2;border-radius:10px">فشل تحميل البريكات النشطة</div>';});}
+  window.RoshdySafeBreakPanel417={refresh:refresh}; setTimeout(refresh,500); setInterval(refresh,10000);
+})();
+</script>
+<style>#roshdy-safe-break-panel th{background:#111827;color:#fff;padding:9px;border:1px solid #e5e7eb;text-align:right}#roshdy-safe-break-panel td{padding:8px;border:1px solid #e5e7eb;text-align:right}</style>
+{% endraw %}
+<!-- END ROSHDY BREAK ADMIN SAFE PANEL AFTER 417 -->
+'''
+
+def inject_before_body(path, block):
+    if not path.exists():
+        return
+    s = path.read_text(encoding="utf-8", errors="ignore")
+    s = remove_blocks_text(s)
+    low = s.lower()
+    if "</body>" in low:
+        i = low.rindex("</body>")
+        s = s[:i] + "\n" + block + "\n" + s[i:]
+    else:
+        s = s.rstrip() + "\n" + block + "\n"
+    path.write_text(s, encoding="utf-8")
+
+inject_before_body(break_admin, safe_break_panel)
+
+# Patch upper report logic: only explicit staff_missed/employee missed rows count as employee mistakes.
+if upper_api.exists():
+    s = upper_api.read_text(encoding="utf-8", errors="ignore")
+    start = "# BEGIN ROSHDY STRICT STAFF MISSED ONLY AFTER FALSE POSITIVE"
+    end = "# END ROSHDY STRICT STAFF MISSED ONLY AFTER FALSE POSITIVE"
+    patch = r'''
+# BEGIN ROSHDY STRICT STAFF MISSED ONLY AFTER FALSE POSITIVE
+# Reason: generic declined/busy calls are not necessarily employee cancellations.
+# Upper Management must not blame employees unless Call Report explicitly classifies the call as staff_missed/employee_missed.
+
+
+def _strict_call_report_page_staff_only(date_from=None, date_to=None, smart_category=None, page=1, page_size=5000):
+    try:
+        from restaurant_ops.api import report_api
+    except Exception as e:
+        return {"success": False, "error": f"cannot import report_api: {e}"}
+    base = {"page": page, "page_size": page_size, "view_mode": "admin"}
+    if smart_category:
+        base["smart_category"] = smart_category
+    variants = [
+        {"date_from": cstr(date_from), "date_to": cstr(date_to)},
+        {"from_date": cstr(date_from), "to_date": cstr(date_to)},
+        {"start_date": cstr(date_from), "end_date": cstr(date_to)},
+        {"date": cstr(date_from)},
+        {},
+    ]
+    last = None
+    for dv in variants:
+        kw = dict(base); kw.update(dv)
+        try:
+            return _unwrap_result(report_api.get_calls_report(**kw))
+        except TypeError as e:
+            last = cstr(e); continue
+        except Exception as e:
+            last = cstr(e); continue
+    return {"success": False, "error": last or "unknown report_api error"}
+
+
+def _strict_rows_staff_only(obj):
+    try:
+        return _find_rows(obj) or []
+    except Exception:
+        return []
+
+
+def _strict_report_all_staff_only(start_date, end_date):
+    first = _strict_call_report_page_staff_only(start_date, end_date, page=1, page_size=5000)
+    rows = list(_strict_rows_staff_only(first))
+    summary = first.get("summary") if isinstance(first, dict) and isinstance(first.get("summary"), dict) else {}
+    pagination = first.get("pagination") if isinstance(first, dict) and isinstance(first.get("pagination"), dict) else {}
+    try:
+        total_pages = cint(pagination.get("total_pages") or 1)
+    except Exception:
+        total_pages = 1
+    for page in range(2, min(max(total_pages, 1), 10) + 1):
+        res = _strict_call_report_page_staff_only(start_date, end_date, page=page, page_size=5000)
+        more = _strict_rows_staff_only(res)
+        if not more:
+            break
+        rows.extend(more)
+    return {"first": first, "rows": rows, "summary": summary, "pagination": pagination}
+
+
+def _strict_is_employee_missed(row):
+    if not isinstance(row, dict):
+        return False
+    smart = cstr(row.get("smart_category") or row.get("category") or "").lower().strip()
+    label = cstr(row.get("category_label") or row.get("status_label") or "")
+    # Safe explicit categories only. DO NOT include generic declined/busy.
+    if smart in ("staff_missed", "employee_missed", "agent_missed", "missed_by_employee"):
+        return True
+    if any(x in label for x in ("فائتة من الموظف", "فاتت من موظف", "لم يرد الموظف")):
+        return True
+    return False
+
+
+def _strict_employee_label(row):
+    agent = cstr(row.get("agent_name") or "").strip()
+    if agent:
+        return agent
+    ext = cstr(row.get("actual_ext") or row.get("extension") or "").strip()
+    try:
+        return _employee_name_from_extension(ext) or ext or "غير محدد"
+    except Exception:
+        return ext or "غير محدد"
+
+
+def _strict_issue_row(row):
+    ext = cstr(row.get("actual_ext") or row.get("extension") or "").strip()
+    if not ext:
+        try:
+            ext = _extract_extension(" ".join([cstr(row.get("dstchannel") or ""), cstr(row.get("channel") or "")]))
+        except Exception:
+            ext = ""
+    return {
+        "time": cstr(row.get("calldate") or row.get("call_time") or row.get("time") or ""),
+        "employee": _strict_employee_label(row),
+        "extension": ext,
+        "caller": cstr(row.get("src") or row.get("cnum") or row.get("caller") or ""),
+        "action": "وصلت للموظف ولم يتم الرد عليها",
+        "duration": cstr(row.get("duration") or row.get("ring_seconds") or row.get("ringtime") or ""),
+    }
+
+
+def _strict_queue_match(row, queue):
+    qlist = _as_list(queue) or [DEFAULT_COMPLAINT_QUEUE]
+    dst = cstr(row.get("dst") or "").strip()
+    actual_ext = cstr(row.get("actual_ext") or "").strip()
+    lastdata = cstr(row.get("lastdata") or "")
+    rec = cstr(row.get("recordingfile") or row.get("recording_url") or "")
+    agent_name = cstr(row.get("agent_name") or "")
+    for q in qlist:
+        q = cstr(q).strip()
+        if not q:
+            continue
+        if dst == q:
+            return True
+        if actual_ext == q and "طابور" in agent_name:
+            return True
+        if lastdata.startswith(q + ",") or lastdata.startswith(q + "|"):
+            return True
+        if f"q-{q}-" in rec:
+            return True
+    return False
+
+
+def _r5_get_call_stats(start_date, end_date):
+    data = _strict_report_all_staff_only(start_date, end_date)
+    rows = data.get("rows") or []
+    summary = data.get("summary") or {}
+    pagination = data.get("pagination") or {}
+
+    total = summary.get("total") or pagination.get("total_records") or len(rows)
+    answered = summary.get("answered")
+    if answered is None:
+        answered = 0
+        for r in rows:
+            if cstr(r.get("smart_category") or "").lower() == "answered" or cstr(r.get("disposition") or "").upper() == "ANSWERED" or "تم الرد" in cstr(r.get("category_label") or ""):
+                answered += 1
+
+    # Staff missed count from explicit summary/category only.
+    staff_missed_count = cint(summary.get("staff_missed") or summary.get("employee_missed") or 0)
+
+    missed_filter_rows = []
+    for cat in ("staff_missed", "employee_missed", "agent_missed", "missed_by_employee"):
+        res = _strict_call_report_page_staff_only(start_date, end_date, smart_category=cat, page=1, page_size=5000)
+        missed_filter_rows.extend(_strict_rows_staff_only(res))
+
+    # Deduplicate and verify each row is explicit employee missed.
+    seen, missed_rows = set(), []
+    for r in missed_filter_rows + rows:
+        if not _strict_is_employee_missed(r):
+            continue
+        uid = cstr(r.get("uniqueid") or r.get("name") or f"{r.get('calldate')}|{r.get('src')}|{r.get('actual_ext')}")
+        if uid in seen:
+            continue
+        seen.add(uid)
+        missed_rows.append(_strict_issue_row(r))
+
+    if staff_missed_count == 0 and missed_rows:
+        staff_missed_count = len(missed_rows)
+
+    try:
+        complaint_q = _roshdy_conf_queue("complaint") if "_roshdy_conf_queue" in globals() else DEFAULT_COMPLAINT_QUEUE
+    except Exception:
+        complaint_q = DEFAULT_COMPLAINT_QUEUE
+    complaint_queue_count = sum(1 for r in rows if _strict_queue_match(r, complaint_q))
+
+    return {
+        "total": cint(total or 0),
+        "answered": cint(answered or 0),
+        "declined_count": 0,
+        "staff_missed_count": staff_missed_count,
+        "employee_issue_count": staff_missed_count,
+        "employee_issue_rows": missed_rows,
+        "complaint_queue_count": complaint_queue_count,
+        "complaint_queue": complaint_q,
+        "source": "report_api_staff_missed_only",
+        "report_api_error": data.get("first", {}).get("error") if isinstance(data.get("first"), dict) else None,
+        "note": "Generic declined/busy calls are excluded from employee blame. Only explicit staff_missed/employee_missed counts here.",
+    }
+# END ROSHDY STRICT STAFF MISSED ONLY AFTER FALSE POSITIVE
+'''
+    if start in s and end in s:
+        i = s.index(start)
+        j = s.index(end, i) + len(end)
+        s = s[:i] + patch.strip() + s[j:]
+    else:
+        s = s.rstrip() + "\n\n" + patch.strip() + "\n"
+
+    # Text polish in the current renderer so the report does not imply generic declined/busy are employee cancellations.
+    replacements = {
+        "مكالمات تحتاج مراجعة": "مكالمات فاتت من موظفين",
+        "فاتت من موظف أو تم رفضها/كنسلتها": "وصلت لموظف ولم يتم الرد عليها",
+        "مراجعة المكالمات التي فاتت أو تم رفضها من الموظفين.": "مراجعة المكالمات التي وصلت لموظفين ولم يتم الرد عليها.",
+        "👤 الموظفون والمكالمات التي تحتاج مراجعة": "👤 الموظفون الذين فاتتهم مكالمات",
+        "مرفوض/مكنسل: {_r5_num(declined_count)} | سابها ترن/لم يرد: {_r5_num(staff_missed_count)}": "وصلت لموظف ولم يتم الرد: {_r5_num(staff_missed_count)}",
+    }
+    for old, new in replacements.items():
+        s = s.replace(old, new)
+
+    compile(s, str(upper_api), "exec")
+    upper_api.write_text(s, encoding="utf-8")
+PY
+
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+if [[ -n "$APP_OWNER" ]]; then
+  chown "$APP_OWNER" "$ADMIN_HTML" "$BREAK_ADMIN_HTML" "$UPPER_API" 2>/dev/null || true
+fi
+
+echo "🧹 Clear cache + restart app services"
+bench_exec clear-cache || true
+"${COMPOSE[@]}" restart backend frontend websocket queue-short queue-long scheduler >/dev/null
+sleep 8
+bench_exec clear-cache || true
+
+echo "🧪 Page smoke checks"
+set +e
+for p in login admin-desk break-admin email-report-customizer call-report; do
+  code="$(curl -k -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$p" 2>/dev/null || echo 000)"
+  echo "$p => $code" | tee -a "$BACKUP_DIR/page_smoke_checks.txt"
+done
+set -e
+
+if grep -q "admin-desk => 200" "$BACKUP_DIR/page_smoke_checks.txt"; then
+  echo "✅ admin-desk returned 200"
+else
+  echo "❌ admin-desk still not 200. Collecting recent backend logs..."
+  "${COMPOSE[@]}" logs --tail=250 backend > "$BACKUP_DIR/backend_logs_tail.txt" 2>&1 || true
+  echo "📄 Backend logs saved: $BACKUP_DIR/backend_logs_tail.txt"
+  exit 1
+fi
+
+echo "🧪 Backend validation"
+set +e
+bench_exec execute restaurant_ops.api.break_api.get_active_breaks | tee "$BACKUP_DIR/active_breaks_after_restore.txt"
+V1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.upper_management_email_api.get_upper_management_report_data | tee "$BACKUP_DIR/upper_data_strict_staff_missed.txt"
+V2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.upper_management_email_api.preview_upper_management_report > "$BACKUP_DIR/upper_preview_after_strict.txt" 2>&1
+V3=$?
+head -c 900 "$BACKUP_DIR/upper_preview_after_strict.txt" | tee "$BACKUP_DIR/upper_preview_after_strict_head.txt"
+echo
+set -e
+
+if [[ $V1 -ne 0 || $V2 -ne 0 || $V3 -ne 0 ]]; then
+  echo "❌ Backend validation failed. راجع: $BACKUP_DIR"
+  exit 1
+fi
+
+echo "🏥 Health Check - Elastix/CDR/AMI + Queue + Call Report"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$BACKUP_DIR/health_asterisk_bridge.txt"
+H1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status | tee "$BACKUP_DIR/health_queue_status.txt"
+H2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' | tee "$BACKUP_DIR/health_call_report.txt"
+H3=${PIPESTATUS[0]}
+set -e
+
+if [[ $H1 -ne 0 || $H2 -ne 0 || $H3 -ne 0 ]]; then
+  echo "⚠️ Health returned non-zero. راجع: $BACKUP_DIR"
+else
+  echo "✅ Health checks OK"
+fi
+
+echo "============================================================"
+echo "✅ DONE"
+echo "📦 Backup folder: $BACKUP_DIR"
+echo "🧯 admin-desk restored/cleaned from risky injected UI"
+echo "⏱️ break-admin has a small safe active-break panel"
+echo "📊 Upper report now counts employee mistakes from explicit staff_missed only"
+echo "🛡️ report_api.py لم يتم لمسه"
+echo "============================================================"

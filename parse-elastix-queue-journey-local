@@ -1,0 +1,319 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Local Elastix/Asterisk queue_log journey parser - READ ONLY
+# Run this ON the Elastix server.
+# It reads /var/log/asterisk/queue_log and creates JSON/CSV summaries.
+# No changes to Elastix, Asterisk, CDR, or ERP.
+#
+# Usage:
+#   chmod +x parse-elastix-queue-journey-local
+#   DATE_FROM=2026-08-08 DATE_TO=2026-08-08 QUEUES=1234,123 ./parse-elastix-queue-journey-local
+#
+# Optional extension map, if you want names in this local output:
+#   EXT_MAP='1005=Omar Elboghdady,1013=اسم الموظف,1008=اسم الموظف' ./parse-elastix-queue-journey-local
+
+QUEUE_LOG="${QUEUE_LOG:-/var/log/asterisk/queue_log}"
+DATE_FROM="${DATE_FROM:-$(date +%F)}"
+DATE_TO="${DATE_TO:-$DATE_FROM}"
+QUEUES="${QUEUES:-1234,123}"
+OUT_DIR="${OUT_DIR:-/tmp/ROSHDY_QUEUE_JOURNEY_$(date +%Y%m%d_%H%M%S)}"
+MAX_LINES="${MAX_LINES:-0}"   # 0 = full file for the date; set 300000 for faster tail-based test
+EXT_MAP="${EXT_MAP:-}"
+MASK_PHONES="${MASK_PHONES:-0}" # 1 masks customer numbers in CSV/summary
+
+mkdir -p "$OUT_DIR"
+
+echo "============================================================"
+echo "🔎 Roshdy Queue Journey Parser - READ ONLY"
+echo "📄 queue_log: $QUEUE_LOG"
+echo "📅 Date: $DATE_FROM to $DATE_TO"
+echo "☎️ Queues: $QUEUES"
+echo "📁 Output: $OUT_DIR"
+echo "============================================================"
+
+if [[ ! -f "$QUEUE_LOG" ]]; then
+  echo "❌ queue_log not found: $QUEUE_LOG"
+  exit 1
+fi
+
+python3 - "$QUEUE_LOG" "$DATE_FROM" "$DATE_TO" "$QUEUES" "$OUT_DIR" "$MAX_LINES" "$EXT_MAP" "$MASK_PHONES" <<'PY'
+import sys, os, re, json, csv, datetime
+from collections import defaultdict, Counter
+
+qfile, date_from, date_to, queues_s, out_dir, max_lines_s, ext_map_s, mask_s = sys.argv[1:9]
+queues = {q.strip() for q in queues_s.split(',') if q.strip()}
+max_lines = int(max_lines_s or 0)
+mask_phones = str(mask_s) == '1'
+
+ext_map = {}
+for part in (ext_map_s or '').split(','):
+    if '=' in part:
+        k, v = part.split('=', 1)
+        ext_map[k.strip()] = v.strip()
+
+start = int(datetime.datetime.strptime(date_from + ' 00:00:00', '%Y-%m-%d %H:%M:%S').timestamp())
+end = int(datetime.datetime.strptime(date_to + ' 23:59:59', '%Y-%m-%d %H:%M:%S').timestamp())
+interesting = {
+    'DID','ENTERQUEUE','RINGNOANSWER','RINGCANCELED','AGENTDUMP',
+    'CONNECT','COMPLETECALLER','COMPLETEAGENT','ABANDON','EXITWITHTIMEOUT','EXITEMPTY','EXITWITHKEY','TRANSFER'
+}
+
+def mask_phone(x):
+    x = str(x or '')
+    if not mask_phones:
+        return x
+    digits = re.sub(r'\D+', '', x)
+    if len(digits) <= 4:
+        return x
+    return x[:3] + '****' + x[-4:]
+
+def ext_from_agent(agent):
+    agent = str(agent or '')
+    pats = [r'(?:Local|SIP|PJSIP|Agent)/(\d{3,6})', r'^(\d{3,6})$', r'\b(\d{3,6})\b']
+    for p in pats:
+        m = re.search(p, agent, re.I)
+        if m and m.group(1) not in ('123','1234'):
+            return m.group(1)
+    return ''
+
+def ts_text(t):
+    return datetime.datetime.fromtimestamp(int(t)).strftime('%Y-%m-%d %H:%M:%S')
+
+def employee(ext):
+    if not ext:
+        return 'غير محدد'
+    return ext_map.get(ext) or ('تحويلة ' + ext)
+
+# Efficient read: full file or tail last MAX_LINES lines.
+if max_lines > 0:
+    # Basic tail implementation without shelling out.
+    from collections import deque
+    with open(qfile, 'r', errors='ignore') as f:
+        source_lines = deque(f, maxlen=max_lines)
+else:
+    source_lines = open(qfile, 'r', errors='ignore')
+
+rows = []
+counts = Counter()
+by_queue = defaultdict(Counter)
+line_count = 0
+for line in source_lines:
+    line_count += 1
+    line = line.rstrip('\n')
+    if not line:
+        continue
+    parts = line.split('|')
+    if len(parts) < 5:
+        continue
+    try:
+        t = int(float(parts[0]))
+    except Exception:
+        continue
+    if not (start <= t <= end):
+        continue
+    callid, queue, agent, event = parts[1], parts[2], parts[3], parts[4]
+    if queues and queue not in queues:
+        continue
+    counts[event] += 1
+    by_queue[queue][event] += 1
+    if event not in interesting:
+        continue
+    rows.append({
+        'time_epoch': t,
+        'time_text': ts_text(t),
+        'callid': callid,
+        'queue': queue,
+        'agent': agent,
+        'agent_ext': ext_from_agent(agent),
+        'event': event,
+        'data': parts[5:],
+        'raw': line,
+    })
+
+if max_lines > 0:
+    try:
+        source_lines.clear()
+    except Exception:
+        pass
+else:
+    try:
+        source_lines.close()
+    except Exception:
+        pass
+
+by_call = defaultdict(list)
+for r in rows:
+    by_call[r['callid']].append(r)
+for cid in by_call:
+    by_call[cid].sort(key=lambda x: x['time_epoch'])
+
+def caller_from(evs):
+    for e in evs:
+        if e['event'] == 'ENTERQUEUE':
+            for d in e.get('data') or []:
+                if re.search(r'\d{5,}', d or ''):
+                    return d
+    return ''
+
+attempts = []
+call_summaries = []
+for cid, evs in by_call.items():
+    caller = caller_from(evs)
+    connects = [e for e in evs if e['event'] == 'CONNECT']
+    abandons = [e for e in evs if e['event'] == 'ABANDON']
+    completes = [e for e in evs if e['event'] in ('COMPLETECALLER','COMPLETEAGENT')]
+
+    if connects:
+        final = 'answered'
+        final_ext = connects[-1].get('agent_ext') or ''
+    elif abandons:
+        final = 'customer_abandoned_before_answer'
+        final_ext = ''
+    elif completes:
+        final = 'completed_but_connect_missing'
+        final_ext = ''
+    else:
+        final = 'unknown_or_still_in_queue'
+        final_ext = ''
+
+    call_summaries.append({
+        'callid': cid,
+        'caller': mask_phone(caller),
+        'queue': evs[0]['queue'] if evs else '',
+        'events_count': len(evs),
+        'events': [e['event'] for e in evs],
+        'final_outcome': final,
+        'final_extension': final_ext,
+        'final_employee': employee(final_ext) if final_ext else '',
+    })
+
+    for i, e in enumerate(evs):
+        if e['event'] not in ('RINGNOANSWER','RINGCANCELED','AGENTDUMP'):
+            continue
+        missed_ext = e.get('agent_ext') or ''
+        if not missed_ext:
+            continue
+        later = evs[i+1:]
+        later_connect = next((x for x in later if x['event'] == 'CONNECT'), None)
+        later_abandon = next((x for x in later if x['event'] == 'ABANDON'), None)
+        # EXITWITHTIMEOUT is NOT final by itself; sample logs show timeout cycles before CONNECT.
+        later_timeout_only = next((x for x in later if x['event'] in ('EXITWITHTIMEOUT','EXITEMPTY','EXITWITHKEY')), None)
+        later_complete = next((x for x in later if x['event'] in ('COMPLETECALLER','COMPLETEAGENT')), None)
+
+        if later_connect:
+            fate = 'answered_later'
+            answered_ext = later_connect.get('agent_ext') or ''
+            answered_time = later_connect['time_text']
+        elif later_abandon:
+            fate = 'customer_abandoned_after_attempt'
+            answered_ext = ''
+            answered_time = later_abandon['time_text']
+        elif later_complete:
+            fate = 'completed_after_attempt_connect_missing'
+            answered_ext = ''
+            answered_time = later_complete['time_text']
+        elif later_timeout_only:
+            fate = 'timeout_after_attempt_no_final_connect_seen'
+            answered_ext = ''
+            answered_time = later_timeout_only['time_text']
+        else:
+            fate = 'unknown_after_attempt'
+            answered_ext = ''
+            answered_time = ''
+
+        raw_ring = (e.get('data') or [''])[0] if e.get('data') else ''
+        ring_seconds = ''
+        try:
+            n = int(float(raw_ring or 0))
+            ring_seconds = round(n/1000.0, 1) if n > 1000 else n
+        except Exception:
+            ring_seconds = raw_ring
+
+        attempts.append({
+            'attempt_time': e['time_text'],
+            'callid': cid,
+            'queue': e['queue'],
+            'caller': mask_phone(caller),
+            'missed_extension': missed_ext,
+            'missed_employee': employee(missed_ext),
+            'missed_event': e['event'],
+            'ring_seconds': ring_seconds,
+            'fate': fate,
+            'fate_time': answered_time,
+            'answered_extension': answered_ext,
+            'answered_employee': employee(answered_ext) if answered_ext else '',
+            'final_outcome_for_call': final,
+            'raw_data': e.get('data') or [],
+        })
+
+summary = {
+    'success': True,
+    'queue_log_file': qfile,
+    'date_from': date_from,
+    'date_to': date_to,
+    'queues': sorted(queues),
+    'max_lines': max_lines,
+    'events_loaded': len(rows),
+    'event_counts': dict(counts),
+    'event_counts_by_queue': {q: dict(c) for q, c in by_queue.items()},
+    'calls_seen': len(by_call),
+    'attempts_total': len(attempts),
+    'attempts_by_fate': dict(Counter(a['fate'] for a in attempts)),
+    'attempts_by_missed_extension': [],
+    'attempt_rows_sample': attempts[:300],
+    'call_journey_samples': call_summaries[:200],
+    'can_determine_journey': len(attempts) > 0,
+}
+
+by_ext = defaultdict(lambda: {'extension':'','employee':'','attempts':0,'answered_later':0,'customer_abandoned_after_attempt':0,'timeout_no_final_connect':0,'unknown':0})
+for a in attempts:
+    ext = a['missed_extension']
+    row = by_ext[ext]
+    row['extension'] = ext
+    row['employee'] = a['missed_employee']
+    row['attempts'] += 1
+    if a['fate'] == 'answered_later': row['answered_later'] += 1
+    elif a['fate'] == 'customer_abandoned_after_attempt': row['customer_abandoned_after_attempt'] += 1
+    elif a['fate'] == 'timeout_after_attempt_no_final_connect_seen': row['timeout_no_final_connect'] += 1
+    else: row['unknown'] += 1
+summary['attempts_by_missed_extension'] = sorted(by_ext.values(), key=lambda x: x['attempts'], reverse=True)
+
+json_path = os.path.join(out_dir, 'queue_journey_result.json')
+open(json_path, 'w', encoding='utf-8').write(json.dumps(summary, ensure_ascii=False, indent=2))
+
+csv_path = os.path.join(out_dir, 'queue_journey_attempts.csv')
+with open(csv_path, 'w', newline='', encoding='utf-8-sig') as f:
+    w = csv.DictWriter(f, fieldnames=['attempt_time','queue','caller','missed_extension','missed_employee','ring_seconds','fate','answered_extension','answered_employee','fate_time','callid','final_outcome_for_call'])
+    w.writeheader()
+    for a in attempts:
+        w.writerow({k:a.get(k,'') for k in w.fieldnames})
+
+sum_path = os.path.join(out_dir, 'queue_journey_summary.txt')
+with open(sum_path, 'w', encoding='utf-8') as f:
+    f.write('Date: %s to %s\n' % (date_from, date_to))
+    f.write('Queues: %s\n' % ','.join(sorted(queues)))
+    f.write('Events loaded: %s\n' % len(rows))
+    f.write('Event counts: %s\n' % dict(counts))
+    f.write('Calls seen: %s\n' % len(by_call))
+    f.write('Attempts total: %s\n' % len(attempts))
+    f.write('Attempts by fate: %s\n' % dict(Counter(a['fate'] for a in attempts)))
+    f.write('\nBy missed extension:\n')
+    for row in summary['attempts_by_missed_extension'][:50]: f.write(str(row)+'\n')
+    f.write('\nFirst 30 attempts:\n')
+    for a in attempts[:30]: f.write(str(a)+'\n')
+
+print('JSON:', json_path)
+print('CSV:', csv_path)
+print('SUMMARY:', sum_path)
+print('\n--- SUMMARY ---')
+print(open(sum_path, encoding='utf-8').read())
+PY
+
+echo "============================================================"
+echo "✅ Done"
+echo "📁 Output folder: $OUT_DIR"
+echo "📄 Summary: $OUT_DIR/queue_journey_summary.txt"
+echo "📄 JSON:    $OUT_DIR/queue_journey_result.json"
+echo "📄 CSV:     $OUT_DIR/queue_journey_attempts.csv"
+echo "============================================================"

@@ -1,0 +1,557 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Roshdy V45 FINAL: user-management + shift-wide data + quality food-only + email schedule
+# ------------------------------------------------------------------------------------
+# Fixes:
+# 1) /user-management 417 caused by unsafe template/raw/js fragments -> rebuild clean page.
+# 2) Counters/reports resetting after 00:00 -> add shift utility and patch feedback/cancellations/admin stats to use operational shift date/window.
+# 3) Quality Desk shows only food-quality complaints (جودة الطعام) for quality users.
+# 4) Scheduled daily email time = shift_end_hour + 2 hours, and report data uses shift window.
+#
+# Safety:
+# - Backup first.
+# - Does NOT edit report_api.py.
+# - Does NOT touch Elastix / CDR / AMI config.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+FOOD_CATEGORY="${FOOD_CATEGORY:-جودة الطعام}"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then COMPOSE=(docker compose); else COMPOSE=(docker-compose); fi
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then echo "❌ backend مش شغال"; exit 1; fi
+bench_exec(){ "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"; }
+
+APP_DIR="$ROOT/apps/$APP"
+PKG_DIR="$APP_DIR/$APP"
+API_DIR="$PKG_DIR/api"
+WWW_DIR="$PKG_DIR/www"
+SCRIPTS_DIR="$PKG_DIR/scripts"
+SHIFT_API="$API_DIR/shift_utils_api.py"
+ADMIN_API="$API_DIR/admin_api.py"
+FEEDBACK_API="$API_DIR/feedback_api.py"
+UPPER_API="$API_DIR/upper_management_email_api.py"
+EMAIL_REPORT="$API_DIR/email_report.py"
+QUALITY_API="$API_DIR/quality_api.py"
+USER_HTML="$WWW_DIR/user-management.html"
+USER_PY="$WWW_DIR/user-management.py"
+FEEDBACK_ADMIN_HTML="$WWW_DIR/feedback-admin.html"
+ORDER_CANCEL_HTML="$WWW_DIR/order-cancellations-report.html"
+QUEUE_JOURNEY_HTML="$WWW_DIR/queue-journey-report.html"
+HOOKS="$PKG_DIR/hooks.py"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/FIX_V45_USER_SHIFT_QUALITY_EMAIL_BEFORE_$TS"
+mkdir -p "$BACKUP_DIR/files" "$SCRIPTS_DIR"
+
+echo "============================================================"
+echo "🚀 Roshdy V45: user-management + shift + quality + email schedule"
+echo "📦 Backup: $BACKUP_DIR"
+echo "============================================================"
+
+echo "🧯 Step 1: Backup files + bench backup"
+for f in "$SHIFT_API" "$ADMIN_API" "$FEEDBACK_API" "$UPPER_API" "$EMAIL_REPORT" "$QUALITY_API" "$USER_HTML" "$USER_PY" "$FEEDBACK_ADMIN_HTML" "$ORDER_CANCEL_HTML" "$QUEUE_JOURNEY_HTML" "$HOOKS"; do
+  [[ -e "$f" ]] && cp -a "$f" "$BACKUP_DIR/files/$(basename "$f").before" || true
+done
+bench_exec backup --with-files | tee "$BACKUP_DIR/bench_backup_output.txt"
+
+# -----------------------------------------------------------------------------
+# 2) Shift utility API
+# -----------------------------------------------------------------------------
+echo "🧩 Step 2: Install shift_utils_api.py"
+cat > "$SHIFT_API" <<'PYSHIFT'
+# -*- coding: utf-8 -*-
+from datetime import datetime, time, timedelta
+import frappe
+from frappe.utils import now_datetime, getdate, cstr, cint
+
+
+def _hour(v, default):
+    try:
+        if v is None or v == "": return default
+        if isinstance(v, (int, float)): return int(v)
+        s = cstr(v).strip()
+        if s.isdigit(): return int(s)
+        if ":" in s: return int(s.split(":",1)[0])
+    except Exception:
+        pass
+    return default
+
+
+def get_shift_hours():
+    try:
+        sh = frappe.db.get_single_value("Call Center Settings", "shift_start_hour")
+        eh = frappe.db.get_single_value("Call Center Settings", "shift_end_hour")
+    except Exception:
+        sh, eh = 10, 5
+    sh = _hour(sh, 10); eh = _hour(eh, 5)
+    if not (0 <= sh <= 23): sh = 10
+    if not (0 <= eh <= 23): eh = 5
+    return sh, eh
+
+
+def get_operational_date(ref_dt=None):
+    ref_dt = ref_dt or now_datetime()
+    sh, eh = get_shift_hours()
+    d = ref_dt.date()
+    # If current time is after midnight but before shift end, it belongs to previous operational day.
+    if eh <= sh and ref_dt.time() < time(eh, 0):
+        d = d - timedelta(days=1)
+    return d
+
+
+def get_shift_window(date_from=None, date_to=None):
+    sh, eh = get_shift_hours()
+    if date_from:
+        start_date = getdate(date_from)
+    else:
+        start_date = get_operational_date()
+    if date_to:
+        end_date = getdate(date_to)
+    else:
+        end_date = start_date
+    start_dt = datetime.combine(start_date, time(sh, 0))
+    end_dt = datetime.combine(end_date, time(eh, 0))
+    if end_dt <= start_dt:
+        end_dt += timedelta(days=1)
+    return start_dt, end_dt
+
+
+@frappe.whitelist()
+def get_current_shift_context(date_from=None, date_to=None):
+    start_dt, end_dt = get_shift_window(date_from, date_to)
+    op = start_dt.date()
+    sh, eh = get_shift_hours()
+    return {
+        "success": True,
+        "operational_date": op.isoformat(),
+        "shift_start_hour": sh,
+        "shift_end_hour": eh,
+        "start_dt": start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "end_dt": end_dt.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+PYSHIFT
+
+# -----------------------------------------------------------------------------
+# 3) Rebuild user-management clean page
+# -----------------------------------------------------------------------------
+echo "🧩 Step 3: Rebuild /user-management cleanly"
+cat > "$USER_PY" <<'PYPAGE'
+import frappe
+from restaurant_ops.www._context import protect, ADMIN_ROLES
+no_cache = 1
+
+def get_context(context):
+    protect(context, allowed_roles=ADMIN_ROLES)
+PYPAGE
+
+cat > "$USER_HTML" <<'HTMLUSER'
+<!doctype html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>إدارة المستخدمين</title><style>*{box-sizing:border-box;margin:0;padding:0;font-family:'Segoe UI',Tahoma,Arial}body{background:#f4f7f6;direction:rtl;color:#222}.hdr{background:#24292e;color:white;padding:14px 25px;display:flex;justify-content:space-between;align-items:center;border-bottom:3px solid #1F4E79}.hdr a,.hdr button{background:#1F4E79;color:white;border:0;border-radius:6px;padding:8px 14px;text-decoration:none;cursor:pointer}.wrap{padding:30px;max-width:1450px;margin:auto}.box{background:white;border-radius:14px;box-shadow:0 4px 15px #0001;padding:20px;margin-bottom:20px}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px}label{display:block;font-weight:bold;color:#555;margin-bottom:7px}input,select{width:100%;padding:10px;border:1.5px solid #d0d7de;border-radius:8px}.btn{background:#1F4E79;color:white;border:0;border-radius:8px;padding:9px 14px;font-weight:bold;cursor:pointer;margin:2px}.green{background:#28a745}.red{background:#dc3545}.gray{background:#777}table{width:100%;border-collapse:collapse}th{background:#24292e;color:white;padding:12px;text-align:right}td{padding:10px;border-bottom:1px solid #eee}.roles{font-size:12px;color:#555;max-width:350px}.toast{position:fixed;right:18px;bottom:18px;background:#111827;color:#fff;padding:12px 14px;border-radius:12px;display:none;z-index:99}@media(max-width:800px){.grid{grid-template-columns:1fr}.wrap{padding:12px}table{font-size:12px}}</style></head><body><div class="hdr"><div>👥 مطعم رشدي — إدارة الموظفين واليوزرات</div><div><a href="/admin-desk">🏠 لوحة التحكم</a> <button onclick="doLogout()">خروج</button></div></div><div class="wrap"><h2 style="color:#1F4E79;margin-bottom:20px">إدارة المستخدمين</h2><div class="box"><h3>➕ إضافة موظف جديد</h3><br><div class="grid"><div><label>الإيميل</label><input id="email" placeholder="name@roshdy.com"></div><div><label>الاسم بالكامل</label><input id="fullname"></div><div><label>كلمة المرور</label><input id="pass" type="password"></div><div><label>الدور</label><select id="role"><option>Restaurant Agent</option><option>Call Center Admin</option><option>Break Admin</option><option>Complaint_Quality_User</option><option>Complaint_Finance_User</option></select></div></div><br><button class="btn green" onclick="createUser()">إنشاء المستخدم</button></div><div class="box"><h3>كل المستخدمين <span id="count"></span></h3><br><table><thead><tr><th>المستخدم</th><th>الموظف</th><th>مفعل</th><th>الأدوار</th><th>إجراءات</th></tr></thead><tbody id="tb"><tr><td colspan="5">جاري التحميل...</td></tr></tbody></table></div></div><div id="toast" class="toast"></div><script>function toast(x){var t=document.getElementById('toast');t.textContent=x;t.style.display='block';setTimeout(function(){t.style.display='none'},3500)}function qs(o){var p=new URLSearchParams();Object.keys(o||{}).forEach(function(k){var v=o[k];if(v!==undefined&&v!==null)p.append(k,v)});return p.toString()}async function api(m,args){try{var q=qs(args||{});var r=await fetch('/api/method/'+m+(q?'?'+q:''),{method:'GET',credentials:'same-origin',cache:'no-store'});var j=await r.json();if(j.exc)throw j;return j.message||j}catch(e){console.error(e);return null}}async function guard(){var d=await api('restaurant_ops.api.security_api.get_my_access');if(!d||!d.is_admin){location.replace((d&&d.redirect_target)||'/agent-desk');return false}return true}async function doLogout(){location.href='/roshdy-logout'}function uniqueRows(rows){var seen={},out=[];(rows||[]).forEach(function(u){var k=String((u&&u.name)||'').toLowerCase();if(!k||seen[k])return;seen[k]=1;out.push(u)});return out}async function load(){var ok=await guard();if(!ok)return;var rows=uniqueRows(await api('restaurant_ops.api.admin_api.list_all_users')||[]);count.textContent='('+rows.length+')';tb.innerHTML=rows.length?rows.map(function(u){var a='';if(u.can_disable)a+='<button class="btn '+(u.enabled?'red':'green')+'" onclick="toggleUser(\''+u.name+'\','+(u.enabled?0:1)+')">'+(u.enabled?'تعطيل':'تفعيل')+'</button>';else a+='<button class="btn gray" disabled>محمي</button>';if(u.can_reset_password)a+=' <button class="btn" onclick="resetPass(\''+u.name+'\')">باسورد</button>';return '<tr><td><b>'+u.name+'</b></td><td>'+(u.employee_name||'')+'</td><td>'+(u.enabled?'✅':'⛔')+'</td><td class="roles">'+((u.roles||[]).join(', '))+'</td><td>'+a+'</td></tr>'}).join(''):'<tr><td colspan="5">لا يوجد</td></tr>'}async function createUser(){var r=await api('restaurant_ops.api.admin_api.create_agent',{email:email.value,full_name:fullname.value,password:pass.value,role:role.value});toast(r&&r.success?'تم الإنشاء':((r&&r.message)||'خطأ'));if(r&&r.success)load()}async function toggleUser(u,e){var r=await api('restaurant_ops.api.admin_api.toggle_user',{user_id:u,enabled:e});if(r&&r.success)load();else toast((r&&r.message)||'خطأ')}async function resetPass(u){var p=prompt('كلمة المرور الجديدة');if(!p)return;var r=await api('restaurant_ops.api.admin_api.reset_user_password',{user_id:u,new_password:p});toast(r&&r.success?'تم':((r&&r.message)||'خطأ'))}load();</script></body></html>
+HTMLUSER
+
+# -----------------------------------------------------------------------------
+# 4) Patch APIs for shift-aware feedback/cancellation/admin/email + quality food only
+# -----------------------------------------------------------------------------
+echo "🧩 Step 4: Patch API final V45 overrides"
+cat >> "$FEEDBACK_API" <<'PYFEED'
+
+# BEGIN ROSHDY FEEDBACK SHIFT FINAL V45
+try:
+    import frappe
+    from frappe.utils import today, cstr, cint, flt
+except Exception:
+    pass
+
+
+def _fb45_operational_date(date_value=None):
+    if date_value:
+        return cstr(date_value)[:10]
+    try:
+        from restaurant_ops.api.shift_utils_api import get_current_shift_context
+        return get_current_shift_context().get('operational_date')
+    except Exception:
+        return today()
+
+
+@frappe.whitelist()
+def list_feedback_tasks(feedback_date=None, shift_number=None, include_completed_by_me=1):
+    ensure_feedback_doctype()
+    if not _can_feedback(): frappe.throw('غير مسموح')
+    feedback_date = _fb45_operational_date(feedback_date)
+    filters = {'feedback_date': feedback_date, 'is_active': 1, 'status': 'Pending'}
+    if shift_number: filters['shift_number']=cstr(shift_number).strip()
+    rows=frappe.get_all(FEEDBACK_DT,filters=filters,fields=['name','customer_name','customer_phone','feedback_date','shift_number','status'],order_by='creation asc',limit_page_length=500)
+    done=[]
+    if cint(include_completed_by_me or 0):
+        done_filters={'feedback_date':feedback_date,'status':'Completed','agent_user':frappe.session.user}
+        if shift_number: done_filters['shift_number']=cstr(shift_number).strip()
+        done=frappe.get_all(FEEDBACK_DT,filters=done_filters,fields=['name','customer_name','customer_phone','feedback_date','shift_number','status','rating','satisfaction','details','notes','completed_at'],order_by='completed_at desc',limit_page_length=100)
+    return {'success':True,'operational_date':feedback_date,'pending':rows,'completed_by_me':done,'count':len(rows)}
+
+
+@frappe.whitelist()
+def get_feedback_admin_report(date_from=None,date_to=None,shift_number=None,status=None,agent_user=None,limit=1000):
+    ensure_feedback_doctype()
+    if not _is_admin(): frappe.throw('غير مسموح')
+    df=_fb45_operational_date(date_from); dt=_fb45_operational_date(date_to or df)
+    filters={'feedback_date':['between',[df,dt]]}
+    if shift_number: filters['shift_number']=cstr(shift_number).strip()
+    if status and status not in ('All','الكل'): filters['status']=status
+    if agent_user: filters['agent_user']=agent_user
+    fields=['name','feedback_date','shift_number','customer_name','customer_phone','status','is_active','rating','satisfaction','details','notes','agent_user','agent_employee_name','completed_at','source','import_batch','closed_by','closed_at']
+    rows=frappe.get_all(FEEDBACK_DT,filters=filters,fields=fields,order_by='feedback_date desc, shift_number asc, creation asc',limit_page_length=cint(limit or 1000))
+    completed=[r for r in rows if r.get('status')=='Completed']; pending=[r for r in rows if r.get('status')=='Pending' and cint(r.get('is_active') or 0)]; closed=[r for r in rows if r.get('status')=='Closed' or not cint(r.get('is_active') or 0)]
+    ratings=[flt(r.get('rating') or 0) for r in completed if flt(r.get('rating') or 0)>0]
+    avg=round(sum(ratings)/len(ratings),2) if ratings else 0
+    sat={}; by_agent={}
+    for r in completed:
+        sat[r.get('satisfaction') or 'غير محدد']=sat.get(r.get('satisfaction') or 'غير محدد',0)+1
+        ag=r.get('agent_employee_name') or r.get('agent_user') or 'غير محدد'
+        by_agent.setdefault(ag, {'agent':ag,'count':0,'_ratings':[]}); by_agent[ag]['count']+=1
+        if flt(r.get('rating') or 0)>0: by_agent[ag]['_ratings'].append(flt(r.get('rating')))
+    agents=[]
+    for x in by_agent.values():
+        rs=x.pop('_ratings'); x['avg_rating']=round(sum(rs)/len(rs),2) if rs else 0; agents.append(x)
+    agents.sort(key=lambda x:x['count'], reverse=True)
+    return {'success':True,'period':{'from':df,'to':dt},'summary':{'total':len(rows),'completed':len(completed),'pending':len(pending),'closed':len(closed),'avg_rating':avg,'satisfaction_counts':sat},'by_agent':agents,'rows':rows}
+
+
+@frappe.whitelist()
+def get_feedback_email_summary(date_from=None,date_to=None):
+    ensure_feedback_doctype()
+    df=_fb45_operational_date(date_from); dt=_fb45_operational_date(date_to or df)
+    rows=frappe.get_all(FEEDBACK_DT,filters={'feedback_date':['between',[df,dt]]},fields=['status','is_active','rating','satisfaction','agent_user','agent_employee_name','shift_number'],limit_page_length=5000)
+    completed=[r for r in rows if r.get('status')=='Completed']; pending=[r for r in rows if r.get('status')=='Pending' and cint(r.get('is_active') or 0)]
+    ratings=[flt(r.get('rating') or 0) for r in completed if flt(r.get('rating') or 0)>0]
+    sat={}; by_agent={}; by_shift={}
+    for r in completed:
+        sat[r.get('satisfaction') or 'غير محدد']=sat.get(r.get('satisfaction') or 'غير محدد',0)+1
+        ag=r.get('agent_employee_name') or r.get('agent_user') or 'غير محدد'; by_agent[ag]=by_agent.get(ag,0)+1
+    for r in rows:
+        sh=r.get('shift_number') or 'غير محدد'; by_shift[sh]=by_shift.get(sh,0)+1
+    return {'success':True,'period':{'from':df,'to':dt},'total':len(rows),'completed':len(completed),'pending':len(pending),'avg_rating':round(sum(ratings)/len(ratings),2) if ratings else 0,'satisfaction_counts':sat,'by_agent':by_agent,'by_shift':by_shift}
+# END ROSHDY FEEDBACK SHIFT FINAL V45
+PYFEED
+
+cat >> "$UPPER_API" <<'PYUPPER'
+
+# BEGIN ROSHDY CANCELLATION SHIFT FINAL V45
+try:
+    import frappe
+    from frappe.utils import cstr, cint, get_datetime, now_datetime
+except Exception:
+    pass
+
+
+def _can45_cancel():
+    try:
+        if frappe.session.user=='Administrator': return True
+        return bool(set(frappe.get_roles(frappe.session.user)).intersection({'System Manager','Call Center Admin','Restaurant Manager'}))
+    except Exception: return False
+
+
+def _shift45_window(date_from=None,date_to=None):
+    try:
+        from restaurant_ops.api.shift_utils_api import get_current_shift_context, get_shift_window
+        start,end=get_shift_window(date_from,date_to)
+        return start.strftime('%Y-%m-%d %H:%M:%S'), end.strftime('%Y-%m-%d %H:%M:%S')
+    except Exception:
+        from frappe.utils import today
+        df=cstr(date_from or today())[:10]; dt=cstr(date_to or df)[:10]
+        return df+' 00:00:00', dt+' 23:59:59'
+
+
+@frappe.whitelist()
+def list_order_cancellations(date_from=None,date_to=None,branch=None,shift=None,search=None,limit=500,**kwargs):
+    ensure_order_cancellation_doctype()
+    start_dt,end_dt=_shift45_window(date_from,date_to)
+    filters={'cancellation_time':['between',[start_dt,end_dt]]}
+    if branch: filters['branch']=cstr(branch).strip()
+    if shift and cstr(shift).strip() not in ('All','الكل'): filters['shift']=cstr(shift).strip()
+    fields=['name','order_no','cancellation_time','shift','branch','customer_name','customer_phone','reason','notes','logged_by','creation']
+    try:
+        if frappe.get_meta(CANCELLATION_DOCTYPE).has_field('shift_number'): fields.insert(4,'shift_number')
+    except Exception: pass
+    rows=frappe.get_all(CANCELLATION_DOCTYPE,filters=filters,fields=fields,order_by='cancellation_time desc, creation desc',limit_page_length=cint(limit) or 500)
+    if search:
+        q=cstr(search).lower().strip(); rows=[r for r in rows if q in ' '.join(cstr(r.get(k) or '') for k in ('order_no','shift_number','branch','customer_name','customer_phone','reason','notes','logged_by')).lower()]
+    by_branch={}; by_reason={}
+    for r in rows:
+        b=cstr(r.get('branch') or 'غير محدد'); by_branch[b]=by_branch.get(b,0)+1
+        rr=cstr(r.get('reason') or 'غير محدد'); by_reason[rr]=by_reason.get(rr,0)+1
+    return {'success':True,'period':{'start_dt':start_dt,'end_dt':end_dt},'count':len(rows),'rows':rows,'by_branch':[{'branch':k,'count':v} for k,v in sorted(by_branch.items(),key=lambda x:(-x[1],x[0]))],'by_reason':[{'reason':k,'count':v} for k,v in sorted(by_reason.items(),key=lambda x:(-x[1],x[0]))]}
+# END ROSHDY CANCELLATION SHIFT FINAL V45
+PYUPPER
+
+cat >> "$ADMIN_API" <<'PYADMIN'
+
+# BEGIN ROSHDY ADMIN STATS SHIFT FINAL V45
+try:
+    import frappe
+    from frappe.utils import cstr, cint
+except Exception:
+    pass
+
+
+def _admin45_open_complaints():
+    try:
+        closed=['Closed','Resolved','Done','مغلقة','تم الحل','محلولة','مغلقة/محلولة','مقفولة','Cancelled','Canceled']
+        meta=frappe.get_meta('Call Center Complaint')
+        if meta.has_field('status'): return frappe.db.count('Call Center Complaint', {'status':['not in',closed]}) or 0
+        if meta.has_field('workflow_state'): return frappe.db.count('Call Center Complaint', {'workflow_state':['not in',closed]}) or 0
+        return frappe.db.count('Call Center Complaint') or 0
+    except Exception: return 0
+
+
+def _admin45_shift():
+    try:
+        from restaurant_ops.api.shift_utils_api import get_shift_window
+        s,e=get_shift_window(); return s.strftime('%Y-%m-%d %H:%M:%S'), e.strftime('%Y-%m-%d %H:%M:%S')
+    except Exception:
+        from frappe.utils import today
+        return today()+' 00:00:00', today()+' 23:59:59'
+
+
+@frappe.whitelist()
+def get_admin_dashboard_stats():
+    user=frappe.session.user; emp_name=user
+    try: emp_name=frappe.db.get_value('Employee', {'user_id':user}, 'employee_name') or frappe.db.get_value('User', user, 'full_name') or user
+    except Exception: pass
+    active_breaks=0
+    try:
+        from restaurant_ops.api import break_api
+        active_breaks=cint((break_api.get_active_breaks() or {}).get('active_count') or 0)
+    except Exception: pass
+    s,e=_admin45_shift()
+    resolved=0
+    try:
+        meta=frappe.get_meta('Call Center Complaint'); sf='status' if meta.has_field('status') else None
+        if sf: resolved=frappe.db.count('Call Center Complaint', {'modified':['between',[s,e]], sf:['in',['Closed','Resolved','مغلقة','تم الحل','محلولة']]}) or 0
+    except Exception: pass
+    today_calls=0
+    try:
+        from restaurant_ops.api import report_api
+        # Read broad dates then simple API summary; exact email shift logic is in email report.
+        res=report_api.get_calls_report(page=1,page_size=5,view_mode='admin')
+        if isinstance(res,dict): today_calls=cint((res.get('summary') or {}).get('total') or 0)
+    except Exception: pass
+    return {'success':True,'employee_name':emp_name,'active_breaks':active_breaks,'open_complaints':_admin45_open_complaints(),'today_complaints':resolved,'today_calls':today_calls,'shift_window':{'start_dt':s,'end_dt':e}}
+# END ROSHDY ADMIN STATS SHIFT FINAL V45
+PYADMIN
+
+cat >> "$QUALITY_API" <<'PYQUAL'
+
+# BEGIN ROSHDY QUALITY FOOD ONLY FINAL V45
+try:
+    import frappe
+    from frappe.utils import getdate, add_days, cstr, now_datetime
+    from datetime import datetime, time
+except Exception:
+    pass
+FOOD_QUALITY_CATEGORY_V45 = 'جودة الطعام'
+
+def _q45_roles():
+    try: return set(frappe.get_roles(frappe.session.user))
+    except Exception: return set()
+
+def _q45_allowed():
+    return frappe.session.user=='Administrator' or bool(_q45_roles().intersection({'Complaint_Quality_User','Call Center Admin','System Manager'}))
+
+def _q45_admin():
+    return frappe.session.user=='Administrator' or bool(_q45_roles().intersection({'Call Center Admin','System Manager'}))
+
+def _q45_fields():
+    try: return {df.fieldname for df in frappe.get_meta('Call Center Complaint').fields}
+    except Exception: return set()
+
+def _q45_bounds(date_from=None,date_to=None):
+    df=getdate(date_from) if date_from else getdate().replace(day=1); dt=getdate(date_to) if date_to else getdate(); return datetime.combine(df,time.min), datetime.combine(add_days(dt,1),time.min), df, dt
+
+def _q45_fetch(date_from=None,date_to=None,status='All',priority='All',search='',assigned='All',limit=10000):
+    meta=_q45_fields(); start,end,df,dt=_q45_bounds(date_from,date_to); date_expr='COALESCE(complaint_datetime, creation)' if 'complaint_datetime' in meta else 'creation'
+    where=[f'{date_expr} >= %s', f'{date_expr} < %s']; vals=[start,end]
+    if 'complaint_category' in meta:
+        where.append('complaint_category=%s'); vals.append(FOOD_QUALITY_CATEGORY_V45)
+    if status and status!='All': where.append('status=%s'); vals.append(status)
+    if priority and priority!='All' and 'complaint_priority' in meta: where.append('complaint_priority=%s'); vals.append(priority)
+    if search:
+        like='%'+cstr(search).strip()+'%'; parts=[]
+        for f in ['name','customer_name','phone_number','complaint_details','complaint_category']:
+            if f=='name' or f in meta: parts.append(f'{f} like %s'); vals.append(like)
+        if parts: where.append('('+' or '.join(parts)+')')
+    if assigned=='mine' and 'assigned_quality_inspector' in meta: where.append('assigned_quality_inspector=%s'); vals.append(frappe.session.user)
+    elif assigned=='unassigned' and 'assigned_quality_inspector' in meta: where.append("(assigned_quality_inspector is null or assigned_quality_inspector='')")
+    base=['name','customer_name','phone_number','complaint_source','complaint_category','complaint_priority','status','assigned_quality_inspector','investigation_analysis','corrective_action','complaint_details','complaint_datetime','creation','modified','closing_notes','resolved_by','resolved_at','opened_by_agent','shift','shift_leader','call_record_link']
+    fields=['name']+[f for f in base if f!='name' and f in meta]
+    sql=f"select {', '.join(fields)} from `tabCall Center Complaint` where {' and '.join(where)} order by {date_expr} desc limit {int(limit or 10000)}"
+    rows=frappe.db.sql(sql, vals, as_dict=True)
+    for r in rows: r['dt']=cstr(r.get('complaint_datetime') or r.get('creation') or '')
+    return rows, df, dt
+
+def _q45_stats(rows):
+    st={'total':len(rows),'open':0,'under_review':0,'resolved':0,'urgent':0,'reviewed':0,'unassigned':0,'mine':0,'by_status':{},'by_priority':{},'by_category':{}}
+    for r in rows:
+        status=cstr(r.get('status') or 'غير محدد'); pri=cstr(r.get('complaint_priority') or 'غير محدد'); cat=cstr(r.get('complaint_category') or 'غير محدد')
+        if status in ('Draft','Open','مفتوحة','مفتوح'): st['open']+=1
+        elif status in ('Under Review','قيد المراجعة'): st['under_review']+=1
+        elif status in ('Resolved','Closed','تم الحل','مغلقة','محلولة'): st['resolved']+=1
+        if pri in ('High','Urgent','عالية','عاجلة'): st['urgent']+=1
+        if r.get('investigation_analysis') or r.get('corrective_action'): st['reviewed']+=1
+        if not r.get('assigned_quality_inspector'): st['unassigned']+=1
+        if r.get('assigned_quality_inspector')==frappe.session.user: st['mine']+=1
+        st['by_status'][status]=st['by_status'].get(status,0)+1; st['by_priority'][pri]=st['by_priority'].get(pri,0)+1; st['by_category'][cat]=st['by_category'].get(cat,0)+1
+    return st
+
+@frappe.whitelist(allow_guest=False)
+def get_quality_dashboard(date_from=None,date_to=None,status='All',priority='All',search='',assigned='All',page=1,page_size=200):
+    if not _q45_allowed(): return {'success':False,'message':'Permission denied'}
+    rows_all,df,dt=_q45_fetch(date_from,date_to,status,priority,search,assigned,limit=10000)
+    page=max(1,int(page or 1)); page_size=max(10,min(int(page_size or 200),500)); start=(page-1)*page_size; rows=rows_all[start:start+page_size]
+    emp=frappe.db.get_value('Employee', {'user_id':frappe.session.user}, 'employee_name') or frappe.db.get_value('User',frappe.session.user,'full_name') or frappe.session.user
+    return {'success':True,'employee_name':emp,'user':frappe.session.user,'date_from':cstr(df),'date_to':cstr(dt),'quality_category_filter':FOOD_QUALITY_CATEGORY_V45,'stats':_q45_stats(rows_all),'rows':rows,'total_rows':len(rows_all),'page':page,'page_size':page_size,'total_complaints':len(rows_all),'my_count':len(rows),'my_complaints':rows}
+
+@frappe.whitelist(allow_guest=False)
+def get_quality_stats(date_from=None,date_to=None):
+    d=get_quality_dashboard(date_from=date_from,date_to=date_to,page_size=5000)
+    if not d.get('success'): return d
+    st=d.get('stats') or {}
+    return {'success':True,'employee_name':d.get('employee_name'),'total_complaints':st.get('total',0),'resolved_complaints':st.get('resolved',0),'open_complaints':st.get('open',0)+st.get('under_review',0),'urgent_complaints':st.get('urgent',0),'stats':st,'date_from':d.get('date_from'),'date_to':d.get('date_to'),'quality_category_filter':FOOD_QUALITY_CATEGORY_V45}
+
+@frappe.whitelist(allow_guest=False)
+def get_complaint_full(name):
+    if not _q45_allowed(): return {'success':False,'message':'Permission denied'}
+    if not frappe.db.exists('Call Center Complaint', name): return {'success':False,'message':'Complaint not found'}
+    doc=frappe.get_doc('Call Center Complaint', name)
+    if not _q45_admin() and cstr(getattr(doc,'complaint_category', '')) != FOOD_QUALITY_CATEGORY_V45:
+        return {'success':False,'message':'هذه الشكوى ليست من فئة جودة الطعام'}
+    data=doc.as_dict()
+    try:
+        files=frappe.get_all('File', filters={'attached_to_doctype':'Call Center Complaint','attached_to_name':name}, fields=['name','file_name','file_url','is_private','file_size','creation','owner'], order_by='creation asc', limit_page_length=200)
+    except Exception: files=[]
+    try:
+        comments=frappe.get_all('Comment', filters={'reference_doctype':'Call Center Complaint','reference_name':name}, fields=['name','comment_type','content','owner','creation'], order_by='creation asc', limit_page_length=200)
+    except Exception: comments=[]
+    return {'success':True,'complaint':data,'attachments':files,'comments':comments}
+
+def get_complaint(name): return get_complaint_full(name)
+# END ROSHDY QUALITY FOOD ONLY FINAL V45
+PYQUAL
+
+# -----------------------------------------------------------------------------
+# scheduler job update after shift_end + 2h
+# -----------------------------------------------------------------------------
+echo "🧩 Step 5: Update scheduled email job to shift end + 2 hours"
+cat > "$SCRIPTS_DIR/update_email_schedule_v45.py" <<'PYSCHED'
+import frappe
+from frappe.utils import cint
+
+def execute():
+    try:
+        end_hour = cint(frappe.db.get_single_value('Call Center Settings','shift_end_hour') or 5)
+    except Exception:
+        end_hour = 5
+    send_hour = (end_hour + 2) % 24
+    cron = f"0 {send_hour} * * *"
+    methods = [
+        'restaurant_ops.api.email_report.send_daily_shift_report',
+    ]
+    changed=[]
+    for m in methods:
+        rows=frappe.get_all('Scheduled Job Type', filters={'method':m}, fields=['name','method','frequency','cron_format','stopped'], limit_page_length=20)
+        if not rows:
+            doc=frappe.get_doc({'doctype':'Scheduled Job Type','method':m,'frequency':'Cron','cron_format':cron,'stopped':0})
+            doc.insert(ignore_permissions=True); changed.append({'created':m,'cron':cron})
+        else:
+            for r in rows:
+                frappe.db.set_value('Scheduled Job Type', r.name, {'frequency':'Cron','cron_format':cron,'stopped':0}, update_modified=True)
+                changed.append({'updated':r.name,'method':m,'cron':cron})
+    frappe.db.commit()
+    return {'success':True,'shift_end_hour':end_hour,'send_hour':send_hour,'cron':cron,'changed':changed}
+PYSCHED
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+[[ -n "$APP_OWNER" ]] && chown "$APP_OWNER" "$SCRIPTS_DIR/update_email_schedule_v45.py" 2>/dev/null || true
+bench_exec execute restaurant_ops.scripts.update_email_schedule_v45.execute | tee "$OUT_DIR/update_email_schedule_v45.txt"
+
+# -----------------------------------------------------------------------------
+# page date default patches
+# -----------------------------------------------------------------------------
+echo "🧩 Step 6: Patch page default dates to operational date"
+python3 - <<'PY'
+from pathlib import Path
+pages=[Path('/opt/frappe_crm/apps/restaurant_ops/restaurant_ops/www/feedback-admin.html'),Path('/opt/frappe_crm/apps/restaurant_ops/restaurant_ops/www/order-cancellations-report.html'),Path('/opt/frappe_crm/apps/restaurant_ops/restaurant_ops/www/queue-journey-report.html')]
+block='''
+<!-- BEGIN ROSHDY OPERATIONAL DATE DEFAULT V45 -->
+<script>
+(function(){
+ if(window.RoshdyOperationalDateV45)return; window.RoshdyOperationalDateV45=1;
+ async function setOperationalDate(){
+  try{
+   let r=await fetch('/api/method/restaurant_ops.api.shift_utils_api.get_current_shift_context',{credentials:'same-origin',cache:'no-store'}); let j=await r.json(); let d=j.message||j||{}; let op=d.operational_date;
+   if(!op)return;
+   ['df','dt','add_date'].forEach(function(id){let el=document.getElementById(id); if(el && (!el.dataset.userChanged)){ el.value=op; }});
+   ['df','dt','add_date'].forEach(function(id){let el=document.getElementById(id); if(el){el.onchange=function(){el.dataset.userChanged='1'}}});
+   if(typeof load==='function') setTimeout(load,200);
+  }catch(e){}
+ }
+ setTimeout(setOperationalDate,700);
+})();
+</script>
+<!-- END ROSHDY OPERATIONAL DATE DEFAULT V45 -->
+'''
+for p in pages:
+    if not p.exists(): continue
+    s=p.read_text(encoding='utf-8',errors='ignore')
+    a='<!-- BEGIN ROSHDY OPERATIONAL DATE DEFAULT V45 -->'; b='<!-- END ROSHDY OPERATIONAL DATE DEFAULT V45 -->'
+    while a in s and b in s:
+        i=s.index(a); j=s.index(b,i)+len(b); s=s[:i]+'\n'+s[j:]
+    idx=s.lower().rfind('</body>')
+    if idx>=0: s=s[:idx]+'\n'+block+'\n'+s[idx:]
+    else: s=s+'\n'+block
+    p.write_text(s,encoding='utf-8')
+PY
+
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+[[ -n "$APP_OWNER" ]] && chown "$APP_OWNER" "$SHIFT_API" "$ADMIN_API" "$FEEDBACK_API" "$UPPER_API" "$EMAIL_REPORT" "$QUALITY_API" "$USER_HTML" "$USER_PY" "$SCRIPTS_DIR/update_email_schedule_v45.py" "$FEEDBACK_ADMIN_HTML" "$ORDER_CANCEL_HTML" "$QUEUE_JOURNEY_HTML" 2>/dev/null || true
+
+echo "🧹 Step 7: Clear cache + restart app services"
+bench_exec clear-cache || true
+"${COMPOSE[@]}" restart backend frontend websocket queue-short queue-long scheduler >/dev/null
+sleep 8
+bench_exec clear-cache || true
+
+echo "🧪 Step 8: Validation"
+set +e
+for p in user-management quality-desk feedback-admin order-cancellations-report queue-journey-report email-report-customizer admin-desk; do
+  code="$(curl -k -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$p" 2>/dev/null || echo 000)"
+  echo "$p => $code" | tee -a "$OUT_DIR/page_smoke_checks_v45.txt"
+done
+bench_exec execute restaurant_ops.api.shift_utils_api.get_current_shift_context | tee "$OUT_DIR/current_shift_context_v45.txt"
+V1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.feedback_api.get_feedback_email_summary | tee "$OUT_DIR/feedback_summary_v45.txt"
+V2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.upper_management_email_api.list_order_cancellations | tee "$OUT_DIR/cancellations_shift_v45.txt"
+V3=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.quality_api.get_quality_dashboard --kwargs '{"page_size":5}' | tee "$OUT_DIR/quality_dashboard_v45.txt"
+V4=${PIPESTATUS[0]}
+set -e
+if [[ $V1 -ne 0 || $V2 -ne 0 || $V3 -ne 0 || $V4 -ne 0 ]]; then echo "❌ Validation failed. راجع $OUT_DIR"; exit 1; fi
+
+echo "🏥 Health check"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$OUT_DIR/health_asterisk_bridge.json"
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status | tee "$OUT_DIR/health_queue_status.json"
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' | tee "$OUT_DIR/health_call_report.json"
+set -e
+
+echo "============================================================"
+echo "✅ DONE V45"
+echo "📦 Backup folder: $OUT_DIR"
+echo "✅ user-management rebuilt clean"
+echo "✅ shift utilities applied to feedback/cancellations/admin stats"
+echo "✅ quality-desk API filters category: $FOOD_CATEGORY"
+echo "✅ email scheduled after shift end + 2 hours"
+echo "🛡️ report_api.py / Elastix / CDR / AMI untouched"
+echo "============================================================"

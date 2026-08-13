@@ -1,0 +1,711 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# make-roshdy-golden-installer
+# Run this on the CURRENT stable Roshdy server.
+# It captures the current restaurant_ops app and generates a self-contained installer:
+#   /opt/ROSHDY_GOLDEN_INSTALLER_YYYYMMDD_HHMMSS.run
+# Copy that .run file to a fresh Ubuntu server and run it as root.
+
+CURRENT_ROOT="${CURRENT_ROOT:-/opt/frappe_crm}"
+CURRENT_APP="$CURRENT_ROOT/apps/restaurant_ops"
+TS="$(date +%Y%m%d_%H%M%S)"
+WORK="/opt/roshdy_golden_build_$TS"
+OUT="/opt/ROSHDY_GOLDEN_INSTALLER_$TS.run"
+SHA="$OUT.sha256"
+
+say(){ echo -e "\n============================================================\n$1\n============================================================"; }
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo "❌ شغّل كـ root على السيرفر الحالي: sudo -i ثم ./make-roshdy-golden-installer"
+  exit 1
+fi
+
+say "1) فحص السيرفر الحالي وتجهيز Payload"
+if [[ ! -d "$CURRENT_APP" ]]; then
+  echo "❌ لم أجد التطبيق الحالي: $CURRENT_APP"
+  exit 1
+fi
+mkdir -p "$WORK/payload"
+
+# Capture current custom app exactly as it is now.
+tar --exclude='__pycache__' --exclude='*.pyc' --exclude='.git' --exclude='.pytest_cache' --exclude='.mypy_cache' \
+  -czf "$WORK/payload/restaurant_ops.tar.gz" -C "$CURRENT_ROOT/apps" restaurant_ops
+
+# Optional current references for debugging only.
+[[ -f "$CURRENT_ROOT/docker-compose.yml" ]] && cp -a "$CURRENT_ROOT/docker-compose.yml" "$WORK/payload/docker-compose.current.yml" || true
+[[ -f "/opt/roshdy_social_bridge/gowa-poc/docker-compose.yml" ]] && mkdir -p "$WORK/payload/gowa" && cp -a "/opt/roshdy_social_bridge/gowa-poc/docker-compose.yml" "$WORK/payload/gowa/docker-compose.current.yml" || true
+
+cat > "$WORK/central_elastix_commands_template.txt" <<'TXT'
+ROSHDY / ERPNext — Elastix/Asterisk side commands template
+=========================================================
+Run these on the PBX/Elastix server as root. Replace values with what the installer prints.
+
+1) MySQL CDR read-only user:
+----------------------------
+mysql -uroot -p
+
+CREATE USER IF NOT EXISTS 'ERP_CDR_USER'@'ERP_SERVER_IP' IDENTIFIED BY 'ERP_CDR_PASSWORD';
+GRANT SELECT ON asteriskcdrdb.* TO 'ERP_CDR_USER'@'ERP_SERVER_IP';
+FLUSH PRIVILEGES;
+
+-- Quick test from ERP server:
+mysql -h PBX_IP -u ERP_CDR_USER -pERP_CDR_PASSWORD asteriskcdrdb -e "select count(*) from cdr;"
+
+2) AMI user:
+------------
+Add to /etc/asterisk/manager_custom.conf or /etc/asterisk/manager.conf depending on Elastix version:
+
+[ERP_AMI_USER]
+secret=ERP_AMI_SECRET
+deny=0.0.0.0/0.0.0.0
+permit=ERP_SERVER_IP/255.255.255.255
+read=system,call,log,verbose,command,agent,user,config,dtmf,reporting,cdr,dialplan,originate
+write=system,call,command,agent,user,originate
+
+Then reload:
+asterisk -rx "manager reload"
+asterisk -rx "manager show users"
+
+3) Firewall examples:
+---------------------
+# iptables example:
+iptables -I INPUT -p tcp -s ERP_SERVER_IP --dport 3306 -j ACCEPT
+iptables -I INPUT -p tcp -s ERP_SERVER_IP --dport 5038 -j ACCEPT
+service iptables save || true
+
+# firewalld example:
+firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="ERP_SERVER_IP" port protocol="tcp" port="3306" accept'
+firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="ERP_SERVER_IP" port protocol="tcp" port="5038" accept'
+firewall-cmd --reload
+TXT
+
+say "2) كتابة Installer self-contained"
+cat > "$OUT" <<'INSTALLER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# ROSHDY GOLDEN INSTALLER — generated from a current stable server.
+# Fresh Ubuntu -> Docker ERPNext v15 -> current restaurant_ops payload -> GOWA WhatsApp Web -> diagnostics.
+
+INSTALL_DIR="/opt/frappe_crm"
+SITE_NAME="crm.local"
+ERPNEXT_IMAGE="frappe/erpnext:v15.42.0"
+HTTP_PORT="80"
+DEFAULT_ADMIN_USER="besho"
+DEFAULT_ADMIN_EMAIL="besho@local.local"
+DEFAULT_ADMIN_PASSWORD='Dr@gon123'
+DB_ROOT_PASSWORD="admin"
+MARIADB_ROOT_PASSWORD="admin"
+NUKE_EXISTING="1"
+INSTALL_GOWA="1"
+INSTALL_BROWSER_CONNECTOR="0"
+
+G='\033[0;32m'; Y='\033[1;33m'; R='\033[0;31m'; C='\033[0;36m'; N='\033[0m'
+log(){ echo -e "${G}✅ $*${N}"; }
+warn(){ echo -e "${Y}⚠️  $*${N}"; }
+err(){ echo -e "${R}❌ $*${N}"; }
+step(){ echo -e "\n${C}============================================================\n$*\n============================================================${N}"; }
+ask(){ local var="$1" prompt="$2" def="${3:-}"; local val; if [[ -n "$def" ]]; then read -r -p "$prompt [$def]: " val || true; val="${val:-$def}"; else read -r -p "$prompt: " val || true; fi; printf -v "$var" '%s' "$val"; }
+
+trap 'err "Installer failed at line $LINENO. Check output above. Backup/logs are in /opt/frappe_crm/backups if created."' ERR
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  err "Run as root: sudo -i ثم bash $0"
+  exit 1
+fi
+
+step "🍔 Roshdy Golden Installer — بيانات الموقع الجديد"
+SERVER_IP_AUTO="$(hostname -I 2>/dev/null | awk '{print $1}')"
+[[ -z "$SERVER_IP_AUTO" ]] && SERVER_IP_AUTO="10.11.1.66"
+ask PLACE_NAME "اسم المكان/المطعم الذي سيظهر في الواجهات" "مطعم رشدي"
+ask SITE_NAME "اسم Frappe site" "$SITE_NAME"
+ask SERVER_IP "IP سيرفر ERP الحالي" "$SERVER_IP_AUTO"
+ask HTTP_PORT "HTTP port" "$HTTP_PORT"
+ask PBX_IP "IP السنترال/Elastix" "10.11.1.253"
+ask ORDER_QUEUE "رقم Queue الأوردرات" "1234"
+ask COMPLAINT_QUEUE "رقم Queue الشكاوى" "123"
+ask SIP_FROM "أول رقم SIP Extension" "1001"
+ask SIP_TO "آخر رقم SIP Extension" "1030"
+ask CDR_DB "اسم قاعدة CDR" "asteriskcdrdb"
+ask CDR_USER "يوزر CDR MySQL للـ ERP" "roshdy_cdr"
+ask CDR_PASS "باسورد CDR MySQL" "Dr@gon123"
+ask AMI_USER "يوزر AMI" "erp_ami"
+ask AMI_SECRET "باسورد AMI" "Dr@gon123"
+ask GOWA_USER "GOWA username" "roshdy_admin"
+ask GOWA_PASS "GOWA password" "Roshdy@123"
+ask INSTALL_BROWSER_CONNECTOR "تثبيت Browser Connector التجريبي للفيس/انستا؟ 1 نعم / 0 لا" "$INSTALL_BROWSER_CONNECTOR"
+
+RECORDING_BASE="http://${PBX_IP}/monitor/"
+
+cat <<SUMMARY
+
+==================== SUMMARY ====================
+Place:              $PLACE_NAME
+ERP IP:             $SERVER_IP:$HTTP_PORT
+Site:               $SITE_NAME
+PBX IP:             $PBX_IP
+Queues:             Orders=$ORDER_QUEUE Complaints=$COMPLAINT_QUEUE
+SIP Range:          $SIP_FROM-$SIP_TO
+CDR:                $CDR_DB / $CDR_USER
+AMI:                $AMI_USER / 5038
+Default ERP Login:  besho / Dr@gon123  (also Administrator password = Dr@gon123)
+GOWA:               $GOWA_USER / $GOWA_PASS
+Browser Connector:  $INSTALL_BROWSER_CONNECTOR
+=================================================
+SUMMARY
+read -r -p "نكمل التثبيت؟ اكتب YES: " OK
+[[ "$OK" == "YES" ]] || { echo "Cancelled"; exit 1; }
+
+WORK="/tmp/roshdy_install_payload_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$WORK"
+PAYLOAD_LINE=$(awk '/^__ROSHDY_GOLDEN_PAYLOAD_BELOW__$/ {print NR + 1; exit 0;}' "$0")
+if [[ -z "${PAYLOAD_LINE:-}" ]]; then err "Payload marker not found"; exit 1; fi
+tail -n +"$PAYLOAD_LINE" "$0" | base64 -d | tar -xzf - -C "$WORK"
+
+auto_remove_nextcloud(){
+  step "[0] Removing Nextcloud if found"
+  if snap list 2>/dev/null | awk '{print $1}' | grep -qx nextcloud; then
+    warn "Nextcloud snap found; removing"
+    snap remove nextcloud || true
+  fi
+  mapfile -t NC_CONTAINERS < <(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -Ei 'nextcloud' || true)
+  if [[ "${#NC_CONTAINERS[@]}" -gt 0 ]]; then
+    warn "Nextcloud docker containers found: ${NC_CONTAINERS[*]}"
+    docker rm -f "${NC_CONTAINERS[@]}" || true
+  fi
+}
+
+install_prereqs(){
+  step "[1] Installing host prerequisites + Docker"
+  apt-get update -y
+  apt-get install -y ca-certificates curl gnupg lsb-release git unzip jq python3 python3-pip mariadb-client openssl
+  if ! command -v docker >/dev/null 2>&1; then
+    curl -fsSL https://get.docker.com | sh
+  fi
+  systemctl enable --now docker
+  if ! docker compose version >/dev/null 2>&1; then
+    apt-get install -y docker-compose-plugin
+  fi
+  log "Docker ready: $(docker --version) | $(docker compose version)"
+}
+
+write_central_commands(){
+  step "[2] Writing PBX/Elastix commands"
+  mkdir -p "$INSTALL_DIR"
+  cat > "$INSTALL_DIR/ELASTIX_PBX_COMMANDS_FOR_${PLACE_NAME// /_}.txt" <<EOF
+ROSHDY ERP — PBX/Elastix side commands for $PLACE_NAME
+=====================================================
+ERP Server IP: $SERVER_IP
+PBX IP: $PBX_IP
+CDR DB: $CDR_DB
+CDR User: $CDR_USER
+CDR Pass: $CDR_PASS
+AMI User: $AMI_USER
+AMI Secret: $AMI_SECRET
+Order Queue: $ORDER_QUEUE
+Complaint Queue: $COMPLAINT_QUEUE
+
+1) MySQL CDR user on Elastix:
+----------------------------
+mysql -uroot -p
+CREATE USER IF NOT EXISTS '$CDR_USER'@'$SERVER_IP' IDENTIFIED BY '$CDR_PASS';
+GRANT SELECT ON $CDR_DB.* TO '$CDR_USER'@'$SERVER_IP';
+FLUSH PRIVILEGES;
+exit
+
+Test from ERP server:
+mysql -h $PBX_IP -u $CDR_USER -p'$CDR_PASS' $CDR_DB -e "select count(*) from cdr;"
+
+2) AMI user on Elastix:
+-----------------------
+Add to /etc/asterisk/manager_custom.conf or /etc/asterisk/manager.conf:
+
+[$AMI_USER]
+secret=$AMI_SECRET
+deny=0.0.0.0/0.0.0.0
+permit=$SERVER_IP/255.255.255.255
+read=system,call,log,verbose,command,agent,user,config,dtmf,reporting,cdr,dialplan,originate
+write=system,call,command,agent,user,originate
+
+Reload:
+asterisk -rx "manager reload"
+asterisk -rx "manager show users"
+
+3) Firewall examples:
+---------------------
+iptables -I INPUT -p tcp -s $SERVER_IP --dport 3306 -j ACCEPT
+iptables -I INPUT -p tcp -s $SERVER_IP --dport 5038 -j ACCEPT
+service iptables save || true
+
+firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="$SERVER_IP" port protocol="tcp" port="3306" accept'
+firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="$SERVER_IP" port protocol="tcp" port="5038" accept'
+firewall-cmd --reload
+EOF
+  log "PBX commands: $INSTALL_DIR/ELASTIX_PBX_COMMANDS_FOR_${PLACE_NAME// /_}.txt"
+}
+
+write_compose(){
+  step "[3] Preparing /opt/frappe_crm and compose"
+  if [[ -d "$INSTALL_DIR" && "$NUKE_EXISTING" == "1" ]]; then
+    warn "Existing $INSTALL_DIR found. Backing up then removing stack/volumes."
+    mkdir -p /opt/frappe_crm_old_backups
+    tar -czf "/opt/frappe_crm_old_backups/frappe_crm_before_golden_$(date +%Y%m%d_%H%M%S).tar.gz" -C /opt frappe_crm 2>/dev/null || true
+    (cd "$INSTALL_DIR" && docker compose down -v --remove-orphans) || true
+    rm -rf "$INSTALL_DIR"
+  fi
+  mkdir -p "$INSTALL_DIR/apps" "$INSTALL_DIR/backups"
+  tar -xzf "$WORK/payload/restaurant_ops.tar.gz" -C "$INSTALL_DIR/apps"
+
+  cat > "$INSTALL_DIR/docker-compose.yml" <<EOF
+x-backend-defaults: &backend_defaults
+  image: $ERPNEXT_IMAGE
+  restart: unless-stopped
+  environment:
+    PYTHONPATH: /home/frappe/frappe-bench/apps:/home/frappe/frappe-bench/apps/restaurant_ops
+  volumes:
+    - sites:/home/frappe/frappe-bench/sites
+    - logs:/home/frappe/frappe-bench/logs
+    - ./apps/restaurant_ops:/home/frappe/frappe-bench/apps/restaurant_ops
+  depends_on:
+    - db
+    - redis-cache
+    - redis-queue
+
+x-depends-on-configurator: &depends_on_configurator
+  condition: service_completed_successfully
+
+services:
+  configurator:
+    <<: *backend_defaults
+    entrypoint: ["bash", "-c"]
+    command:
+      - >
+        ls -1 apps > sites/apps.txt;
+        grep -qxF restaurant_ops sites/apps.txt || echo restaurant_ops >> sites/apps.txt;
+        bench set-config -g db_host \$\$DB_HOST;
+        bench set-config -gp db_port \$\$DB_PORT;
+        bench set-config -g redis_cache "redis://\$\$REDIS_CACHE";
+        bench set-config -g redis_queue "redis://\$\$REDIS_QUEUE";
+        bench set-config -g redis_socketio "redis://\$\$REDIS_QUEUE";
+        bench set-config -gp socketio_port \$\$SOCKETIO_PORT;
+    environment:
+      DB_HOST: db
+      DB_PORT: "3306"
+      REDIS_CACHE: redis-cache:6379
+      REDIS_QUEUE: redis-queue:6379
+      SOCKETIO_PORT: "9000"
+    restart: "no"
+
+  backend:
+    <<: *backend_defaults
+    depends_on:
+      configurator: *depends_on_configurator
+
+  frontend:
+    <<: *backend_defaults
+    command: ["nginx-entrypoint.sh"]
+    environment:
+      BACKEND: backend:8000
+      FRAPPE_SITE_NAME_HEADER: $SITE_NAME
+      SOCKETIO: websocket:9000
+      UPSTREAM_REAL_IP_ADDRESS: 127.0.0.1
+      UPSTREAM_REAL_IP_RECURSIVE: "off"
+      UPSTREAM_REAL_IP_HEADER: X-Forwarded-For
+      PROXY_READ_TIMEOUT: "600"
+      CLIENT_MAX_BODY_SIZE: 100m
+    ports:
+      - "$HTTP_PORT:8080"
+    depends_on:
+      - backend
+      - websocket
+
+  websocket:
+    <<: *backend_defaults
+    command: ["node", "/home/frappe/frappe-bench/apps/frappe/socketio.js"]
+    depends_on:
+      configurator: *depends_on_configurator
+
+  queue-short:
+    <<: *backend_defaults
+    command: ["bench", "worker", "--queue", "short,default"]
+    depends_on:
+      configurator: *depends_on_configurator
+
+  queue-long:
+    <<: *backend_defaults
+    command: ["bench", "worker", "--queue", "long,default,short"]
+    depends_on:
+      configurator: *depends_on_configurator
+
+  scheduler:
+    <<: *backend_defaults
+    command: ["bench", "schedule"]
+    depends_on:
+      configurator: *depends_on_configurator
+
+  db:
+    image: mariadb:10.6
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost --password=\$\$MARIADB_ROOT_PASSWORD"]
+      interval: 2s
+      retries: 60
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-character-set-client-handshake
+      - --skip-innodb-read-only-compressed
+    environment:
+      MARIADB_ROOT_PASSWORD: $MARIADB_ROOT_PASSWORD
+    volumes:
+      - db-data:/var/lib/mysql
+
+  redis-cache:
+    image: redis:6.2-alpine
+    restart: unless-stopped
+    volumes: ["redis-cache-data:/data"]
+
+  redis-queue:
+    image: redis:6.2-alpine
+    restart: unless-stopped
+    volumes: ["redis-queue-data:/data"]
+
+volumes:
+  db-data:
+  redis-cache-data:
+  redis-queue-data:
+  sites:
+  logs:
+EOF
+  log "Compose written"
+}
+
+start_stack(){
+  step "[4] Starting ERPNext stack"
+  cd "$INSTALL_DIR"
+  docker compose pull
+  docker compose up -d
+  sleep 15
+  BACKEND=$(docker compose ps -q backend)
+  [[ -n "$BACKEND" ]] || { docker compose ps; err "Backend container not found"; exit 1; }
+  for i in $(seq 1 90); do
+    if docker exec "$BACKEND" bench --version >/dev/null 2>&1; then break; fi
+    sleep 3
+  done
+  docker exec "$BACKEND" bench --version >/dev/null
+  log "Backend ready: $BACKEND"
+}
+
+install_python_deps(){
+  step "[5] Installing dependencies inside Frappe containers"
+  cd "$INSTALL_DIR"
+  for svc in backend queue-short queue-long scheduler; do
+    CID=$(docker compose ps -q "$svc" || true)
+    if [[ -n "$CID" ]]; then
+      docker exec --user root "$CID" bash -lc "apt-get update -qq && apt-get install -y -qq mariadb-client 2>/dev/null || true"
+      docker exec --user frappe "$CID" bash -lc "cd /home/frappe/frappe-bench && /home/frappe/frappe-bench/env/bin/pip install -q pymysql requests -e apps/restaurant_ops || /home/frappe/frappe-bench/env/bin/pip install pymysql requests -e apps/restaurant_ops"
+    fi
+  done
+  log "Dependencies installed"
+}
+
+create_site(){
+  step "[6] Creating site + installing ERPNext/restaurant_ops"
+  cd "$INSTALL_DIR"
+  BACKEND=$(docker compose ps -q backend)
+  if docker exec "$BACKEND" test -d "/home/frappe/frappe-bench/sites/$SITE_NAME"; then
+    warn "Site exists: $SITE_NAME"
+  else
+    docker exec "$BACKEND" bench new-site "$SITE_NAME" --admin-password "$DEFAULT_ADMIN_PASSWORD" --db-root-password "$DB_ROOT_PASSWORD" --install-app erpnext --set-default --no-mariadb-socket
+  fi
+  docker exec "$BACKEND" bash -lc "grep -qxF restaurant_ops /home/frappe/frappe-bench/sites/apps.txt || echo restaurant_ops >> /home/frappe/frappe-bench/sites/apps.txt"
+  docker exec "$BACKEND" bench --site "$SITE_NAME" install-app restaurant_ops || warn "restaurant_ops may already be installed"
+}
+
+write_golden_post_install(){
+  step "[7] Writing golden post-install script inside app"
+  cat > "$INSTALL_DIR/apps/restaurant_ops/restaurant_ops/scripts/golden_post_install.py" <<'PY'
+import os, re, json
+import frappe
+from frappe.utils.password import update_password
+
+ROLES = [
+    "Restaurant Agent", "Call Center Admin", "Break Admin", "Complaint_Finance_User", "Complaint_Quality_User",
+    "Social Inbox Admin", "Social Inbox Supervisor", "Social Inbox Agent", "Social Inbox Viewer"
+]
+
+
+def ensure_role(role):
+    if not frappe.db.exists("Role", role):
+        frappe.get_doc({"doctype": "Role", "role_name": role, "desk_access": 1}).insert(ignore_permissions=True)
+
+
+def ensure_user(email, username, password):
+    if not frappe.db.exists("User", email):
+        doc = frappe.get_doc({
+            "doctype": "User", "email": email, "first_name": username, "username": username, "enabled": 1,
+            "user_type": "System User", "send_welcome_email": 0,
+        }).insert(ignore_permissions=True)
+    else:
+        doc = frappe.get_doc("User", email)
+        doc.enabled = 1
+        doc.user_type = "System User"
+        doc.username = username
+        doc.save(ignore_permissions=True)
+    update_password(email, password)
+    for role in ["System Manager", "Administrator", "Call Center Admin", "Social Inbox Admin", "Social Inbox Supervisor", "Social Inbox Agent"]:
+        try:
+            doc.add_roles(role)
+        except Exception:
+            pass
+
+
+def ensure_sip_range(start, end):
+    if not frappe.db.exists("DocType", "SIP Extension"):
+        return
+    for n in range(int(start), int(end)+1):
+        ext = str(n)
+        if not frappe.db.exists("SIP Extension", ext):
+            try:
+                frappe.get_doc({"doctype": "SIP Extension", "extension_number": ext, "description": f"SIP Extension {ext}", "active": 1, "status": "Free"}).insert(ignore_permissions=True)
+            except Exception:
+                pass
+
+
+def patch_display_name(place):
+    root = os.path.dirname(os.path.dirname(__file__))
+    for dirpath, _, files in os.walk(root):
+        if "__pycache__" in dirpath:
+            continue
+        for fn in files:
+            if not fn.endswith((".html", ".py", ".js", ".json", ".md")):
+                continue
+            p = os.path.join(dirpath, fn)
+            try:
+                data = open(p, "r", encoding="utf-8").read()
+            except Exception:
+                continue
+            new = data.replace("مطعم رشدي", place)
+            # Do NOT replace password strings like Roshdy@123. Only friendly display phrase.
+            new = new.replace("Roshdy Restaurant", place)
+            if new != data:
+                open(p, "w", encoding="utf-8").write(new)
+
+
+def run_known_setup_scripts():
+    known = [
+        "restaurant_ops.scripts.build_all_doctypes.run", "restaurant_ops.scripts.create_roles.run", "restaurant_ops.scripts.seed_data.run",
+        "restaurant_ops.scripts.import_employees.run", "restaurant_ops.scripts.hr_ops_setup.run", "restaurant_ops.scripts.hr_excel_setup.run",
+        "restaurant_ops.scripts.hr_settings_setup.run", "restaurant_ops.scripts.agent_notices_setup.run", "restaurant_ops.scripts.branch_availability_setup.run",
+        "restaurant_ops.scripts.social_inbox_setup.run", "restaurant_ops.scripts.social_inbox_nuclear_fix.run", "restaurant_ops.scripts.social_retention_setup_force.run",
+        "restaurant_ops.scripts.customer_lookup_setup.run",
+    ]
+    for method in known:
+        try:
+            frappe.get_attr(method)()
+            print("OK", method)
+        except Exception as e:
+            print("SKIP", method, str(e)[:180])
+
+
+def run(place_name="مطعم رشدي", admin_email="besho@local.local", admin_username="besho", admin_password="Dr@gon123", sip_from="1001", sip_to="1030"):
+    for r in ROLES:
+        ensure_role(r)
+    frappe.db.commit()
+    ensure_user(admin_email, admin_username, admin_password)
+    try:
+        update_password("Administrator", admin_password)
+    except Exception:
+        pass
+    frappe.db.commit()
+    patch_display_name(place_name)
+    run_known_setup_scripts()
+    ensure_sip_range(sip_from, sip_to)
+    frappe.db.commit()
+    return {"success": True, "place_name": place_name, "admin_email": admin_email, "username": admin_username, "sip_from": sip_from, "sip_to": sip_to}
+PY
+}
+
+configure_site(){
+  step "[8] Configuring site, PBX, queues, default user, and current code"
+  cd "$INSTALL_DIR"
+  BACKEND=$(docker compose ps -q backend)
+  docker exec "$BACKEND" bench --site "$SITE_NAME" set-config host_name "http://$SERVER_IP"
+  docker exec "$BACKEND" bench --site "$SITE_NAME" set-config restaurant_place_name "$PLACE_NAME"
+  docker exec "$BACKEND" bench --site "$SITE_NAME" set-config asterisk_host "$PBX_IP"
+  docker exec "$BACKEND" bench --site "$SITE_NAME" set-config asterisk_db_name "$CDR_DB"
+  docker exec "$BACKEND" bench --site "$SITE_NAME" set-config asterisk_db_user "$CDR_USER"
+  docker exec "$BACKEND" bench --site "$SITE_NAME" set-config asterisk_db_password "$CDR_PASS"
+  docker exec "$BACKEND" bench --site "$SITE_NAME" set-config asterisk_ami_port "5038"
+  docker exec "$BACKEND" bench --site "$SITE_NAME" set-config asterisk_ami_user "$AMI_USER"
+  docker exec "$BACKEND" bench --site "$SITE_NAME" set-config asterisk_ami_secret "$AMI_SECRET"
+  docker exec "$BACKEND" bench --site "$SITE_NAME" set-config asterisk_recording_web_base "$RECORDING_BASE"
+  docker exec "$BACKEND" bench --site "$SITE_NAME" set-config queue_orders "$ORDER_QUEUE"
+  docker exec "$BACKEND" bench --site "$SITE_NAME" set-config queue_complaints "$COMPLAINT_QUEUE"
+  docker exec "$BACKEND" bench --site "$SITE_NAME" execute restaurant_ops.scripts.golden_post_install.run --kwargs "{\"place_name\":\"$PLACE_NAME\",\"admin_email\":\"$DEFAULT_ADMIN_EMAIL\",\"admin_username\":\"$DEFAULT_ADMIN_USER\",\"admin_password\":\"$DEFAULT_ADMIN_PASSWORD\",\"sip_from\":\"$SIP_FROM\",\"sip_to\":\"$SIP_TO\"}"
+
+  # Patch common hardcoded old IP only; queue IDs are stored in site_config and current app usually defaults to 123/1234.
+  if [[ "$PBX_IP" != "10.11.1.253" ]]; then
+    python3 - <<PY2
+from pathlib import Path
+root=Path('$INSTALL_DIR/apps/restaurant_ops')
+for p in root.rglob('*'):
+    if p.is_file() and p.suffix in ('.py','.html','.js','.json'):
+        try: s=p.read_text()
+        except Exception: continue
+        ns=s.replace('10.11.1.253','$PBX_IP')
+        if ns!=s: p.write_text(ns)
+PY2
+  fi
+  docker exec "$BACKEND" bash -lc "find /home/frappe/frappe-bench/apps/restaurant_ops -name '*.pyc' -delete; find /home/frappe/frappe-bench/apps/restaurant_ops -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true"
+  docker exec "$BACKEND" bench --site "$SITE_NAME" migrate
+}
+
+install_gowa(){
+  [[ "$INSTALL_GOWA" == "1" ]] || return 0
+  step "[9] Installing GOWA WhatsApp Web bridge"
+  GROOT="/opt/roshdy_social_bridge/gowa-poc"
+  mkdir -p "$GROOT/gowa/storages" "$GROOT/gowa/statics" "$GROOT/collector/data"
+  cat > "$GROOT/.env" <<EOF
+GOWA_IMAGE=aldinokemal2104/go-whatsapp-web-multidevice:v8.11.0
+GOWA_BIND=0.0.0.0
+GOWA_PORT=33030
+COLLECTOR_PORT=33031
+GOWA_USER=$GOWA_USER
+GOWA_PASS=$GOWA_PASS
+APP_BASIC_AUTH=$GOWA_USER:$GOWA_PASS
+WHATSAPP_WEBHOOK_SECRET=$(openssl rand -hex 24)
+EOF
+  chmod 600 "$GROOT/.env"
+  cat > "$GROOT/docker-compose.yml" <<'YAML'
+name: roshdy_social_poc
+services:
+  webhook_collector:
+    image: python:3.12-alpine
+    container_name: roshdy-social-webhook
+    restart: unless-stopped
+    working_dir: /app
+    command: ["python", "-u", "/app/collector.py"]
+    environment:
+      WEBHOOK_SECRET: "${WHATSAPP_WEBHOOK_SECRET}"
+      LOG_FILE: "/data/webhook_events.jsonl"
+    volumes:
+      - ./collector/collector.py:/app/collector.py:ro
+      - ./collector/data:/data
+    ports:
+      - "127.0.0.1:${COLLECTOR_PORT:-33031}:9001"
+  gowa:
+    image: "${GOWA_IMAGE}"
+    container_name: roshdy-gowa
+    restart: unless-stopped
+    depends_on: [webhook_collector]
+    ports:
+      - "${GOWA_BIND:-0.0.0.0}:${GOWA_PORT:-33030}:3000"
+    environment:
+      APP_HOST: "0.0.0.0"
+      APP_PORT: "3000"
+      APP_OS: "Roshdy Social Bridge"
+      APP_BASIC_AUTH: "${APP_BASIC_AUTH}"
+      DB_URI: "file:storages/whatsapp.db?_foreign_keys=on"
+      DB_KEYS_URI: "file:storages/whatsapp-keys.db?_foreign_keys=on"
+      WHATSAPP_WEBHOOK: "http://webhook_collector:9001/webhook,http://frappe_crm-frontend-1:8080/api/method/restaurant_ops.api.social_inbox_api.webhook"
+      WHATSAPP_WEBHOOK_SECRET: "${WHATSAPP_WEBHOOK_SECRET}"
+      WHATSAPP_WEBHOOK_EVENTS: "message,message.reaction,message.revoked,message.edited,message.ack,message.deleted,chat_presence,call.offer"
+      WHATSAPP_AUTO_MARK_READ: "false"
+      WHATSAPP_AUTO_DOWNLOAD_MEDIA: "true"
+      WHATSAPP_AUTO_REJECT_CALL: "false"
+      WHATSAPP_PRESENCE_ON_CONNECT: "unavailable"
+    volumes:
+      - ./gowa/storages:/app/storages
+      - ./gowa/statics:/app/statics
+YAML
+  cat > "$GROOT/collector/collector.py" <<'PY'
+import json, os, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+LOG_FILE=os.environ.get('LOG_FILE','/data/webhook_events.jsonl')
+os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+class H(BaseHTTPRequestHandler):
+    def _j(self,c,d):
+        b=json.dumps(d,ensure_ascii=False).encode(); self.send_response(c); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(b))); self.end_headers(); self.wfile.write(b)
+    def do_GET(self): self._j(200, {'success':True,'service':'collector','time':time.time()})
+    def do_POST(self):
+        n=int(self.headers.get('Content-Length','0') or '0'); body=self.rfile.read(n)
+        try: data=json.loads(body.decode() or '{}')
+        except Exception: data={'raw':body.decode(errors='replace')}
+        with open(LOG_FILE,'a',encoding='utf-8') as f: f.write(json.dumps({'received_at':time.strftime('%F %T'),'payload':data},ensure_ascii=False)+'\n')
+        self._j(200, {'success':True})
+ThreadingHTTPServer(('0.0.0.0',9001),H).serve_forever()
+PY
+  (cd "$GROOT" && docker compose up -d)
+  log "GOWA ready: http://$SERVER_IP:33030 | $GOWA_USER / $GOWA_PASS"
+}
+
+finalize(){
+  step "[10] Final restart and validation"
+  cd "$INSTALL_DIR"
+  docker compose restart backend frontend websocket queue-short queue-long scheduler
+  sleep 20
+  BACKEND=$(docker compose ps -q backend)
+  for page in login admin-desk social-inbox social-settings call-report; do
+    code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$page" || true)
+    echo "$page => $code"
+  done
+  echo "--- Asterisk diagnostics ---"
+  docker exec "$BACKEND" bench --site "$SITE_NAME" execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics || true
+  echo "--- Queue status ---"
+  docker exec "$BACKEND" bench --site "$SITE_NAME" execute restaurant_ops.api.queue_api.get_queue_status || true
+  echo "--- Call report sample ---"
+  docker exec "$BACKEND" bench --site "$SITE_NAME" execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' || true
+  cat <<DONE
+
+============================================================
+✅ INSTALLATION DONE
+============================================================
+URL: http://$SERVER_IP
+ERP Login: besho / Dr@gon123
+Administrator password: Dr@gon123
+GOWA WhatsApp: http://$SERVER_IP:33030  ($GOWA_USER / $GOWA_PASS)
+PBX commands file: $INSTALL_DIR/ELASTIX_PBX_COMMANDS_FOR_${PLACE_NAME// /_}.txt
+============================================================
+DONE
+}
+
+auto_remove_nextcloud
+install_prereqs
+write_central_commands
+write_compose
+start_stack
+install_python_deps
+create_site
+write_golden_post_install
+configure_site
+install_gowa
+finalize
+
+exit 0
+__ROSHDY_GOLDEN_PAYLOAD_BELOW__
+INSTALLER
+
+# Append payload as base64 tar.gz: contains payload/restaurant_ops.tar.gz and helper docs.
+tar -czf "$WORK/full_payload.tar.gz" -C "$WORK" payload
+base64 "$WORK/full_payload.tar.gz" >> "$OUT"
+chmod +x "$OUT"
+sha256sum "$OUT" > "$SHA"
+
+say "3) تم إنشاء Installer"
+echo "Installer: $OUT"
+echo "SHA256:    $SHA"
+echo
+cat <<NEXT
+انسخ الملفين دول للسيرفر الجديد:
+  $OUT
+  $SHA
+
+على السيرفر الجديد:
+  sudo -i
+  chmod +x $(basename "$OUT")
+  ./$(basename "$OUT")
+
+ملحوظة: السكريبت هيسألك عن اسم المكان، IP السنترال، queues، SIP range، وبيانات CDR/AMI.
+NEXT

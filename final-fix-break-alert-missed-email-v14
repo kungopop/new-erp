@@ -1,0 +1,837 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Roshdy V14 FINAL:
+# - Fix admin-ended break full-screen alert on /my-break and /agent-desk, based on PHP tracker logic.
+# - Make break logs clearly show employee close vs admin close: closed_by + closure_type.
+# - Upper Management email uses SAME source as Customer Service report for employee missed attempts:
+#   report_api.get_staff_missed_attempts(date_from,date_to,15)
+#   so the two emails cannot disagree anymore.
+# - Hidden/non-deliverable report recipients are filtered from sends.
+# - Optional cleanup of old failed backup folders (dry-run by default).
+# Safety:
+# - Backup first.
+# - Does NOT edit restaurant_ops.api.report_api.
+# - Does NOT touch Elastix/CDR/AMI config.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+CLEAN_OLD_FAILED_BACKUPS="${CLEAN_OLD_FAILED_BACKUPS:-0}"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "❌ docker compose/docker-compose مش موجود"
+  exit 1
+fi
+
+APP_DIR="$ROOT/apps/$APP"
+PKG_DIR="$APP_DIR/$APP"
+WWW_DIR="$PKG_DIR/www"
+API_DIR="$PKG_DIR/api"
+SCRIPTS_DIR="$PKG_DIR/scripts"
+BREAK_API="$API_DIR/break_api.py"
+UPPER_API="$API_DIR/upper_management_email_api.py"
+EMAIL_REPORT="$API_DIR/email_report.py"
+MY_BREAK_HTML="$WWW_DIR/my-break.html"
+AGENT_HTML="$WWW_DIR/agent-desk.html"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/FINAL_V14_BREAK_ALERT_MISSED_EMAIL_BEFORE_$TS"
+mkdir -p "$BACKUP_DIR" "$SCRIPTS_DIR"
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend container مش شغال أو مش لاقيه"
+  exit 1
+fi
+
+bench_exec() {
+  "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"
+}
+
+echo "============================================================"
+echo "🚀 Roshdy FINAL V14: break alert + missed employees + email recipients"
+echo "📦 Backup: $BACKUP_DIR"
+echo "============================================================"
+
+echo "🧯 Step 1: Backup files + bench backup"
+for f in "$BREAK_API" "$UPPER_API" "$EMAIL_REPORT" "$MY_BREAK_HTML" "$AGENT_HTML"; do
+  [[ -f "$f" ]] && cp -a "$f" "$BACKUP_DIR/$(basename "$f").before"
+done
+bench_exec backup --with-files | tee "$BACKUP_DIR/bench_backup_output.txt"
+
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+
+echo "🧱 Step 2: Ensure break admin-alert fields exist"
+cat > "$SCRIPTS_DIR/setup_break_alert_fields_v14.py" <<'PY'
+import frappe
+from frappe.custom.doctype.custom_field.custom_field import create_custom_field
+
+def execute():
+    dt = "Employee Break Log"
+    if not frappe.db.exists("DocType", dt):
+        return {"success": False, "error": "Employee Break Log not found"}
+    meta = frappe.get_meta(dt)
+    fields = {
+        "admin_close_target_user": {"label": "Admin Close Target User", "fieldtype": "Data", "insert_after": "closure_type"},
+        "admin_close_acknowledged": {"label": "Admin Close Acknowledged", "fieldtype": "Check", "default": "0", "insert_after": "admin_close_target_user"},
+        "admin_close_acknowledged_at": {"label": "Admin Close Acknowledged At", "fieldtype": "Datetime", "insert_after": "admin_close_acknowledged"},
+        "admin_close_message": {"label": "Admin Close Message", "fieldtype": "Small Text", "insert_after": "admin_close_acknowledged_at"},
+    }
+    made = []
+    for fn, df in fields.items():
+        if not meta.has_field(fn) and not frappe.db.exists("Custom Field", {"dt": dt, "fieldname": fn}):
+            data = dict(df)
+            data["fieldname"] = fn
+            create_custom_field(dt, data, ignore_validate=True)
+            made.append(fn)
+    frappe.db.commit()
+    frappe.clear_cache(doctype=dt)
+    return {"success": True, "created": made}
+PY
+[[ -n "$APP_OWNER" ]] && chown "$APP_OWNER" "$SCRIPTS_DIR/setup_break_alert_fields_v14.py" 2>/dev/null || true
+bench_exec execute restaurant_ops.scripts.setup_break_alert_fields_v14.execute | tee "$BACKUP_DIR/setup_break_alert_fields_v14.txt"
+
+echo "🧩 Step 3: Patch APIs and pages"
+export BREAK_API UPPER_API EMAIL_REPORT MY_BREAK_HTML AGENT_HTML
+python3 - <<'PY'
+# -*- coding: utf-8 -*-
+from pathlib import Path
+import os
+
+break_api = Path(os.environ["BREAK_API"])
+upper_api = Path(os.environ["UPPER_API"])
+email_report = Path(os.environ["EMAIL_REPORT"])
+my_break = Path(os.environ["MY_BREAK_HTML"])
+agent = Path(os.environ["AGENT_HTML"])
+
+# ------------------------------------------------------------------
+# A) break_api final block
+# ------------------------------------------------------------------
+if break_api.exists():
+    s = break_api.read_text(encoding="utf-8", errors="ignore")
+    start = "# BEGIN ROSHDY BREAK FINAL V14"
+    end = "# END ROSHDY BREAK FINAL V14"
+    patch = r'''
+# BEGIN ROSHDY BREAK FINAL V14
+# Final break logic:
+# - admin_end_break sets closure_type='admin', closed_by=admin, admin_close_target_user=agent user, ack=0.
+# - end_break sets closure_type='employee', closed_by=current user.
+# - get_my_break_admin_alert finds pending admin-closed break by target user / employee / owner / extension.
+try:
+    import frappe
+    from frappe.utils import now_datetime, get_datetime, flt, cstr, add_to_date, getdate
+except Exception:
+    frappe = None
+
+
+def _v14_admin_allowed():
+    try:
+        if frappe.session.user == "Administrator":
+            return True
+        roles = set(frappe.get_roles(frappe.session.user))
+        return bool(roles.intersection({"System Manager", "Call Center Admin", "Restaurant Manager", "Break Admin"}))
+    except Exception:
+        return False
+
+
+def _v14_meta_has(dt, fn):
+    try:
+        return frappe.get_meta(dt).has_field(fn)
+    except Exception:
+        return False
+
+
+def _v14_employee_name(emp):
+    if not emp:
+        return "غير محدد"
+    try:
+        return frappe.db.get_value("Employee", emp, "employee_name") or emp
+    except Exception:
+        return emp
+
+
+def _v14_employee_user(emp):
+    if not emp:
+        return None
+    try:
+        return frappe.db.get_value("Employee", emp, "user_id")
+    except Exception:
+        return None
+
+
+def _v14_user_employees(user=None):
+    user = user or frappe.session.user
+    try:
+        if frappe.db.exists("DocType", "Employee"):
+            return frappe.get_all("Employee", filters={"user_id": user}, pluck="name", limit_page_length=50) or []
+    except Exception:
+        pass
+    return []
+
+
+def _v14_user_extensions(user=None):
+    user = user or frappe.session.user
+    out = []
+    try:
+        if frappe.db.exists("DocType", "Extension Session"):
+            rows = frappe.get_all("Extension Session", filters={"user": user, "session_status": "active"}, fields=["extension"], limit_page_length=20)
+            out += [cstr(r.get("extension")) for r in rows if r.get("extension")]
+    except Exception:
+        pass
+    try:
+        emps = _v14_user_employees(user)
+        if emps and frappe.db.exists("DocType", "Employee"):
+            meta = frappe.get_meta("Employee")
+            for df in meta.fields:
+                fn = cstr(df.fieldname).lower()
+                if any(x in fn for x in ("extension", "ext", "sip")):
+                    for emp in emps:
+                        v = frappe.db.get_value("Employee", emp, df.fieldname)
+                        if v:
+                            out.append(cstr(v))
+    except Exception:
+        pass
+    ded = []
+    for x in out:
+        if x and x not in ded:
+            ded.append(x)
+    return ded
+
+
+def _v14_target_user_for_break(doc):
+    # 1) Employee.user_id
+    u = _v14_employee_user(doc.get("employee"))
+    if u:
+        return u
+    # 2) active extension session on extension_at_start
+    ext = cstr(doc.get("extension_at_start") or "").strip()
+    if ext:
+        try:
+            u = frappe.db.get_value("Extension Session", {"extension": ext, "session_status": "active"}, "user")
+            if u:
+                return u
+        except Exception:
+            pass
+    # 3) owner if it is an agent/user, not admin
+    owner = doc.get("owner")
+    if owner and owner not in ("Administrator", "Guest"):
+        return owner
+    return None
+
+
+def _v14_break_limit_minutes(break_type=None):
+    default = 30.0
+    try:
+        conf = getattr(frappe.local, "conf", {}) or {}
+        if conf.get("break_overdue_minutes"):
+            return flt(conf.get("break_overdue_minutes")) or default
+    except Exception:
+        pass
+    if break_type:
+        try:
+            if frappe.db.exists("DocType", "Break Type") and frappe.db.exists("Break Type", break_type):
+                doc = frappe.get_doc("Break Type", break_type)
+                for fn in ("max_duration_minutes", "allowed_minutes", "duration_minutes", "break_minutes", "max_minutes", "time_limit_minutes", "duration", "minutes", "limit_minutes"):
+                    if hasattr(doc, fn) and flt(getattr(doc, fn) or 0) > 0:
+                        return flt(getattr(doc, fn))
+        except Exception:
+            pass
+    return default
+
+
+def _v14_duration_minutes(start_time, end_time=None):
+    if not start_time:
+        return 0.0
+    try:
+        st = get_datetime(start_time)
+        en = get_datetime(end_time) if end_time else now_datetime()
+        return round(max((en - st).total_seconds(), 0) / 60.0, 1)
+    except Exception:
+        return 0.0
+
+
+def _v14_active_break_filters_for_user(user=None):
+    user = user or frappe.session.user
+    employees = _v14_user_employees(user)
+    exts = _v14_user_extensions(user)
+    clauses = ["owner=%s"]
+    params = [user]
+    if employees:
+        clauses.append("employee in (" + ",".join(["%s"] * len(employees)) + ")")
+        params.extend(employees)
+    if exts and _v14_meta_has("Employee Break Log", "extension_at_start"):
+        clauses.append("extension_at_start in (" + ",".join(["%s"] * len(exts)) + ")")
+        params.extend(exts)
+    return clauses, params
+
+
+@frappe.whitelist()
+def get_active_breaks():
+    if not _v14_admin_allowed():
+        frappe.throw("غير مسموح")
+    dt = "Employee Break Log"
+    if not frappe.db.exists("DocType", dt):
+        return {"success": False, "active_count": 0, "overdue_count": 0, "rows": [], "error": "Employee Break Log not found"}
+    rows = frappe.db.sql("""
+        select name, employee, break_type, break_date, status, start_time, end_time,
+               duration_seconds, duration_minutes, extension_at_start, notes, creation, owner,
+               closed_by, closure_type
+        from `tabEmployee Break Log`
+        where ifnull(docstatus,0) < 2
+          and (
+                lower(ifnull(status,'')) in ('active','نشط')
+                or (
+                    (end_time is null or end_time='')
+                    and lower(ifnull(status,'')) not in ('finished','closed','ended','cancelled','canceled','completed','منتهي','مغلق','ملغي')
+                )
+          )
+        order by coalesce(start_time, creation) asc
+        limit 500
+    """, as_dict=True)
+    now = now_datetime()
+    out = []
+    overdue_count = 0
+    for r in rows:
+        dur = _v14_duration_minutes(r.get("start_time"))
+        limit = _v14_break_limit_minutes(r.get("break_type"))
+        overdue = dur >= limit
+        if overdue:
+            overdue_count += 1
+        out.append({
+            "name": r.get("name"),
+            "employee": r.get("employee"),
+            "employee_name": _v14_employee_name(r.get("employee")),
+            "break_type": r.get("break_type") or "غير محدد",
+            "start_time": cstr(r.get("start_time") or ""),
+            "duration_minutes": dur,
+            "limit_minutes": limit,
+            "overdue": overdue,
+            "overdue_minutes": round(max(dur - limit, 0), 1),
+            "extension": r.get("extension_at_start") or "",
+            "notes": r.get("notes") or "",
+        })
+    return {"success": True, "server_now": now.strftime("%Y-%m-%d %H:%M:%S"), "active_count": len(out), "overdue_count": overdue_count, "rows": out}
+
+
+@frappe.whitelist()
+def admin_end_break(break_log=None, note=None):
+    if not _v14_admin_allowed():
+        frappe.throw("غير مسموح: إنهاء البريك من الإدارة فقط")
+    if not break_log:
+        frappe.throw("break_log مطلوب")
+    dt = "Employee Break Log"
+    if not frappe.db.exists(dt, break_log):
+        frappe.throw("سجل البريك غير موجود")
+    doc = frappe.get_doc(dt, break_log)
+    now = now_datetime()
+    dur_seconds = 0
+    if doc.get("start_time"):
+        dur_seconds = int(max((now - get_datetime(doc.get("start_time"))).total_seconds(), 0))
+    dur_minutes = round(dur_seconds / 60.0, 2)
+    admin_user = frappe.session.user
+    admin_label = frappe.db.get_value("User", admin_user, "full_name") or admin_user
+    target_user = _v14_target_user_for_break(doc)
+    old_notes = cstr(doc.get("notes") or "")
+    append = f"\n[Admin Close] تم إنهاء البريك بواسطة {admin_label} في {now.strftime('%Y-%m-%d %H:%M:%S')}"
+    if note:
+        append += f" - ملاحظة: {note}"
+    updates = {
+        "status": "finished",
+        "end_time": now,
+        "duration_seconds": dur_seconds,
+        "duration_minutes": dur_minutes,
+        "closed_by": admin_user,
+        "closure_type": "admin",
+        "notes": (old_notes + append).strip(),
+    }
+    if _v14_meta_has(dt, "admin_close_target_user"):
+        updates["admin_close_target_user"] = target_user or ""
+    if _v14_meta_has(dt, "admin_close_acknowledged"):
+        updates["admin_close_acknowledged"] = 0
+    if _v14_meta_has(dt, "admin_close_acknowledged_at"):
+        updates["admin_close_acknowledged_at"] = None
+    if _v14_meta_has(dt, "admin_close_message"):
+        updates["admin_close_message"] = f"تم إنهاء البريك بواسطة {admin_label}"
+    frappe.db.set_value(dt, break_log, updates, update_modified=True)
+    frappe.db.commit()
+    if target_user:
+        payload = {"break_log": break_log, "closed_by": admin_label, "message": f"تم إنهاء البريك بواسطة {admin_label}", "break_type": doc.get("break_type") or "", "end_time": now.strftime('%Y-%m-%d %H:%M:%S'), "duration_minutes": dur_minutes}
+        try:
+            frappe.publish_realtime("roshdy_break_force_closed", payload, user=target_user, after_commit=True)
+        except Exception:
+            pass
+        try:
+            frappe.get_doc({"doctype": "Notification Log", "subject": "تم إنهاء البريك بواسطة الإدارة", "email_content": payload["message"], "for_user": target_user, "type": "Alert", "document_type": dt, "document_name": break_log}).insert(ignore_permissions=True)
+        except Exception:
+            pass
+    return {"success": True, "message": "تم إنهاء البريك", "break_log": break_log, "closed_by": admin_label, "duration_minutes": dur_minutes, "target_user": target_user or ""}
+
+
+@frappe.whitelist()
+def end_break():
+    """Employee closes own active break from /my-break. Keeps log clear: closure_type=employee."""
+    user = frappe.session.user
+    if not user or user == "Guest":
+        frappe.throw("يجب تسجيل الدخول")
+    dt = "Employee Break Log"
+    clauses, params = _v14_active_break_filters_for_user(user)
+    sql = f"""
+        select name, employee, break_type, start_time, end_time, status, owner, extension_at_start
+        from `tabEmployee Break Log`
+        where ifnull(docstatus,0)<2
+          and (lower(ifnull(status,'')) in ('active','نشط') or (end_time is null and lower(ifnull(status,'')) not in ('finished','closed','ended','cancelled','canceled','completed','منتهي','مغلق','ملغي')))
+          and ({' or '.join(clauses)})
+        order by coalesce(start_time, creation) desc
+        limit 1
+    """
+    rows = frappe.db.sql(sql, params, as_dict=True)
+    if not rows:
+        return {"success": False, "message": "لا يوجد بريك نشط لإنهائه"}
+    r = rows[0]
+    now = now_datetime()
+    dur_seconds = 0
+    if r.get("start_time"):
+        dur_seconds = int(max((now - get_datetime(r.get("start_time"))).total_seconds(), 0))
+    updates = {
+        "status": "finished",
+        "end_time": now,
+        "duration_seconds": dur_seconds,
+        "duration_minutes": round(dur_seconds / 60.0, 2),
+        "closed_by": user,
+        "closure_type": "employee",
+    }
+    if _v14_meta_has(dt, "admin_close_acknowledged"):
+        updates["admin_close_acknowledged"] = 1
+    frappe.db.set_value(dt, r.get("name"), updates, update_modified=True)
+    frappe.db.commit()
+    return {"success": True, "message": "تم إنهاء البريك بواسطة الموظف", "break_log": r.get("name"), "closure_type": "employee"}
+
+
+@frappe.whitelist()
+def get_my_break_admin_alert():
+    user = frappe.session.user
+    if not user or user == "Guest":
+        return {"success": True, "has_alert": False, "reason": "guest"}
+    dt = "Employee Break Log"
+    if not frappe.db.exists("DocType", dt):
+        return {"success": True, "has_alert": False, "reason": "missing break doctype"}
+    employees = _v14_user_employees(user)
+    exts = _v14_user_extensions(user)
+    since = add_to_date(now_datetime(), hours=-96)
+    clauses = []
+    params = []
+    if _v14_meta_has(dt, "admin_close_target_user"):
+        clauses.append("admin_close_target_user=%s")
+        params.append(user)
+    clauses.append("owner=%s")
+    params.append(user)
+    if employees:
+        clauses.append("employee in (" + ",".join(["%s"] * len(employees)) + ")")
+        params.extend(employees)
+    if exts and _v14_meta_has(dt, "extension_at_start"):
+        clauses.append("extension_at_start in (" + ",".join(["%s"] * len(exts)) + ")")
+        params.extend(exts)
+    params.append(since)
+    ack_clause = "and ifnull(admin_close_acknowledged,0)=0" if _v14_meta_has(dt, "admin_close_acknowledged") else ""
+    sql = f"""
+        select name, employee, break_type, start_time, end_time, duration_minutes,
+               closed_by, closure_type, modified, owner, extension_at_start
+        from `tabEmployee Break Log`
+        where ifnull(docstatus,0)<2
+          and ifnull(closure_type,'')='admin'
+          and ({' or '.join(clauses)})
+          and modified >= %s
+          {ack_clause}
+        order by modified desc
+        limit 1
+    """
+    rows = frappe.db.sql(sql, params, as_dict=True)
+    if not rows:
+        return {"success": True, "has_alert": False, "user": user, "employees": employees, "extensions": exts, "debug": "no pending admin-closed break matched this user"}
+    r = rows[0]
+    closed_by = r.get("closed_by") or "الإدارة"
+    label = frappe.db.get_value("User", closed_by, "full_name") or closed_by
+    return {"success": True, "has_alert": True, "alert": {"break_log": r.get("name"), "employee": r.get("employee"), "break_type": r.get("break_type") or "", "start_time": cstr(r.get("start_time") or ""), "end_time": cstr(r.get("end_time") or ""), "duration_minutes": r.get("duration_minutes"), "closed_by": label, "message": f"تم إنهاء البريك بواسطة {label}"}}
+
+
+@frappe.whitelist()
+def acknowledge_admin_closed_break(break_log=None):
+    if not break_log:
+        frappe.throw("break_log مطلوب")
+    dt = "Employee Break Log"
+    if not frappe.db.exists(dt, break_log):
+        frappe.throw("سجل البريك غير موجود")
+    doc = frappe.get_doc(dt, break_log)
+    user = frappe.session.user
+    employees = _v14_user_employees(user)
+    exts = _v14_user_extensions(user)
+    allowed = (doc.get("owner") == user or doc.get("employee") in employees or (_v14_meta_has(dt, "admin_close_target_user") and doc.get("admin_close_target_user") == user) or (doc.get("extension_at_start") and cstr(doc.get("extension_at_start")) in exts) or _v14_admin_allowed())
+    if not allowed:
+        frappe.throw("غير مسموح")
+    updates = {}
+    if _v14_meta_has(dt, "admin_close_acknowledged"):
+        updates["admin_close_acknowledged"] = 1
+    if _v14_meta_has(dt, "admin_close_acknowledged_at"):
+        updates["admin_close_acknowledged_at"] = now_datetime()
+    if updates:
+        frappe.db.set_value(dt, break_log, updates, update_modified=True)
+        frappe.db.commit()
+    return {"success": True}
+
+
+@frappe.whitelist()
+def debug_my_break_alert_binding():
+    user = frappe.session.user
+    return {"success": True, "user": user, "employees": _v14_user_employees(user), "extensions": _v14_user_extensions(user), "pending": get_my_break_admin_alert()}
+# END ROSHDY BREAK FINAL V14
+'''
+    if start in s and end in s:
+        i = s.index(start)
+        j = s.index(end, i) + len(end)
+        s = s[:i] + patch.strip() + s[j:]
+    else:
+        s = s.rstrip() + "\n\n" + patch.strip() + "\n"
+    compile(s, str(break_api), "exec")
+    break_api.write_text(s, encoding="utf-8")
+
+# ------------------------------------------------------------------
+# B) Full-screen alert overlay for /my-break and /agent-desk
+# ------------------------------------------------------------------
+alert_block = r'''
+<!-- BEGIN ROSHDY BREAK ADMIN CLOSED OVERLAY V14 -->
+{% raw %}
+<style>
+#roshdy-admin-break-closed-v14{position:fixed;inset:0;background:#b30000;z-index:2147483000;display:none;align-items:center;justify-content:center;padding:18px;direction:rtl;font-family:Tahoma,Arial,sans-serif;text-align:center;color:white}.rabc14-card{background:rgba(0,0,0,.28);border:2px solid rgba(255,255,255,.55);border-radius:24px;box-shadow:0 35px 90px rgba(0,0,0,.45);width:760px;max-width:96vw;padding:34px}.rabc14-ico{font-size:74px;margin-bottom:8px}.rabc14-title{font-size:48px;font-weight:900;margin-bottom:12px}.rabc14-msg{font-size:28px;margin-bottom:18px}.rabc14-admin{font-size:44px;color:#ffdd33;font-weight:900;text-shadow:2px 2px 7px #000;margin:8px 0}.rabc14-details{background:rgba(255,255,255,.14);border-radius:16px;padding:16px;font-size:19px;margin-bottom:22px}.rabc14-btn{background:#fff;color:#b30000;border:0;border-radius:16px;padding:16px 30px;font-size:22px;font-weight:900;cursor:pointer}@media(max-width:700px){.rabc14-title{font-size:34px}.rabc14-msg{font-size:22px}.rabc14-admin{font-size:30px}.rabc14-details{font-size:16px}.rabc14-btn{font-size:18px}}
+</style>
+<div id="roshdy-admin-break-closed-v14"><div class="rabc14-card"><div class="rabc14-ico">🚨</div><div class="rabc14-title">تنبيه إداري</div><div class="rabc14-msg">تم إنهاء البريك بواسطة الأدمن</div><div id="rabc14-admin" class="rabc14-admin">الإدارة</div><div id="rabc14-details" class="rabc14-details"></div><button id="rabc14-ack" class="rabc14-btn">أعلم .. العودة للعمل</button></div></div>
+<script>(function(){if(window.RoshdyBreakClosedV14)return;window.RoshdyBreakClosedV14=1;var current=null;function api(m,args){args=args||{};var q=new URLSearchParams();Object.keys(args).forEach(function(k){if(args[k]!==undefined&&args[k]!==null)q.append(k,args[k])});return fetch('/api/method/'+m+(q.toString()?'?'+q.toString():''),{method:'GET',credentials:'same-origin',cache:'no-store'}).then(function(r){return r.json()}).then(function(j){if(j.exc)throw j;return j.message||j})}function show(a){a=a||{};current=a.break_log||current;document.getElementById('rabc14-admin').textContent=a.closed_by||'الإدارة';document.getElementById('rabc14-details').innerHTML='نوع البريك: <b>'+(a.break_type||'')+'</b><br>وقت الإغلاق: <b>'+(a.end_time||'')+'</b><br>مدة البريك: <b>'+(a.duration_minutes||'')+' دقيقة</b>';document.getElementById('roshdy-admin-break-closed-v14').style.display='flex'}function poll(){api('restaurant_ops.api.break_api.get_my_break_admin_alert',{}).then(function(r){if(r&&r.has_alert&&r.alert)show(r.alert)}).catch(function(e){console.log('admin break close alert poll',e)})}var ack=document.getElementById('rabc14-ack');if(ack){ack.onclick=function(){if(!current){document.getElementById('roshdy-admin-break-closed-v14').style.display='none';return}api('restaurant_ops.api.break_api.acknowledge_admin_closed_break',{break_log:current}).finally(function(){document.getElementById('roshdy-admin-break-closed-v14').style.display='none'})}}if(window.frappe&&frappe.realtime){try{frappe.realtime.on('roshdy_break_force_closed',function(p){show(p||{})})}catch(e){}}setTimeout(poll,600);setInterval(poll,2500);})();</script>
+{% endraw %}
+<!-- END ROSHDY BREAK ADMIN CLOSED OVERLAY V14 -->
+'''
+
+def clean_insert_overlay(path: Path):
+    if not path.exists():
+        return
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    markers = [
+        ("<!-- BEGIN ROSHDY AGENT BREAK CLOSE ALERT -->", "<!-- END ROSHDY AGENT BREAK CLOSE ALERT -->"),
+        ("<!-- BEGIN ROSHDY AGENT BREAK ADMIN CLOSED V10 -->", "<!-- END ROSHDY AGENT BREAK ADMIN CLOSED V10 -->"),
+        ("<!-- BEGIN ROSHDY AGENT BREAK ADMIN CLOSED V12 -->", "<!-- END ROSHDY AGENT BREAK ADMIN CLOSED V12 -->"),
+        ("<!-- BEGIN ROSHDY AGENT BREAK ADMIN CLOSED V13 -->", "<!-- END ROSHDY AGENT BREAK ADMIN CLOSED V13 -->"),
+        ("<!-- BEGIN ROSHDY BREAK ADMIN CLOSED OVERLAY V14 -->", "<!-- END ROSHDY BREAK ADMIN CLOSED OVERLAY V14 -->"),
+    ]
+    for a,b in markers:
+        while a in text and b in text:
+            i = text.index(a)
+            j = text.index(b, i) + len(b)
+            text = text[:i] + "\n" + text[j:]
+    low = text.lower()
+    idx = low.rfind("</body>")
+    if idx >= 0:
+        text = text[:idx] + "\n" + alert_block + "\n" + text[idx:]
+    else:
+        text = text.rstrip() + "\n" + alert_block + "\n"
+    path.write_text(text, encoding="utf-8")
+
+clean_insert_overlay(my_break)
+clean_insert_overlay(agent)
+
+# ------------------------------------------------------------------
+# C) Email hidden recipient filter and staff missed source alignment
+# ------------------------------------------------------------------
+recipient_filter = r'''
+# BEGIN ROSHDY EMAIL RECIPIENT FILTER FINAL V14
+try:
+    import frappe
+    import re as _r14_email_re
+except Exception:
+    frappe = None
+_ROSHDY_BLOCKED_REPORT_EMAILS_FINAL_V14 = {"admin@roshdy.com", "el.alfy@roshdy.com", "administrator@roshdy.com"}
+def _r14_flat_emails(v):
+    if v is None: return []
+    if isinstance(v, (list, tuple, set)):
+        out=[]
+        for x in v: out += _r14_flat_emails(x)
+        return out
+    return _r14_email_re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", str(v)) or ([str(v).strip()] if '@' in str(v) else [])
+def _r14_clean_recipients(v):
+    is_str = isinstance(v, str)
+    seen=set(); cleaned=[]
+    for e in _r14_flat_emails(v):
+        e=str(e).strip().strip(',; '); k=e.lower()
+        if not e or k in seen: continue
+        if k in _ROSHDY_BLOCKED_REPORT_EMAILS_FINAL_V14 or k.endswith('@local.local') or k.endswith('@example.com'): continue
+        seen.add(k); cleaned.append(e)
+    return ', '.join(cleaned) if is_str else cleaned
+if frappe and not getattr(frappe, '_roshdy_sendmail_filter_final_v14', False):
+    frappe._roshdy_sendmail_original_final_v14 = frappe.sendmail
+    def _r14_sendmail(*args, **kwargs):
+        args=list(args)
+        if args: args[0] = _r14_clean_recipients(args[0])
+        for k in ('recipients','cc','bcc'):
+            if k in kwargs: kwargs[k] = _r14_clean_recipients(kwargs.get(k))
+        return frappe._roshdy_sendmail_original_final_v14(*args, **kwargs)
+    frappe.sendmail = _r14_sendmail
+    frappe._roshdy_sendmail_filter_final_v14 = True
+# END ROSHDY EMAIL RECIPIENT FILTER FINAL V14
+'''
+for mod_path in (email_report, upper_api):
+    if not mod_path.exists():
+        continue
+    text = mod_path.read_text(encoding="utf-8", errors="ignore")
+    a = "# BEGIN ROSHDY EMAIL RECIPIENT FILTER FINAL V14"
+    b = "# END ROSHDY EMAIL RECIPIENT FILTER FINAL V14"
+    if a in text and b in text:
+        i=text.index(a); j=text.index(b,i)+len(b); text=text[:i]+recipient_filter.strip()+text[j:]
+    else:
+        text=text.rstrip()+"\n\n"+recipient_filter.strip()+"\n"
+    compile(text, str(mod_path), "exec")
+    mod_path.write_text(text, encoding="utf-8")
+
+if upper_api.exists():
+    text = upper_api.read_text(encoding="utf-8", errors="ignore")
+    start = "# BEGIN ROSHDY UPPER STAFF MISSED SAME_AS_CENTER V14"
+    end = "# END ROSHDY UPPER STAFF MISSED SAME_AS_CENTER V14"
+    patch = r'''
+# BEGIN ROSHDY UPPER STAFF MISSED SAME_AS_CENTER V14
+# Force Upper Management report to use the exact same missed-attempt source as Center report:
+# restaurant_ops.api.report_api.get_staff_missed_attempts(date_from,date_to,15)
+try:
+    import frappe
+    from frappe.utils import cstr, cint, flt, today, now_datetime
+except Exception:
+    pass
+
+try:
+    _v14_previous_get_upper_management_report_data = get_upper_management_report_data
+except Exception:
+    _v14_previous_get_upper_management_report_data = None
+
+
+def _v14_public_employee_label_from_missed(row):
+    ext = cstr(row.get('extension') or row.get('actual_ext') or '').strip()
+    emp = cstr(row.get('employee_name') or '').strip()
+    if emp and emp not in ('غير مربوط وقت المكالمة', 'None'):
+        return emp
+    if ext:
+        return 'تحويلة ' + ext + ' (غير مربوط وقت المكالمة)'
+    return 'غير محدد من بيانات السنترال'
+
+
+def _v14_load_staff_missed_attempts(date_from=None, date_to=None):
+    from restaurant_ops.api.report_api import get_staff_missed_attempts
+    date_from = date_from or today()
+    date_to = date_to or date_from
+    d = get_staff_missed_attempts(date_from, date_to, 15) or {}
+    details = d.get('details') or []
+    grouped = d.get('grouped') or []
+    rows = []
+    for r in details[:500]:
+        disp = cstr(r.get('disposition') or '')
+        action = 'سابها ترن ولم يرد' if disp == 'NO ANSWER' else ('فشل/اتكنسلت على التحويلة' if disp == 'FAILED' else 'محاولة فائتة على التحويلة')
+        rows.append({
+            'time': cstr(r.get('calldate') or ''),
+            'employee': _v14_public_employee_label_from_missed(r),
+            'extension': cstr(r.get('extension') or ''),
+            'caller': cstr(r.get('src') or ''),
+            'action': action,
+            'duration': cstr(r.get('duration') or ''),
+            'uniqueid': cstr(r.get('uniqueid') or ''),
+        })
+    # If details not present but grouped is present, still show grouped rows so the table is never empty while total > 0.
+    if not rows and grouped:
+        for g in grouped[:100]:
+            rows.append({
+                'time': '--',
+                'employee': _v14_public_employee_label_from_missed(g),
+                'extension': cstr(g.get('extension') or ''),
+                'caller': '--',
+                'action': 'عدد محاولات فائتة: ' + cstr(g.get('count') or 0),
+                'duration': cstr(g.get('duration') or g.get('total_duration') or ''),
+                'uniqueid': '',
+            })
+    return {
+        'success': d.get('success', True),
+        'total_attempts': cint(d.get('total_attempts') or len(rows) or 0),
+        'extensions_count': cint(d.get('extensions_count') or len(grouped) or 0),
+        'total_duration': cint(d.get('total_duration') or 0),
+        'grouped': grouped,
+        'rows': rows,
+        'raw': d,
+    }
+
+
+@frappe.whitelist()
+def get_upper_management_report_data(date_from=None, date_to=None):
+    if _v14_previous_get_upper_management_report_data:
+        data = _v14_previous_get_upper_management_report_data(date_from=date_from, date_to=date_to)
+    else:
+        data = {'success': True, 'period': {'from': cstr(date_from or today()), 'to': cstr(date_to or date_from or today()), 'label': cstr(date_from or today())}, 'generated_at': now_datetime().strftime('%Y-%m-%d %H:%M:%S')}
+    period = data.get('period') or {}
+    df = date_from or period.get('from') or today()
+    dt = date_to or period.get('to') or df
+    missed = _v14_load_staff_missed_attempts(df, dt)
+    calls = data.setdefault('calls', {})
+    calls['staff_missed_count'] = missed.get('total_attempts', 0)
+    calls['employee_issue_count'] = missed.get('total_attempts', 0)
+    calls['employee_issue_rows'] = missed.get('rows', [])
+    calls['staff_missed_grouped'] = missed.get('grouped', [])
+    calls['staff_missed_total_duration'] = missed.get('total_duration', 0)
+    calls['source'] = 'report_api.get_staff_missed_attempts_same_as_center_v14'
+    calls['note'] = 'Uses the exact same source as the Customer Service Manager email.'
+    # add followup if needed and not already there
+    try:
+        if missed.get('total_attempts', 0) and 'followups' in data:
+            txt = 'مراجعة المحاولات الفائتة على تحويلات الموظفين.'
+            if txt not in data['followups']:
+                data['followups'].append(txt)
+    except Exception:
+        pass
+    return data
+
+
+@frappe.whitelist()
+def debug_employee_missed_rows(date_from=None, date_to=None):
+    df = date_from or today()
+    dt = date_to or df
+    d = _v14_load_staff_missed_attempts(df, dt)
+    return {'success': True, 'date_from': df, 'date_to': dt, 'count': d.get('total_attempts'), 'extensions_count': d.get('extensions_count'), 'total_duration': d.get('total_duration'), 'grouped': d.get('grouped'), 'rows': d.get('rows')[:80]}
+# END ROSHDY UPPER STAFF MISSED SAME_AS_CENTER V14
+'''
+    if start in text and end in text:
+        i=text.index(start); j=text.index(end,i)+len(end); text=text[:i]+patch.strip()+text[j:]
+    else:
+        text=text.rstrip()+"\n\n"+patch.strip()+"\n"
+    compile(text, str(upper_api), "exec")
+    upper_api.write_text(text, encoding="utf-8")
+PY
+
+echo "🧹 Step 4: Cleanup hidden report emails from Singles (User emails kept for login; send filter blocks them in reports)"
+cat > "$SCRIPTS_DIR/cleanup_hidden_report_recipients_final_v14.py" <<'PY'
+import re
+import frappe
+BLOCKED = {"admin@roshdy.com", "el.alfy@roshdy.com", "administrator@roshdy.com"}
+
+def _clean(v):
+    if not isinstance(v, str) or "@" not in v:
+        return v, []
+    out = v
+    removed = []
+    for e in BLOCKED:
+        if e.lower() in out.lower():
+            out = re.sub(re.escape(e), "", out, flags=re.I)
+            removed.append(e)
+    out = re.sub(r"[,;]\s*[,;]+", ",", out)
+    out = re.sub(r"(^\s*[,;]+|[,;]+\s*$)", "", out).strip()
+    out = out.replace("\n\n", "\n").strip()
+    return out, removed
+
+def execute():
+    rows = frappe.db.sql("select doctype, field, value from `tabSingles` where value like '%%@roshdy.com%%'", as_dict=True)
+    changed=[]
+    for r in rows:
+        new, removed = _clean(r.value or "")
+        if removed and new != r.value:
+            frappe.db.set_value(r.doctype, None, r.field, new)
+            changed.append({"doctype": r.doctype, "field": r.field, "removed": removed})
+    frappe.db.commit()
+    return {"success": True, "changed": changed, "blocked_in_sendmail_filter": sorted(BLOCKED), "note": "User emails are not deleted; report sendmail filter blocks the non-deliverable ones."}
+PY
+[[ -n "$APP_OWNER" ]] && chown "$APP_OWNER" "$SCRIPTS_DIR/cleanup_hidden_report_recipients_final_v14.py" 2>/dev/null || true
+bench_exec execute restaurant_ops.scripts.cleanup_hidden_report_recipients_final_v14.execute | tee "$BACKUP_DIR/cleanup_hidden_report_recipients_final_v14.txt"
+
+[[ -n "$APP_OWNER" ]] && chown "$APP_OWNER" "$BREAK_API" "$UPPER_API" "$EMAIL_REPORT" "$MY_BREAK_HTML" "$AGENT_HTML" 2>/dev/null || true
+
+echo "🧹 Step 5: Clear cache + restart app services"
+bench_exec clear-cache || true
+"${COMPOSE[@]}" restart backend frontend websocket queue-short queue-long scheduler >/dev/null
+sleep 8
+bench_exec clear-cache || true
+
+echo "🧪 Step 6: Page smoke checks"
+set +e
+for p in admin-desk my-break agent-desk break-admin order-cancellations-report email-report-customizer call-report; do
+  code="$(curl -k -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$p" 2>/dev/null || echo 000)"
+  echo "$p => $code" | tee -a "$BACKUP_DIR/page_smoke_checks_v14.txt"
+done
+set -e
+
+if ! grep -q "my-break => 200" "$BACKUP_DIR/page_smoke_checks_v14.txt" || ! grep -q "agent-desk => 200" "$BACKUP_DIR/page_smoke_checks_v14.txt"; then
+  echo "❌ Critical agent/my-break page failed. Restore from: $BACKUP_DIR"
+  exit 1
+fi
+
+echo "🧪 Step 7: Backend validation"
+set +e
+bench_exec execute restaurant_ops.api.break_api.get_active_breaks | tee "$BACKUP_DIR/active_breaks_v14.txt"
+V1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.break_api.debug_my_break_alert_binding | tee "$BACKUP_DIR/debug_my_break_alert_binding_current_user_v14.txt"
+V2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.report_api.get_staff_missed_attempts | tee "$BACKUP_DIR/report_api_staff_missed_attempts_v14.txt"
+V3=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.upper_management_email_api.debug_employee_missed_rows | tee "$BACKUP_DIR/upper_debug_employee_missed_rows_v14.txt"
+V4=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.upper_management_email_api.debug_email_send_config | tee "$BACKUP_DIR/email_debug_v14.txt"
+V5=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.upper_management_email_api.verify_cancellations_in_upper_email | tee "$BACKUP_DIR/email_verify_v14.txt"
+V6=${PIPESTATUS[0]}
+set -e
+
+if [[ $V1 -ne 0 || $V2 -ne 0 || $V3 -ne 0 || $V4 -ne 0 || $V5 -ne 0 || $V6 -ne 0 ]]; then
+  echo "❌ Backend validation failed. راجع: $BACKUP_DIR"
+  exit 1
+fi
+
+echo "🧽 Step 8: Old failed backup cleanup candidates"
+CLEAN_LIST="$BACKUP_DIR/cleanup_candidates.txt"
+find "$ROOT/backups" -maxdepth 1 -type d \( \
+  -name 'FIX_ADMIN_BREAK_CANCEL_SIDEBAR_V7_BEFORE_*' -o \
+  -name 'ADMIN_CLEAN_BREAKADMIN_V8_BEFORE_*' -o \
+  -name 'REBUILD_ADMIN_DESK_V9_BEFORE_*' -o \
+  -name 'V11_COMPLAINTS_MISSED_CANCEL_WIDGET_EMAIL_BEFORE_*' -o \
+  -name 'V12_EMAIL_AGENT_ALERT_REPORT_POLISH_BEFORE_*' -o \
+  -name 'V13_BREAK_ALERT_MISSED_EMAIL_CLEANUP_BEFORE_*' -o \
+  -name 'EMERGENCY_RESTORE_ADMIN_STRICT_REPORT_BEFORE_*' \
+\) | sort > "$CLEAN_LIST" || true
+cat "$CLEAN_LIST"
+if [[ "$CLEAN_OLD_FAILED_BACKUPS" == "1" ]]; then
+  echo "🧽 CLEAN_OLD_FAILED_BACKUPS=1 -> deleting listed old failed backup folders"
+  while IFS= read -r d; do
+    [[ -n "$d" && -d "$d" ]] && rm -rf --one-file-system "$d"
+  done < "$CLEAN_LIST"
+else
+  echo "ℹ️ Dry-run فقط. للمسح بعد التأكد: CLEAN_OLD_FAILED_BACKUPS=1 ./final-fix-break-alert-missed-email-v14"
+fi
+
+echo "🏥 Step 9: Health Check - Elastix/CDR/AMI + Queue + Call Report"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$BACKUP_DIR/health_asterisk_bridge.txt"
+H1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status | tee "$BACKUP_DIR/health_queue_status.txt"
+H2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' | tee "$BACKUP_DIR/health_call_report.txt"
+H3=${PIPESTATUS[0]}
+set -e
+
+if [[ $H1 -ne 0 || $H2 -ne 0 || $H3 -ne 0 ]]; then
+  echo "⚠️ Health returned non-zero. راجع: $BACKUP_DIR"
+else
+  echo "✅ Health checks OK"
+fi
+
+echo "============================================================"
+echo "✅ DONE FINAL V14"
+echo "📦 Backup folder: $BACKUP_DIR"
+echo "⏱️ Full-screen admin-close alert added to /my-break and /agent-desk"
+echo "🧾 Break log now distinguishes closure_type=employee vs closure_type=admin"
+echo "👤 Upper Management missed employees uses SAME function as Center report: report_api.get_staff_missed_attempts"
+echo "📧 Hidden bad report recipients are filtered"
+echo "🧽 Cleanup candidates saved: $CLEAN_LIST"
+echo "🛡️ report_api.py was NOT edited"
+echo "============================================================"

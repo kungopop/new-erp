@@ -1,0 +1,288 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# roshdy-fix-gowa-pass
+# Fixes GOWA password source-of-truth in:
+# 1) /opt/roshdy_social_bridge/gowa-poc/.env
+# 2) running GOWA container
+# 3) ERP Social Channel Account encrypted password
+# Avoids passing long dotted methods/URLs in chat.
+
+ROOT="/opt/frappe_crm"
+SITE="crm.local"
+APP_DIR="$ROOT/apps/restaurant_ops/restaurant_ops"
+BRIDGE_DIR="/opt/roshdy_social_bridge/gowa-poc"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/FIX_GOWA_PASS_BEFORE_$TS"
+NEWPASS="Roshdy@123"
+GOWA_USER="roshdy_admin"
+GOWA_PORT="33030"
+DEVICE_ID="orders_wa_1"
+
+say(){ echo -e "\n============================================================\n$1\n============================================================"; }
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo "❌ شغّل كـ root: sudo -i ثم ./roshdy-fix-gowa-pass"
+  exit 1
+fi
+
+say "1) Backup سريع"
+cd "$ROOT"
+BACKEND="$(docker compose ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ لم أجد backend container. شغّل: cd /opt/frappe_crm && docker compose up -d"
+  exit 1
+fi
+mkdir -p "$BACKUP_DIR"
+[[ -f "$BRIDGE_DIR/.env" ]] && cp -a "$BRIDGE_DIR/.env" "$BACKUP_DIR/gowa.env.bak" || true
+[[ -f "$APP_DIR/api/social_inbox_api.py" ]] && cp -a "$APP_DIR/api/social_inbox_api.py" "$BACKUP_DIR/social_inbox_api.py.bak" || true
+
+echo "✅ Backup: $BACKUP_DIR"
+
+say "2) تثبيت باسورد GOWA في .env وإعادة تشغيل GOWA"
+if [[ ! -d "$BRIDGE_DIR" ]]; then
+  echo "❌ لم أجد $BRIDGE_DIR"
+  exit 1
+fi
+cd "$BRIDGE_DIR"
+
+# Read existing secret before editing.
+WHATSAPP_WEBHOOK_SECRET="$(grep -E '^WHATSAPP_WEBHOOK_SECRET=' .env 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
+[[ -z "$WHATSAPP_WEBHOOK_SECRET" ]] && WHATSAPP_WEBHOOK_SECRET="secret"
+
+# Ensure lines exist or update them.
+grep -q '^GOWA_USER=' .env && sed -i "s/^GOWA_USER=.*/GOWA_USER=$GOWA_USER/" .env || echo "GOWA_USER=$GOWA_USER" >> .env
+grep -q '^GOWA_PASS=' .env && sed -i "s/^GOWA_PASS=.*/GOWA_PASS=$NEWPASS/" .env || echo "GOWA_PASS=$NEWPASS" >> .env
+grep -q '^APP_BASIC_AUTH=' .env && sed -i "s/^APP_BASIC_AUTH=.*/APP_BASIC_AUTH=$GOWA_USER:$NEWPASS/" .env || echo "APP_BASIC_AUTH=$GOWA_USER:$NEWPASS" >> .env
+
+# Recreate only GOWA, keep collector running.
+docker compose up -d --force-recreate gowa
+sleep 6
+
+echo "--- .env auth lines ---"
+grep -E '^(GOWA_USER|GOWA_PASS|APP_BASIC_AUTH|WHATSAPP_WEBHOOK_SECRET)=' .env
+
+echo "--- Host curl GOWA /health with new password ---"
+curl -fsS -u "$GOWA_USER:$NEWPASS" "http://127.0.0.1:$GOWA_PORT/health"
+echo
+
+say "3) كتابة credentials JSON داخل تطبيق ERP"
+SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+[[ -z "$SERVER_IP" ]] && SERVER_IP="10.11.1.66"
+GOWA_BASE_URL="http://$SERVER_IP:$GOWA_PORT"
+mkdir -p "$APP_DIR/scripts"
+cat > "$APP_DIR/scripts/gowa_credentials.json" <<EOF
+{
+  "api_base_url": "$GOWA_BASE_URL",
+  "api_username": "$GOWA_USER",
+  "api_password": "$NEWPASS",
+  "webhook_secret": "$WHATSAPP_WEBHOOK_SECRET",
+  "device_id": "$DEVICE_ID"
+}
+EOF
+chmod 644 "$APP_DIR/scripts/gowa_credentials.json"
+
+echo "✅ Credentials file written: $APP_DIR/scripts/gowa_credentials.json"
+
+say "4) Patch API password reader نهائيًا"
+cat >> "$APP_DIR/api/social_inbox_api.py" <<'PY'
+
+# ===== ROSHDY GOWA PASSWORD FINAL FALLBACK =====
+def _password(doc, field):
+    try:
+        v = doc.get_password(field)
+        if v:
+            return v
+    except Exception:
+        pass
+    try:
+        from frappe.utils.password import get_decrypted_password
+        v = get_decrypted_password(doc.doctype, doc.name, field, raise_exception=False)
+        if v:
+            return v
+    except Exception:
+        pass
+    try:
+        v = frappe.db.get_value(doc.doctype, doc.name, field)
+        if v and str(v).strip() and str(v).strip() != "*****":
+            return v
+    except Exception:
+        pass
+    return ""
+
+
+def _set_password(doc, fieldname, value):
+    if value is None or value == "":
+        return
+    try:
+        if hasattr(doc, "set_password"):
+            doc.set_password(fieldname, value)
+            return
+    except Exception:
+        pass
+    try:
+        from frappe.utils.password import set_encrypted_password
+        set_encrypted_password(doc.doctype, doc.name, value, fieldname)
+        return
+    except Exception:
+        pass
+    try:
+        frappe.db.set_value(doc.doctype, doc.name, fieldname, value, update_modified=False)
+    except TypeError:
+        frappe.db.set_value(doc.doctype, doc.name, fieldname, value)
+PY
+chmod 644 "$APP_DIR/api/social_inbox_api.py"
+
+say "5) Direct ERP encrypted password sync"
+cat > "$APP_DIR/scripts/fix_gowa_password_direct.py" <<'PY'
+import json
+import re
+from pathlib import Path
+import frappe
+
+
+def clean_url(url):
+    url = str(url or "").strip()
+    m = re.search(r'https?://[^\]\)\s]+', url)
+    return (m.group(0) if m else url).rstrip('/')
+
+
+def set_pwd(doctype, name, field, value):
+    if value is None or value == "":
+        return "empty"
+    # Remove stale password rows first to avoid stale/masked values.
+    try:
+        frappe.db.sql("delete from `__Auth` where `doctype`=%s and `name`=%s and `fieldname`=%s", (doctype, name, field))
+        frappe.db.commit()
+    except Exception:
+        pass
+    try:
+        from frappe.utils.password import set_encrypted_password
+        set_encrypted_password(doctype, name, value, field)
+        frappe.db.commit()
+    except Exception as e:
+        # Fallback: set direct value if encrypted helper is unavailable.
+        try:
+            frappe.db.set_value(doctype, name, field, value, update_modified=False)
+            frappe.db.commit()
+        except TypeError:
+            frappe.db.set_value(doctype, name, field, value)
+            frappe.db.commit()
+        return "direct_fallback: " + str(e)
+    return "encrypted"
+
+
+def get_pwd(doctype, name, field):
+    try:
+        from frappe.utils.password import get_decrypted_password
+        v = get_decrypted_password(doctype, name, field, raise_exception=False)
+        if v:
+            return v
+    except Exception:
+        pass
+    try:
+        return frappe.db.get_value(doctype, name, field) or ""
+    except Exception:
+        return ""
+
+
+def run():
+    path = Path(__file__).with_name('gowa_credentials.json')
+    data = json.loads(path.read_text())
+    base = clean_url(data.get('api_base_url'))
+    user = data.get('api_username') or 'roshdy_admin'
+    pwd = data.get('api_password') or ''
+    secret = data.get('webhook_secret') or ''
+    device = data.get('device_id') or 'orders_wa_1'
+
+    name = (
+        frappe.db.get_value('Social Channel Account', {'provider':'GOWA WhatsApp Web', 'channel_type':'WhatsApp'}, 'name')
+        or frappe.db.get_value('Social Channel Account', {'channel_type':'WhatsApp', 'device_id':device}, 'name')
+    )
+    if name:
+        doc = frappe.get_doc('Social Channel Account', name)
+    else:
+        doc = frappe.get_doc({'doctype':'Social Channel Account'})
+
+    doc.account_label = doc.account_label or 'واتساب أوردرات رشدي'
+    doc.channel_type = 'WhatsApp'
+    doc.provider = 'GOWA WhatsApp Web'
+    doc.device_id = device
+    doc.phone_label = doc.phone_label or device
+    doc.api_base_url = base
+    doc.api_username = user
+    doc.active = 1
+    doc.admin_only_start_chat = 1
+    doc.allowed_roles = doc.allowed_roles or 'Social Inbox Admin\nSocial Inbox Supervisor\nSocial Inbox Agent\nCall Center Admin'
+    if doc.is_new():
+        doc.insert(ignore_permissions=True)
+    else:
+        doc.save(ignore_permissions=True)
+    frappe.db.commit()
+
+    mode1 = set_pwd(doc.doctype, doc.name, 'api_password', pwd)
+    mode2 = set_pwd(doc.doctype, doc.name, 'webhook_secret', secret)
+
+    got = get_pwd(doc.doctype, doc.name, 'api_password')
+    got_secret = get_pwd(doc.doctype, doc.name, 'webhook_secret')
+    return {
+        'success': True,
+        'account': doc.name,
+        'api_base_url': doc.api_base_url,
+        'api_username': doc.api_username,
+        'device_id': doc.device_id,
+        'api_password_mode': mode1,
+        'api_password_present': bool(got),
+        'api_password_length': len(got or ''),
+        'api_password_matches': got == pwd,
+        'webhook_secret_mode': mode2,
+        'webhook_secret_present': bool(got_secret),
+        'webhook_secret_length': len(got_secret or ''),
+    }
+PY
+chmod 644 "$APP_DIR/scripts/fix_gowa_password_direct.py"
+
+cd "$ROOT"
+docker exec "$BACKEND" bash -lc "find /home/frappe/frappe-bench/apps/restaurant_ops -name '*.pyc' -delete; find /home/frappe/frappe-bench/apps/restaurant_ops -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true"
+
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.scripts.fix_gowa_password_direct.run
+
+say "6) Restart ERP services"
+docker exec "$BACKEND" bench --site "$SITE" clear-cache || true
+docker exec "$BACKEND" bench --site "$SITE" clear-website-cache || true
+docker compose restart backend frontend websocket queue-short queue-long scheduler
+sleep 10
+BACKEND="$(docker compose ps -q backend)"
+
+say "7) Validation"
+echo "--- debug_gowa_auth ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.social_inbox_api.debug_gowa_auth || true
+
+ACC="$(docker exec "$BACKEND" bench --site "$SITE" execute frappe.db.get_value --args '["Social Channel Account", {"provider":"GOWA WhatsApp Web", "channel_type":"WhatsApp"}, "name"]' 2>/dev/null | tr -d '"' || true)"
+echo "ERP account: $ACC"
+if [[ -n "$ACC" && "$ACC" != "None" ]]; then
+  echo "--- test_account ---"
+  docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.social_inbox_api.test_account --kwargs "{\"account_name\":\"$ACC\"}" || true
+fi
+
+echo "--- Page HTTP status ---"
+for page in social-settings social-inbox admin-desk agent-desk call-report; do
+  code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$page" || true)"
+  echo "$page => $code"
+done
+
+say "8) Health Check مهم: Elastix/CDR/AMI + Queue + Call Report"
+echo "--- Asterisk/Elastix diagnostics ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics || true
+
+echo "--- Queue status ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.queue_api.get_queue_status || true
+
+echo "--- Calls report admin sample ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' || true
+
+say "✅ GOWA Password Fixed يا زعيم"
+echo "افتح GOWA من Incognito: http://$SERVER_IP:$GOWA_PORT"
+echo "username: $GOWA_USER"
+echo "password: $NEWPASS"
+echo "Backup: $BACKUP_DIR"

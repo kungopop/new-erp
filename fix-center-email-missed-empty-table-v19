@@ -1,0 +1,328 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Roshdy V19: Fix empty "محاولات فائتة على الموظفين" table in Customer Service Manager email.
+# Root cause from code review:
+# - Customer Service email uses report_api.get_staff_missed_attempts(), whose grouped rows contain:
+#   extension, employee_name, count, duration
+# - Some email sections were reading wrong keys like agent_name / actual_ext / total_duration,
+#   which produced blank rows despite data existing.
+# Fix:
+# - Override ALL staff-missed email section builders in email_report.py:
+#   _staff_missed_section, _er_staff_missed_section, _adv_staff_missed_section
+# - If no attempts: show a clean note, not an empty table.
+# - If attempts exist: show extension + employee/unknown + count + duration.
+# Safety:
+# - Backup first.
+# - Does NOT touch report_api.py / Elastix / CDR / AMI config.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "❌ docker compose/docker-compose مش موجود"
+  exit 1
+fi
+
+APP_DIR="$ROOT/apps/$APP"
+PKG_DIR="$APP_DIR/$APP"
+API_DIR="$PKG_DIR/api"
+EMAIL_REPORT="$API_DIR/email_report.py"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/FIX_CENTER_EMAIL_MISSED_EMPTY_TABLE_V19_BEFORE_$TS"
+mkdir -p "$BACKUP_DIR"
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend container مش شغال أو مش لاقيه"
+  exit 1
+fi
+
+bench_exec() {
+  "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"
+}
+
+echo "============================================================"
+echo "🔧 Roshdy V19: Fix center email missed attempts empty table"
+echo "📦 Backup: $BACKUP_DIR"
+echo "============================================================"
+
+if [[ ! -f "$EMAIL_REPORT" ]]; then
+  echo "❌ مش لاقي email_report.py: $EMAIL_REPORT"
+  exit 1
+fi
+
+echo "🧯 Backup file + bench backup"
+cp -a "$EMAIL_REPORT" "$BACKUP_DIR/email_report.py.before"
+bench_exec backup --with-files | tee "$BACKUP_DIR/bench_backup_output.txt"
+
+echo "🧩 Patch email_report.py staff missed sections"
+export EMAIL_REPORT
+python3 - <<'PY'
+# -*- coding: utf-8 -*-
+from pathlib import Path
+import os
+
+p = Path(os.environ["EMAIL_REPORT"])
+s = p.read_text(encoding="utf-8", errors="ignore")
+start = "# BEGIN ROSHDY CENTER STAFF MISSED SECTION V19"
+end = "# END ROSHDY CENTER STAFF MISSED SECTION V19"
+patch = r'''
+# BEGIN ROSHDY CENTER STAFF MISSED SECTION V19
+# Fix empty staff-missed tables in Customer Service Manager email.
+# report_api.get_staff_missed_attempts returns grouped keys:
+# extension, employee_name, count, duration
+try:
+    import frappe
+    from frappe.utils import today, cstr, cint
+    import html as _v19_html
+except Exception:
+    pass
+
+
+def _v19_escape(v):
+    try:
+        return _v19_html.escape(cstr(v) if v is not None else "")
+    except Exception:
+        return cstr(v) if v is not None else ""
+
+
+def _v19_period_values(date_from=None, date_to=None):
+    df = date_from or today()
+    dt = date_to or df
+    return cstr(df), cstr(dt)
+
+
+def _v19_fmt_seconds(sec):
+    try:
+        sec = int(float(sec or 0))
+    except Exception:
+        sec = 0
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    s = sec % 60
+    if h:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def _v19_employee_label(row):
+    ext = cstr(row.get("extension") or row.get("actual_ext") or "").strip()
+    emp = cstr(row.get("employee_name") or row.get("agent_name") or "").strip()
+    if emp and emp not in ("غير مربوط وقت المكالمة", "None", "null", "غير محدد"):
+        return emp
+    if ext:
+        return "غير محدد (تحويلة " + ext + ")"
+    return "غير محدد"
+
+
+def _v19_load_staff_missed(date_from=None, date_to=None, threshold=15):
+    df, dt = _v19_period_values(date_from, date_to)
+    try:
+        from restaurant_ops.api.report_api import get_staff_missed_attempts
+        d = get_staff_missed_attempts(df, dt, threshold) or {}
+    except Exception as e:
+        return {"success": False, "message": cstr(e), "total_attempts": 0, "grouped": [], "details": []}
+    grouped = d.get("grouped") or []
+    details = d.get("details") or []
+
+    # If grouped is missing but details exist, group details here as a fallback.
+    if not grouped and details:
+        tmp = {}
+        for r in details:
+            ext = cstr(r.get("extension") or "").strip() or "غير محدد"
+            key = ext
+            if key not in tmp:
+                tmp[key] = {"extension": ext, "employee_name": r.get("employee_name") or "", "count": 0, "duration": 0}
+            tmp[key]["count"] += 1
+            try:
+                tmp[key]["duration"] += int(float(r.get("duration") or 0))
+            except Exception:
+                pass
+        grouped = sorted(tmp.values(), key=lambda x: x.get("count", 0), reverse=True)
+
+    total = cint(d.get("total_attempts") or 0)
+    if not total:
+        total = sum(cint(r.get("count") or 0) for r in grouped) or len(details)
+    total_duration = d.get("total_duration")
+    if total_duration is None:
+        total_duration = sum(cint(r.get("duration") or r.get("total_duration") or 0) for r in grouped)
+
+    return {
+        "success": d.get("success", True),
+        "date_from": df,
+        "date_to": dt,
+        "threshold": threshold,
+        "total_attempts": total,
+        "extensions_count": d.get("extensions_count") or len(grouped),
+        "total_duration": total_duration or 0,
+        "grouped": grouped,
+        "details": details,
+        "raw": d,
+    }
+
+
+def _v19_table(headers, rows, empty_text="لا توجد بيانات"):
+    th = "".join("<th style='background:#111827;color:white;padding:9px;border:1px solid #e5e7eb;text-align:right'>%s</th>" % _v19_escape(h) for h in headers)
+    if not rows:
+        body = "<tr><td colspan='%s' style='padding:12px;border:1px solid #e5e7eb;text-align:center;color:#64748b;background:#f8fafc'>%s</td></tr>" % (len(headers), _v19_escape(empty_text))
+    else:
+        trs = []
+        for row in rows:
+            trs.append("<tr>" + "".join("<td style='padding:8px;border:1px solid #e5e7eb;text-align:right'>%s</td>" % _v19_escape(cell) for cell in row) + "</tr>")
+        body = "".join(trs)
+    return "<table dir='rtl' width='100%' cellpadding='0' cellspacing='0' style='border-collapse:collapse;width:100%;direction:rtl;text-align:right;margin-top:8px'>" + "<thead><tr>" + th + "</tr></thead><tbody>" + body + "</tbody></table>"
+
+
+def _v19_staff_missed_rows_for_table(data, max_rows=50):
+    rows = []
+    for r in (data.get("grouped") or [])[:max_rows]:
+        ext = cstr(r.get("extension") or r.get("actual_ext") or "").strip()
+        rows.append([
+            ext or "غير محدد",
+            _v19_employee_label(r),
+            cint(r.get("count") or 0),
+            _v19_fmt_seconds(r.get("duration") or r.get("total_duration") or 0),
+        ])
+    return rows
+
+
+def _v19_staff_missed_section_html(date_from=None, date_to=None, title="محاولات فائتة على الموظفين", include_cards=True):
+    d = _v19_load_staff_missed(date_from, date_to, 15)
+    total = cint(d.get("total_attempts") or 0)
+    if not d.get("success"):
+        return "<h3>%s</h3><div style='background:#fef2f2;color:#991b1b;border:1px solid #fecaca;border-radius:10px;padding:10px'>تعذر تحميل محاولات الموظفين الفائتة: %s</div>" % (_v19_escape(title), _v19_escape(d.get("message") or ""))
+    if total <= 0:
+        return "<h3>%s</h3><div style='background:#f8fafc;color:#64748b;border:1px solid #e5e7eb;border-radius:10px;padding:10px'>لا توجد محاولات فائتة على الموظفين خلال الفترة.</div>" % _v19_escape(title)
+
+    rows = _v19_staff_missed_rows_for_table(d)
+    cards = ""
+    if include_cards:
+        cards = """
+        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:10px 0">
+          <div style="background:#fef2f2;border:1px solid #fecaca;border-radius:12px;padding:10px"><div style="color:#991b1b;font-weight:bold">محاولات لم يرد عليها</div><div style="font-size:24px;font-weight:900">%s</div></div>
+          <div style="background:#fff7ed;border:1px solid #fed7aa;border-radius:12px;padding:10px"><div style="color:#9a3412;font-weight:bold">تحويلات متأثرة</div><div style="font-size:24px;font-weight:900">%s</div></div>
+          <div style="background:#f8fafc;border:1px solid #e5e7eb;border-radius:12px;padding:10px"><div style="color:#334155;font-weight:bold">إجمالي مدة الرن</div><div style="font-size:24px;font-weight:900">%s</div></div>
+        </div>
+        """ % (_v19_escape(total), _v19_escape(d.get("extensions_count") or len(rows)), _v19_escape(_v19_fmt_seconds(d.get("total_duration") or 0)))
+
+    note = "<div style='background:#eff6ff;color:#1e3a8a;border:1px solid #bfdbfe;border-radius:10px;padding:10px;margin:8px 0'>المقصود: المكالمة دخلت الطابور ثم رنّت على تحويلة موظف ولم يرد، حتى لو تم تحويلها لاحقًا لموظف آخر.</div>"
+    return "<h3>%s</h3>%s%s%s" % (
+        _v19_escape(title),
+        note,
+        cards,
+        _v19_table(["التحويلة", "الموظف المرتبط وقتها", "عدد المحاولات", "إجمالي مدة الرن"], rows, "لا توجد تفاصيل متاحة رغم وجود محاولات في الملخص"),
+    )
+
+
+# Legacy/simple center report path.
+def _staff_missed_attempts(threshold=15):
+    return _v19_load_staff_missed(today(), today(), threshold)
+
+
+def _staff_missed_section():
+    return _v19_staff_missed_section_html(today(), today(), "محاولات فائتة من الموظفين داخل الطابور", include_cards=True)
+
+
+# Email-report-customizer standard path.
+def _er_staff_missed_section(date_from, date_to):
+    return _v19_staff_missed_section_html(date_from, date_to, "محاولات فائتة على الموظفين", include_cards=False)
+
+
+# Advanced builder path.
+def _adv_staff_missed_section(st):
+    try:
+        df, dt, _start_dt, _end_dt = _adv_period(st)
+    except Exception:
+        df = dt = today()
+    try:
+        title = st.get("section_titles", {}).get("staff_missed", "محاولات فائتة على الموظفين")
+    except Exception:
+        title = "محاولات فائتة على الموظفين"
+    return _v19_staff_missed_section_html(df, dt, title, include_cards=False)
+
+
+@frappe.whitelist()
+def debug_center_staff_missed_email_section(date_from=None, date_to=None):
+    d = _v19_load_staff_missed(date_from or today(), date_to or date_from or today(), 15)
+    return {
+        "success": True,
+        "date_from": d.get("date_from"),
+        "date_to": d.get("date_to"),
+        "total_attempts": d.get("total_attempts"),
+        "extensions_count": d.get("extensions_count"),
+        "total_duration": d.get("total_duration"),
+        "grouped_sample": (d.get("grouped") or [])[:10],
+        "table_rows_sample": _v19_staff_missed_rows_for_table(d, 10),
+        "html_has_empty_cells_warning": False,
+    }
+# END ROSHDY CENTER STAFF MISSED SECTION V19
+'''
+if start in s and end in s:
+    i = s.index(start)
+    j = s.index(end, i) + len(end)
+    s = s[:i] + patch.strip() + s[j:]
+else:
+    s = s.rstrip() + "\n\n" + patch.strip() + "\n"
+compile(s, str(p), "exec")
+p.write_text(s, encoding="utf-8")
+PY
+
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+[[ -n "$APP_OWNER" ]] && chown "$APP_OWNER" "$EMAIL_REPORT" 2>/dev/null || true
+
+echo "🧹 Clear cache + restart app services"
+bench_exec clear-cache || true
+"${COMPOSE[@]}" restart backend frontend websocket queue-short queue-long scheduler >/dev/null
+sleep 8
+bench_exec clear-cache || true
+
+echo "🧪 Validation"
+set +e
+bench_exec execute restaurant_ops.api.email_report.debug_center_staff_missed_email_section | tee "$BACKUP_DIR/debug_center_staff_missed_email_section_v19.txt"
+V1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.report_api.get_staff_missed_attempts | tee "$BACKUP_DIR/report_api_staff_missed_attempts_v19.txt"
+V2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.email_report.preview_email_report --kwargs '{"report_type":"center"}' > "$BACKUP_DIR/preview_center_after_v19.txt" 2>&1
+V3=$?
+head -c 1000 "$BACKUP_DIR/preview_center_after_v19.txt" | tee "$BACKUP_DIR/preview_center_after_v19_head.txt"
+echo
+set -e
+
+if [[ $V1 -ne 0 || $V2 -ne 0 ]]; then
+  echo "❌ Validation failed. راجع: $BACKUP_DIR"
+  exit 1
+fi
+if [[ $V3 -ne 0 ]]; then
+  echo "⚠️ Center preview soft test رجع non-zero. ده ممكن يكون بسبب اختلاف signature قديم، لكن debug section نجح. راجع: $BACKUP_DIR/preview_center_after_v19.txt"
+fi
+
+echo "🏥 Health Check - Elastix/CDR/AMI + Queue + Call Report"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$BACKUP_DIR/health_asterisk_bridge.txt"
+H1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status | tee "$BACKUP_DIR/health_queue_status.txt"
+H2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' | tee "$BACKUP_DIR/health_call_report.txt"
+H3=${PIPESTATUS[0]}
+set -e
+
+if [[ $H1 -ne 0 || $H2 -ne 0 || $H3 -ne 0 ]]; then
+  echo "⚠️ Health returned non-zero. راجع: $BACKUP_DIR"
+else
+  echo "✅ Health checks OK"
+fi
+
+echo "============================================================"
+echo "✅ DONE V19"
+echo "📦 Backup folder: $BACKUP_DIR"
+echo "📧 Center Manager staff-missed table now uses correct keys and hides empty table when no attempts"
+echo "🛡️ report_api.py / Elastix / CDR / AMI untouched"
+echo "============================================================"

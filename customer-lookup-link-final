@@ -1,0 +1,465 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# customer-lookup-link-final
+# Final Customer Lookup integration:
+# - Hide Customer Lookup Settings from call-center admin desk links (System Manager direct URL only).
+# - Link lookup cache to Social Inbox conversations (auto on WhatsApp webhook + manual refresh in UI).
+# - Enrich CDR/call-report API with customer names from lookup query/cache.
+# - Keep settings page System Manager only.
+# - No DB credentials/query exposed to agents/center managers.
+
+ROOT="/opt/frappe_crm"
+SITE="crm.local"
+APP_HOST="$ROOT/apps/restaurant_ops"
+APP_DIR="$APP_HOST/restaurant_ops"
+WWW_DIR="$APP_DIR/www"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/CUSTOMER_LOOKUP_LINK_FINAL_BEFORE_$TS"
+
+say(){ echo -e "\n============================================================\n$1\n============================================================"; }
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo "❌ شغّل كـ root: sudo -i ثم ./customer-lookup-link-final"
+  exit 1
+fi
+
+say "1) Backup قبل الربط النهائي"
+cd "$ROOT"
+BACKEND="$(docker compose ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ لم أجد backend container. شغّل: cd /opt/frappe_crm && docker compose up -d"
+  exit 1
+fi
+mkdir -p "$BACKUP_DIR"
+cp -a "$APP_HOST" "$BACKUP_DIR/restaurant_ops"
+[[ -f "$ROOT/docker-compose.yml" ]] && cp -a "$ROOT/docker-compose.yml" "$BACKUP_DIR/docker-compose.yml"
+echo "✅ Backup: $BACKUP_DIR"
+
+say "2) Hide Customer Lookup link from Admin Desk for non-System users"
+python3 - <<'PY'
+from pathlib import Path
+import re
+p = Path('/opt/frappe_crm/apps/restaurant_ops/restaurant_ops/www/admin-desk.html')
+if p.exists():
+    s = p.read_text(errors='ignore')
+    # Remove static Customer Lookup link entirely. Page remains accessible by direct URL for System Manager only.
+    s = re.sub(r'<!-- ROSHDY_CUSTOMER_LOOKUP_LINK_START -->[\s\S]*?<!-- ROSHDY_CUSTOMER_LOOKUP_LINK_END -->', '', s, flags=re.I)
+    # Also remove any accidental direct anchor to customer lookup from previous injections.
+    s = re.sub(r'<a[^>]+href=["\']/customer-lookup-settings["\'][\s\S]*?</a>\s*', '', s, flags=re.I)
+    s = s.replace('{#', '{ #')
+    p.write_text(s)
+    print('✅ admin-desk customer lookup static link removed')
+else:
+    print('⚠️ admin-desk.html not found')
+PY
+
+say "3) Patch Customer Lookup API: internal lookup + social display API"
+python3 - <<'PY'
+from pathlib import Path
+import re
+p = Path('/opt/frappe_crm/apps/restaurant_ops/restaurant_ops/api/customer_lookup_api.py')
+if not p.exists():
+    raise SystemExit('customer_lookup_api.py not found. Run customer-lookup-phaseA first.')
+s = p.read_text()
+s = re.sub(r'\n# ===== ROSHDY CUSTOMER LOOKUP LINK FINAL START =====[\s\S]*?# ===== ROSHDY CUSTOMER LOOKUP LINK FINAL END =====\n?', '\n', s)
+block = r'''
+# ===== ROSHDY CUSTOMER LOOKUP LINK FINAL START =====
+SOCIAL_VIEW_ROLES = {"System Manager", "Social Inbox Admin", "Social Inbox Supervisor", "Social Inbox Agent", "Call Center Admin", "Restaurant Agent"}
+
+
+def _can_view_lookup():
+    try:
+        user = frappe.session.user
+        roles = set(frappe.get_roles(user))
+        return user == "Administrator" or bool(roles & SOCIAL_VIEW_ROLES)
+    except Exception:
+        return False
+
+
+def _first_active_query_name():
+    return frappe.db.get_value("Customer Lookup Query", {"active": 1}, "name")
+
+
+def _run_lookup_internal(query_name, phone, force=0):
+    """Internal lookup with cache. Does not check System Manager; used by Social Inbox/CDR only."""
+    if not query_name:
+        query_name = _first_active_query_name()
+    if not query_name:
+        return {"success": False, "message": "Customer Lookup Query غير متظبط لسه", "rows": [], "display": ""}
+    query = frappe.get_doc("Customer Lookup Query", query_name)
+    source = frappe.get_doc("Customer Lookup Source", query.source)
+    if not int(source.active or 0) or not int(query.active or 0):
+        return {"success": False, "message": "Customer Lookup source/query inactive", "rows": [], "display": ""}
+    vars = normalize_phone(phone)
+    phone_norm = vars.get("phone_20") or vars.get("phone_digits") or str(phone or "")
+    ttl = int(query.cache_ttl_minutes or source.cache_ttl_minutes or 5)
+    if not int(force or 0):
+        cached = _get_cache(phone_norm, query.name)
+        if cached:
+            try:
+                result = json.loads(cached.result_json or "{}")
+            except Exception:
+                result = {}
+            return {"success": True, "cached": True, "phone": phone_norm, "query": query.name, "source": source.name, "result": result, "rows": result.get("rows") or [], "display": cached.display_text or result.get("display") or "", "expires_at": str(cached.expires_at)}
+    mode = query.lookup_mode
+    if mode == "Use Source Default":
+        mode = "HTTP URL" if source.source_type == "HTTP Bridge" else "SQL Query"
+    try:
+        if mode == "HTTP URL":
+            url = _render_template(source.http_url_template, vars)
+            import requests
+            r = requests.get(url, timeout=10)
+            parsed = _parse_http_response(r.text, source.http_response_type)
+            result = {"rows": parsed.get("rows") or [], "summary": (parsed.get("rows") or [{}])[0] if parsed.get("rows") else {}, "display": parsed.get("display") or "", "raw": parsed.get("raw") or parsed.get("raw_text") or parsed.get("raw_html"), "variables": vars, "http_status_code": r.status_code, "url": url}
+            cache = _save_cache(phone_norm, query.name, source.name, result, ttl)
+            return {"success": r.ok, "cached": False, "phone": phone_norm, "query": query.name, "source": source.name, "result": result, "rows": result.get("rows") or [], "display": cache.display_text, "expires_at": str(cache.expires_at)}
+        ok, msg = _safe_sql(query.sql_query)
+        if not ok:
+            return {"success": False, "message": msg, "rows": [], "display": ""}
+        max_rows = max(1, min(int(query.max_rows or 5), 50))
+        sql = query.sql_query.strip()
+        if not re.search(r"\blimit\b", sql, flags=re.I):
+            sql += f" limit {max_rows}"
+        con = _mysql_connect(source)
+        with con.cursor() as cur:
+            cur.execute(sql, vars)
+            rows = cur.fetchall()
+        con.close()
+        result = {"rows": rows, "summary": rows[0] if rows else {}, "display": _rows_to_display(rows), "variables": vars}
+        cache = _save_cache(phone_norm, query.name, source.name, result, ttl)
+        return {"success": True, "cached": False, "phone": phone_norm, "query": query.name, "source": source.name, "result": result, "rows": rows, "display": cache.display_text, "expires_at": str(cache.expires_at)}
+    except Exception as e:
+        # Cache errors too briefly, to avoid repeated hammering.
+        try:
+            name = _cache_key(phone_norm, query.name)
+            doc = frappe.get_doc("Customer Lookup Cache", name) if name else frappe.get_doc({"doctype": "Customer Lookup Cache"})
+            doc.phone_normalized = phone_norm
+            doc.query = query.name
+            doc.source = source.name
+            doc.status = "Error"
+            doc.last_lookup_at = now_datetime()
+            doc.expires_at = add_to_date(now_datetime(), minutes=1)
+            doc.result_json = "{}"
+            doc.display_text = ""
+            doc.error_message = str(e)
+            if doc.is_new(): doc.insert(ignore_permissions=True)
+            else: doc.save(ignore_permissions=True)
+            frappe.db.commit()
+        except Exception:
+            pass
+        return {"success": False, "message": str(e), "phone": phone_norm, "rows": [], "display": ""}
+
+
+def _extract_customer_name_from_result(result):
+    """Pick customer name from Arabic/English query result keys."""
+    rows = []
+    if isinstance(result, dict):
+        rows = result.get("rows") or []
+        if not rows and isinstance(result.get("summary"), dict):
+            rows = [result.get("summary")]
+    if not rows:
+        return ""
+    row = rows[0] or {}
+    preferred = [
+        "اسم العميل", "العميل", "اسم", "Customer Name", "customer_name", "client_name", "name", "Name", "cust_name", "customer",
+    ]
+    for k in preferred:
+        v = row.get(k)
+        if v:
+            return str(v)
+    # Fallback: first non-phone-ish text field
+    for k, v in row.items():
+        if v is None:
+            continue
+        sv = str(v).strip()
+        if not sv:
+            continue
+        if re.fullmatch(r"[+0-9\s\-]{7,}", sv):
+            continue
+        return sv[:80]
+    return ""
+
+
+def get_customer_name_internal(phone, force=0):
+    res = _run_lookup_internal(None, phone, force=force)
+    if not res.get("success"):
+        return ""
+    return _extract_customer_name_from_result(res.get("result") or {})
+
+
+@frappe.whitelist(allow_guest=False)
+def get_customer_lookup_for_phone(phone, force=0):
+    if not _can_view_lookup():
+        return _deny()
+    res = _run_lookup_internal(None, phone, force=force)
+    if res.get("success"):
+        res["customer_name"] = _extract_customer_name_from_result(res.get("result") or {})
+    return res
+
+
+@frappe.whitelist(allow_guest=False)
+def get_customer_lookup_for_conversation(conversation, force=0):
+    if not _can_view_lookup():
+        return _deny()
+    try:
+        conv = frappe.get_doc("Social Conversation", conversation)
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+    phone = conv.normalized_phone or conv.customer_phone or conv.external_chat_id
+    res = _run_lookup_internal(None, phone, force=force)
+    if res.get("success"):
+        cname = _extract_customer_name_from_result(res.get("result") or {})
+        res["customer_name"] = cname
+        # Update conversation/customer name if useful and not just a number.
+        try:
+            if cname and (not conv.customer_name or conv.customer_name == conv.customer_phone or str(conv.customer_name).isdigit() or "@" in str(conv.customer_name)):
+                conv.customer_name = cname
+                conv.save(ignore_permissions=True)
+                frappe.db.commit()
+        except Exception:
+            pass
+    return res
+# ===== ROSHDY CUSTOMER LOOKUP LINK FINAL END =====
+'''
+p.write_text(s.rstrip() + "\n\n" + block + "\n")
+print('✅ customer_lookup_api patched')
+PY
+
+say "4) Patch Social Inbox API webhook to auto-refresh lookup on incoming messages"
+python3 - <<'PY'
+from pathlib import Path
+import re
+p = Path('/opt/frappe_crm/apps/restaurant_ops/restaurant_ops/api/social_inbox_api.py')
+s = p.read_text()
+s = re.sub(r'\n# ===== ROSHDY CUSTOMER LOOKUP SOCIAL WEBHOOK START =====[\s\S]*?# ===== ROSHDY CUSTOMER LOOKUP SOCIAL WEBHOOK END =====\n?', '\n', s)
+block = r'''
+# ===== ROSHDY CUSTOMER LOOKUP SOCIAL WEBHOOK START =====
+try:
+    _roshdy_lookup_base_webhook = webhook
+except Exception:
+    _roshdy_lookup_base_webhook = None
+
+
+@frappe.whitelist(allow_guest=True, methods=["POST"])
+def webhook():
+    """Wrapped Social webhook: store WhatsApp event, then refresh customer lookup cache by conversation phone."""
+    if not _roshdy_lookup_base_webhook:
+        return {"success": False, "message": "Base webhook missing"}
+    res = _roshdy_lookup_base_webhook()
+    try:
+        conv_name = None
+        if isinstance(res, dict):
+            conv_name = res.get("conversation")
+        if conv_name:
+            from restaurant_ops.api.customer_lookup_api import get_customer_lookup_for_conversation
+            # call as internal by temporarily using API function; it checks roles, so use internal instead
+            from restaurant_ops.api.customer_lookup_api import _run_lookup_internal, _extract_customer_name_from_result
+            conv = frappe.get_doc("Social Conversation", conv_name)
+            phone = conv.normalized_phone or conv.customer_phone or conv.external_chat_id
+            lookup = _run_lookup_internal(None, phone, force=0)
+            if lookup.get("success"):
+                cname = _extract_customer_name_from_result(lookup.get("result") or {})
+                if cname and (not conv.customer_name or conv.customer_name == conv.customer_phone or "@" in str(conv.customer_name) or str(conv.customer_name).isdigit()):
+                    conv.customer_name = cname
+                    conv.save(ignore_permissions=True)
+                    frappe.db.commit()
+                res["customer_lookup"] = {"success": True, "customer_name": cname, "cached": lookup.get("cached")}
+    except Exception as e:
+        try:
+            res["customer_lookup_error"] = str(e)
+        except Exception:
+            pass
+    return res
+# ===== ROSHDY CUSTOMER LOOKUP SOCIAL WEBHOOK END =====
+'''
+p.write_text(s.rstrip() + "\n\n" + block + "\n")
+print('✅ social_inbox webhook patched')
+PY
+
+say "5) Patch Social Inbox UI: customer lookup panel + refresh"
+python3 - <<'PY'
+from pathlib import Path
+import re
+p = Path('/opt/frappe_crm/apps/restaurant_ops/restaurant_ops/www/social-inbox.html')
+if not p.exists():
+    print('⚠️ social-inbox.html not found')
+    raise SystemExit
+s = p.read_text(errors='ignore')
+s = re.sub(r'<!-- ROSHDY_CUSTOMER_LOOKUP_UI_START -->[\s\S]*?<!-- ROSHDY_CUSTOMER_LOOKUP_UI_END -->', '', s, flags=re.I)
+block = r'''
+<!-- ROSHDY_CUSTOMER_LOOKUP_UI_START -->
+<script id="customer-lookup-ui-script">
+(function(){
+function M(a){return a.join('')}
+function esc(x){return String(x==null?'':x).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
+async function api(method,args){var qs=new URLSearchParams();args=args||{};Object.keys(args).forEach(function(k){if(args[k]!==undefined&&args[k]!==null)qs.append(k,args[k])});var r=await fetch('/api/method/'+method+(qs.toString()?'?'+qs.toString():''),{credentials:'same-origin',cache:'no-store'});var j=await r.json();return j.message}
+function ensureCard(){
+  if(document.getElementById('customerLookupCard')) return document.getElementById('customerLookupCard');
+  var side=document.querySelector('.side') || document.querySelector('.side-body') || document.querySelector('.panel .body');
+  if(!side) return null;
+  var div=document.createElement('div');
+  div.id='customerLookupCard';
+  div.className='card';
+  div.innerHTML='<b>بيانات العميل من قاعدة الأوردرات</b><div id="customerLookupBody" class="muted">لم يتم التحميل</div><button class="btn light" id="customerLookupRefresh" type="button">Refresh Customer Data</button>';
+  side.insertBefore(div, side.children[1] || null);
+  var b=div.querySelector('#customerLookupRefresh');
+  if(b) b.addEventListener('click', function(){ window.loadCustomerLookup && window.loadCustomerLookup(true); });
+  return div;
+}
+window.loadCustomerLookup = async function(force){
+  var card=ensureCard(); if(!card) return;
+  var body=document.getElementById('customerLookupBody');
+  if(!window.currentConv){ body.innerHTML='اختار محادثة'; return; }
+  body.innerHTML='جاري تحميل بيانات العميل...';
+  try{
+    var d=await api(M(['restaurant','_ops.api.customer_lookup','_api.get_customer_lookup_for_conversation']),{conversation:window.currentConv,force:force?1:0});
+    if(!d || !d.success){ body.innerHTML='<span style="color:#b91c1c">'+esc((d&&d.message)||'لا توجد بيانات أو Query غير متظبط')+'</span>'; return; }
+    var rows=d.rows || (d.result&&d.result.rows) || [];
+    var html='';
+    if(d.customer_name) html+='<div><b>اسم العميل:</b> '+esc(d.customer_name)+'</div>';
+    if(d.cached) html+='<div class="muted">من الكاش — صالح حتى '+esc(d.expires_at||'')+'</div>';
+    else html+='<div class="muted">تم التحديث الآن — صالح حتى '+esc(d.expires_at||'')+'</div>';
+    if(rows.length){
+      html+='<div style="margin-top:8px">';
+      rows.slice(0,5).forEach(function(row,idx){
+        html+='<div style="border:1px solid #e5e7eb;border-radius:10px;padding:8px;margin:6px 0;background:#f8fafc">';
+        if(rows.length>1) html+='<b>نتيجة '+(idx+1)+'</b><br>';
+        Object.keys(row||{}).forEach(function(k){html+='<div><b>'+esc(k)+':</b> '+esc(row[k])+'</div>'});
+        html+='</div>';
+      });
+      html+='</div>';
+    } else {
+      html+='<div class="muted">لا توجد Rows راجعة من الكويري</div>';
+    }
+    body.innerHTML=html;
+  }catch(e){ body.innerHTML='<span style="color:#b91c1c">'+esc(e.message||e)+'</span>'; }
+};
+var oldOpen=window.openConv;
+if(typeof oldOpen==='function'){
+  window.openConv=async function(name){ await oldOpen(name); setTimeout(function(){window.loadCustomerLookup(false)},250); };
+}
+setTimeout(ensureCard,700);
+})();
+</script>
+<!-- ROSHDY_CUSTOMER_LOOKUP_UI_END -->
+'''
+if '</body>' in s:
+    s=s.replace('</body>', block+'\n</body>', 1)
+else:
+    s=s+'\n'+block
+p.write_text(s)
+print('✅ social-inbox UI patched')
+PY
+
+say "6) Patch CDR report API to enrich customer names"
+python3 - <<'PY'
+from pathlib import Path
+import re
+p = Path('/opt/frappe_crm/apps/restaurant_ops/restaurant_ops/api/report_api.py')
+if not p.exists():
+    raise SystemExit('report_api.py not found')
+s = p.read_text()
+s = re.sub(r'\n# ===== ROSHDY CDR CUSTOMER LOOKUP START =====[\s\S]*?# ===== ROSHDY CDR CUSTOMER LOOKUP END =====\n?', '\n', s)
+block = r'''
+# ===== ROSHDY CDR CUSTOMER LOOKUP START =====
+try:
+    _roshdy_customer_lookup_base_get_calls_report = get_calls_report
+except Exception:
+    _roshdy_customer_lookup_base_get_calls_report = None
+
+
+def _roshdy_call_phone_for_lookup(call):
+    for k in ("src", "cnum", "clid"):
+        v = call.get(k) if isinstance(call, dict) else None
+        if v:
+            import re
+            digits = re.sub(r"\D+", "", str(v))
+            if len(digits) >= 10:
+                return v
+    return ""
+
+
+@frappe.whitelist(allow_guest=False)
+def get_calls_report(*args, **kwargs):
+    res = _roshdy_customer_lookup_base_get_calls_report(*args, **kwargs) if _roshdy_customer_lookup_base_get_calls_report else {"success": False, "calls": []}
+    try:
+        calls = res.get("calls") or []
+        if not calls:
+            return res
+        from restaurant_ops.api.customer_lookup_api import get_customer_name_internal
+        cache = {}
+        for call in calls:
+            phone = _roshdy_call_phone_for_lookup(call)
+            if not phone:
+                continue
+            key = str(phone)
+            if key not in cache:
+                try:
+                    cache[key] = get_customer_name_internal(phone, force=0) or ""
+                except Exception:
+                    cache[key] = ""
+            name = cache[key]
+            if name:
+                call["customer_name"] = name
+                call["customer_lookup_name"] = name
+                call["caller_label"] = name + " — " + str(call.get("src") or call.get("cnum") or "")
+                # Make it visible on old call-report UIs that display CLID/CNAM only. This is response-only, DB is untouched.
+                try:
+                    call["cnam"] = name
+                    call["clid"] = name + " <" + str(call.get("src") or call.get("cnum") or "") + ">"
+                except Exception:
+                    pass
+    except Exception as e:
+        try:
+            res["customer_lookup_error"] = str(e)
+        except Exception:
+            pass
+    return res
+# ===== ROSHDY CDR CUSTOMER LOOKUP END =====
+'''
+p.write_text(s.rstrip() + "\n\n" + block + "\n")
+print('✅ report_api patched')
+PY
+
+say "7) Migrate/Clear/Restart"
+docker exec "$BACKEND" bash -lc "find /home/frappe/frappe-bench/apps/restaurant_ops -name '*.pyc' -delete; find /home/frappe/frappe-bench/apps/restaurant_ops -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true"
+docker exec "$BACKEND" bench --site "$SITE" migrate
+docker exec "$BACKEND" bench --site "$SITE" clear-cache || true
+docker exec "$BACKEND" bench --site "$SITE" clear-website-cache || true
+docker compose restart backend frontend websocket queue-short queue-long scheduler
+sleep 10
+BACKEND="$(docker compose ps -q backend)"
+
+say "8) Validation"
+echo "--- Page HTTP status ---"
+for page in customer-lookup-settings social-inbox call-report admin-desk; do
+  code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$page" || true)"
+  echo "$page => $code"
+done
+
+echo "--- Customer lookup variables test ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.customer_lookup_api.variables_for_phone --kwargs '{"phone":"+201028567017"}' || true
+
+echo "--- Active lookup query check ---"
+docker exec "$BACKEND" bench --site "$SITE" execute frappe.db.get_value --args '["Customer Lookup Query", {"active":1}, "name"]' || true
+
+echo "--- Call report sample with customer lookup fields (will show names only after query/source configured) ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":2,"view_mode":"admin"}' || true
+
+say "9) Health Check مهم: Elastix/CDR/AMI + Queue + Call Report"
+echo "--- Asterisk/Elastix diagnostics ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics || true
+
+echo "--- Queue status ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.queue_api.get_queue_status || true
+
+echo "--- Calls report admin sample ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' || true
+
+say "✅ Customer Lookup linked to Social Inbox + CDR يا زعيم"
+echo "مهم: لازم System Manager يضيف Source + Query active من /customer-lookup-settings."
+echo "صيغة SQL مثال:"
+echo 'SELECT customer_name AS `اسم العميل`, order_no AS `رقم آخر أوردر`, order_date AS `تاريخ آخر طلب`, branch_name AS `آخر فرع`, total AS `إجمالي آخر طلب` FROM orders WHERE phone LIKE %(phone_like)s ORDER BY order_date DESC LIMIT 5'
+echo "لو هتستخدم PHP القديم: Source Type HTTP Bridge + URL http://10.11.1.19/caller.php?phone={phone_local} ويفضل يرجع JSON."
+echo "Backup: $BACKUP_DIR"

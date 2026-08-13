@@ -1,0 +1,320 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Roshdy V31: Desk role security guard
+# ----------------------------------------------------------------------
+# Fixes:
+# - Agent-facing pages showing Admin Desk button/link.
+# - Direct /admin-desk access by non-admin users.
+# - Adds lightweight role guard API and client-side redirect/hide.
+# - Admin-only pages get a guard so accidental access redirects away.
+# Safety:
+# - Backup first.
+# - Does NOT touch report_api.py / Elastix / CDR / AMI config.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "❌ docker compose/docker-compose مش موجود"
+  exit 1
+fi
+
+APP_DIR="$ROOT/apps/$APP"
+PKG_DIR="$APP_DIR/$APP"
+API_DIR="$PKG_DIR/api"
+WWW_DIR="$PKG_DIR/www"
+SECURITY_API="$API_DIR/security_api.py"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/FIX_DESK_ROLE_SECURITY_V31_BEFORE_$TS"
+mkdir -p "$BACKUP_DIR/files"
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend container مش شغال أو مش لاقيه"
+  exit 1
+fi
+
+bench_exec() {
+  "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"
+}
+
+echo "============================================================"
+echo "🔐 Roshdy V31: Desk role security guard"
+echo "📦 Backup: $BACKUP_DIR"
+echo "============================================================"
+
+echo "🧯 Step 1: Backup files + bench backup"
+for f in \
+  "$SECURITY_API" \
+  "$WWW_DIR/admin-desk.html" "$WWW_DIR/admin-desk.py" \
+  "$WWW_DIR/feedback.html" "$WWW_DIR/feedback.py" \
+  "$WWW_DIR/agent-desk.html" "$WWW_DIR/my-break.html" \
+  "$WWW_DIR/feedback-admin.html" "$WWW_DIR/feedback-admin.py" \
+  "$WWW_DIR/user-management.html" "$WWW_DIR/user-management.py" \
+  "$WWW_DIR/break-admin.html" "$WWW_DIR/break-admin.py" \
+  "$WWW_DIR/settings.html" "$WWW_DIR/settings.py" \
+  "$WWW_DIR/order-cancellations-report.html" "$WWW_DIR/order-cancellations-report.py" \
+  "$WWW_DIR/queue-journey-report.html" "$WWW_DIR/queue-journey-report.py"; do
+  [[ -e "$f" ]] && cp -a "$f" "$BACKUP_DIR/files/$(basename "$f").before" || true
+done
+bench_exec backup --with-files | tee "$BACKUP_DIR/bench_backup_output.txt"
+
+# -----------------------------------------------------------------------------
+# 2) Security API
+# -----------------------------------------------------------------------------
+echo "🧩 Step 2: Install security_api.py"
+cat > "$SECURITY_API" <<'PYAPI'
+# -*- coding: utf-8 -*-
+import frappe
+
+ADMIN_ROLES = {"System Manager", "Call Center Admin", "Restaurant Manager", "Break Admin"}
+AGENT_ROLE = "Restaurant Agent"
+QUALITY_ROLES = {"Complaint_Quality_User"}
+
+
+def _roles(user=None):
+    user = user or frappe.session.user
+    if not user or user == "Guest":
+        return []
+    try:
+        return frappe.get_roles(user)
+    except Exception:
+        return []
+
+
+def _is_admin(user=None):
+    user = user or frappe.session.user
+    if user == "Administrator":
+        return True
+    return bool(set(_roles(user)).intersection(ADMIN_ROLES))
+
+
+def _is_agent(user=None):
+    return AGENT_ROLE in set(_roles(user))
+
+
+def _is_quality_only(user=None):
+    r = set(_roles(user))
+    return bool(r.intersection(QUALITY_ROLES)) and not bool(r.intersection(ADMIN_ROLES))
+
+
+def _redirect_target(user=None):
+    user = user or frappe.session.user
+    r = set(_roles(user))
+    if not user or user == "Guest":
+        return "/login"
+    if _is_admin(user):
+        return "/admin-desk"
+    if AGENT_ROLE in r:
+        return "/agent-desk"
+    if _is_quality_only(user):
+        return "/quality-desk"
+    return "/login?msg=no_role"
+
+
+@frappe.whitelist()
+def get_my_access():
+    user = frappe.session.user
+    roles = _roles(user)
+    return {
+        "success": True,
+        "user": user,
+        "roles": roles,
+        "is_guest": 1 if (not user or user == "Guest") else 0,
+        "is_admin": 1 if _is_admin(user) else 0,
+        "is_agent": 1 if _is_agent(user) else 0,
+        "is_quality_only": 1 if _is_quality_only(user) else 0,
+        "redirect_target": _redirect_target(user),
+    }
+
+
+@frappe.whitelist()
+def assert_admin():
+    if not _is_admin():
+        frappe.throw("غير مسموح: هذه الصفحة مخصصة للأدمن فقط")
+    return {"success": True}
+PYAPI
+
+# -----------------------------------------------------------------------------
+# 3) Patch page python context for admin-only pages (soft guard)
+# -----------------------------------------------------------------------------
+echo "🧩 Step 3: Patch admin-only page contexts"
+python3 - <<'PY'
+from pathlib import Path
+
+www = Path('/opt/frappe_crm/apps/restaurant_ops/restaurant_ops/www')
+admin_pages = {
+    'admin-desk.py': 'ADMIN_ROLES',
+    'feedback-admin.py': 'ADMIN_ROLES',
+    'user-management.py': 'ADMIN_ROLES',
+    'break-admin.py': 'ADMIN_ROLES',
+    'settings.py': 'ADMIN_ROLES',
+    'order-cancellations-report.py': 'ADMIN_ROLES',
+    'queue-journey-report.py': 'ADMIN_ROLES',
+}
+for fn in admin_pages:
+    p = www / fn
+    p.write_text("""import frappe\nfrom restaurant_ops.www._context import protect, ADMIN_ROLES\nno_cache = 1\n\ndef get_context(context):\n    user, roles, ok = protect(context, allowed_roles=ADMIN_ROLES)\n    context.security_admin_only = 1\n    if not ok:\n        # HTML guard will redirect; backend APIs are also protected.\n        context.redirect_target = '/agent-desk' if 'Restaurant Agent' in roles else '/login'\n""", encoding='utf-8')
+PY
+
+# -----------------------------------------------------------------------------
+# 4) HTML guards
+# -----------------------------------------------------------------------------
+echo "🧩 Step 4: Patch HTML role guards and hide Admin Desk links for agents"
+python3 - <<'PY'
+from pathlib import Path
+
+www = Path('/opt/frappe_crm/apps/restaurant_ops/restaurant_ops/www')
+
+ADMIN_GUARD_A = '<!-- BEGIN ROSHDY ADMIN ONLY GUARD V31 -->'
+ADMIN_GUARD_B = '<!-- END ROSHDY ADMIN ONLY GUARD V31 -->'
+ADMIN_GUARD = r'''
+<!-- BEGIN ROSHDY ADMIN ONLY GUARD V31 -->
+<style id="roshdy-admin-only-guard-style-v31">html.roshdy-admin-pending body{visibility:hidden}</style>
+<script id="roshdy-admin-only-guard-head-v31">document.documentElement.classList.add('roshdy-admin-pending');</script>
+<script id="roshdy-admin-only-guard-v31">
+(function(){
+  function go(url){ window.location.replace(url || '/agent-desk'); }
+  fetch('/api/method/restaurant_ops.api.security_api.get_my_access', {method:'GET', credentials:'same-origin', cache:'no-store'})
+    .then(function(r){return r.json();})
+    .then(function(j){var d=j.message||j||{}; if(!d.is_admin){ go(d.redirect_target); } else { document.documentElement.classList.remove('roshdy-admin-pending'); }})
+    .catch(function(){ go('/login'); });
+})();
+</script>
+<!-- END ROSHDY ADMIN ONLY GUARD V31 -->
+'''
+
+AGENT_HIDE_A = '<!-- BEGIN ROSHDY HIDE ADMIN LINKS FOR AGENTS V31 -->'
+AGENT_HIDE_B = '<!-- END ROSHDY HIDE ADMIN LINKS FOR AGENTS V31 -->'
+AGENT_HIDE = r'''
+<!-- BEGIN ROSHDY HIDE ADMIN LINKS FOR AGENTS V31 -->
+<script id="roshdy-hide-admin-links-v31">
+(function(){
+  function hideAdminLinks(){
+    try{
+      fetch('/api/method/restaurant_ops.api.security_api.get_my_access', {method:'GET', credentials:'same-origin', cache:'no-store'})
+        .then(function(r){return r.json();})
+        .then(function(j){
+          var d=j.message||j||{};
+          if(d.is_admin) return;
+          Array.prototype.slice.call(document.querySelectorAll('a,button')).forEach(function(el){
+            var href=(el.getAttribute('href')||'');
+            var txt=(el.textContent||'').trim();
+            if(href.indexOf('/admin-desk')>=0 || txt==='Admin Desk' || txt.indexOf('لوحة التحكم')>=0){
+              el.style.display='none';
+              el.setAttribute('aria-hidden','true');
+              el.onclick=function(ev){ev.preventDefault(); return false;};
+            }
+          });
+        });
+    }catch(e){}
+  }
+  setTimeout(hideAdminLinks, 50);
+  setTimeout(hideAdminLinks, 800);
+})();
+</script>
+<!-- END ROSHDY HIDE ADMIN LINKS FOR AGENTS V31 -->
+'''
+
+def remove_block(s, a, b):
+    while a in s and b in s:
+        i=s.index(a); j=s.index(b,i)+len(b); s=s[:i]+'\n'+s[j:]
+    return s
+
+def inject_before_body(path, block, a, b):
+    if not path.exists(): return
+    s=path.read_text(encoding='utf-8', errors='ignore')
+    s=remove_block(s,a,b)
+    low=s.lower(); idx=low.rfind('</body>')
+    if idx>=0: s=s[:idx]+'\n'+block+'\n'+s[idx:]
+    else: s=s.rstrip()+'\n'+block+'\n'
+    path.write_text(s,encoding='utf-8')
+
+def inject_admin_guard(path):
+    if not path.exists(): return
+    s=path.read_text(encoding='utf-8', errors='ignore')
+    s=remove_block(s,ADMIN_GUARD_A,ADMIN_GUARD_B)
+    # Put guard as early as possible, right after <head> if present.
+    low=s.lower(); idx=low.find('<head>')
+    if idx>=0:
+        idx_end=idx+len('<head>')
+        s=s[:idx_end]+'\n'+ADMIN_GUARD+'\n'+s[idx_end:]
+    else:
+        s=ADMIN_GUARD+'\n'+s
+    path.write_text(s,encoding='utf-8')
+
+# Admin-only pages get redirect guard.
+for name in ['admin-desk.html','feedback-admin.html','user-management.html','break-admin.html','settings.html','order-cancellations-report.html','queue-journey-report.html']:
+    inject_admin_guard(www/name)
+
+# Agent-facing/mixed pages hide admin links.
+for name in ['feedback.html','agent-desk.html','my-break.html']:
+    inject_before_body(www/name, AGENT_HIDE, AGENT_HIDE_A, AGENT_HIDE_B)
+
+# Also remove literal Admin Desk button from feedback header if possible; keep href hidden fallback too.
+fb = www/'feedback.html'
+if fb.exists():
+    s=fb.read_text(encoding='utf-8', errors='ignore')
+    # Replace visible Admin Desk text with link carrying class so JS can hide; if non-admin hidden, if admin still visible.
+    s=s.replace('<a href="/admin-desk">Admin Desk</a>', '<a href="/admin-desk" class="admin-only-link">Admin Desk</a>')
+    fb.write_text(s, encoding='utf-8')
+PY
+
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+[[ -n "$APP_OWNER" ]] && chown -R "$APP_OWNER" "$API_DIR" "$WWW_DIR" 2>/dev/null || true
+
+# -----------------------------------------------------------------------------
+# 5) Restart / validate
+# -----------------------------------------------------------------------------
+echo "🧹 Step 5: Clear cache + restart app services"
+bench_exec clear-cache || true
+"${COMPOSE[@]}" restart backend frontend websocket queue-short queue-long scheduler >/dev/null
+sleep 8
+bench_exec clear-cache || true
+
+echo "🧪 Step 6: Validation"
+set +e
+bench_exec execute restaurant_ops.api.security_api.get_my_access | tee "$BACKUP_DIR/security_get_my_access.txt"
+V1=${PIPESTATUS[0]}
+for p in feedback admin-desk feedback-admin agent-desk; do
+  code="$(curl -k -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$p" 2>/dev/null || echo 000)"
+  echo "$p => $code" | tee -a "$BACKUP_DIR/page_smoke_checks_v31.txt"
+done
+set -e
+
+if [[ $V1 -ne 0 ]]; then
+  echo "❌ security API validation failed. راجع: $BACKUP_DIR/security_get_my_access.txt"
+  exit 1
+fi
+
+echo "🏥 Step 7: Health Check - Elastix/CDR/AMI + Queue + Call Report"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$BACKUP_DIR/health_asterisk_bridge.txt"
+H1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status | tee "$BACKUP_DIR/health_queue_status.txt"
+H2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' | tee "$BACKUP_DIR/health_call_report.txt"
+H3=${PIPESTATUS[0]}
+set -e
+
+if [[ $H1 -ne 0 || $H2 -ne 0 || $H3 -ne 0 ]]; then
+  echo "⚠️ Health returned non-zero. راجع: $BACKUP_DIR"
+else
+  echo "✅ Health checks OK"
+fi
+
+echo "============================================================"
+echo "✅ DONE V31"
+echo "📦 Backup folder: $BACKUP_DIR"
+echo "🔐 Non-admin users will not see/use Admin Desk links"
+echo "🚪 Direct /admin-desk access redirects non-admin users"
+echo "🛡️ report_api.py / Elastix / CDR / AMI untouched"
+echo "============================================================"

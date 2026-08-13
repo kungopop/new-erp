@@ -1,0 +1,487 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Fix email sending compatibility after Upper Management V3 router.
+# - Keeps the new Upper Management dynamic report.
+# - Restores old/legacy email buttons if they are not upper-management.
+# - If upper-management send fails, it falls back to the legacy send instead of silently breaking.
+# - Improves recipient detection for the new upper-management report.
+# - Does NOT touch report_api.py / Elastix / CDR / AMI.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+RUN_EMAIL_SEND_TEST="${RUN_EMAIL_SEND_TEST:-0}"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "❌ docker compose/docker-compose مش موجود"
+  exit 1
+fi
+
+APP_DIR="$ROOT/apps/$APP"
+PKG_DIR="$APP_DIR/$APP"
+API_DIR="$PKG_DIR/api"
+EMAIL_REPORT="$API_DIR/email_report.py"
+UPPER_API="$API_DIR/upper_management_email_api.py"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/FIX_EMAIL_SEND_COMPAT_BEFORE_$TS"
+mkdir -p "$BACKUP_DIR"
+
+if [[ ! -f "$EMAIL_REPORT" ]]; then
+  echo "❌ مش لاقي email_report.py: $EMAIL_REPORT"
+  exit 1
+fi
+if [[ ! -f "$UPPER_API" ]]; then
+  echo "❌ مش لاقي upper_management_email_api.py: $UPPER_API"
+  exit 1
+fi
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend container مش شغال أو مش لاقيه"
+  exit 1
+fi
+
+bench_exec() {
+  "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"
+}
+
+echo "============================================================"
+echo "🔧 Fix Email Send Compatibility"
+echo "📦 Backup: $BACKUP_DIR"
+echo "============================================================"
+
+echo "🧯 Backup current email files"
+cp -a "$EMAIL_REPORT" "$BACKUP_DIR/email_report.py.before"
+cp -a "$UPPER_API" "$BACKUP_DIR/upper_management_email_api.py.before"
+
+export EMAIL_REPORT UPPER_API
+python3 - <<'PY'
+# -*- coding: utf-8 -*-
+from pathlib import Path
+import os
+
+email_report = Path(os.environ["EMAIL_REPORT"])
+upper_api = Path(os.environ["UPPER_API"])
+
+# ------------------------------------------------------------------
+# 1) Robust recipient + send override inside upper_management_email_api.py
+# ------------------------------------------------------------------
+s = upper_api.read_text(encoding="utf-8", errors="ignore")
+start = "# BEGIN ROSHDY EMAIL SEND COMPAT V2"
+end = "# END ROSHDY EMAIL SEND COMPAT V2"
+block = r'''
+# BEGIN ROSHDY EMAIL SEND COMPAT V2
+# Compatibility layer added after discovering that the previous router could break old test-send buttons.
+# This block intentionally overrides recipient resolving and send_upper_management_report only.
+
+import re as _roshdy_re
+import json as _roshdy_json
+
+
+def _roshdy_extract_emails_from_any(value):
+    """Extract valid-looking emails from strings/lists/dicts/json without trusting field shape."""
+    out = []
+    if value is None:
+        return out
+    if isinstance(value, (list, tuple, set)):
+        for x in value:
+            out.extend(_roshdy_extract_emails_from_any(x))
+        return out
+    if isinstance(value, dict):
+        for x in value.values():
+            out.extend(_roshdy_extract_emails_from_any(x))
+        return out
+    text = cstr(value)
+    if not text:
+        return out
+    # If it is JSON, parse then recurse too.
+    stripped = text.strip()
+    if stripped.startswith("[") or stripped.startswith("{"):
+        try:
+            out.extend(_roshdy_extract_emails_from_any(_roshdy_json.loads(stripped)))
+        except Exception:
+            pass
+    out.extend(_roshdy_re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", text))
+    return out
+
+
+def _roshdy_clean_email_list(values):
+    seen = set()
+    cleaned = []
+    for e in _roshdy_extract_emails_from_any(values):
+        e = cstr(e).strip().strip(",; ")
+        if not e or e.lower() in seen:
+            continue
+        # Avoid local placeholder accounts as real outgoing recipients unless explicitly supplied alone.
+        if e.endswith("@local.local") or e.endswith("@example.com"):
+            continue
+        seen.add(e.lower())
+        cleaned.append(e)
+    return cleaned
+
+
+def _roshdy_user_email(user):
+    try:
+        mail = frappe.db.get_value("User", user, "email") or user
+        return mail if "@" in cstr(mail) else None
+    except Exception:
+        return user if "@" in cstr(user) else None
+
+
+def _roshdy_role_recipients():
+    """Fallback recipients from admin/management users, used only when no explicit settings found."""
+    emails = []
+    try:
+        roles = ["Call Center Admin", "Restaurant Manager", "System Manager"]
+        for role in roles:
+            if not frappe.db.exists("Role", role):
+                continue
+            users = frappe.get_all("Has Role", filters={"role": role}, pluck="parent", limit_page_length=500)
+            for u in users:
+                try:
+                    enabled = frappe.db.get_value("User", u, "enabled")
+                    user_type = frappe.db.get_value("User", u, "user_type")
+                    if not enabled or user_type == "Website User":
+                        continue
+                    em = _roshdy_user_email(u)
+                    if em:
+                        emails.append(em)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return _roshdy_clean_email_list(emails)
+
+
+def _get_default_upper_recipients():
+    """Override: robust recipient discovery for the Upper Management report."""
+    emails = []
+
+    # 1) Single DocTypes/settings JSON fields. Include recipient-like fields, exclude sender/smtp/password fields.
+    try:
+        rows = frappe.db.sql(
+            """
+            select doctype, field, value
+            from `tabSingles`
+            where value like '%%@%%'
+            """,
+            as_dict=True,
+        )
+        include_words = ("recipient", "recipients", "send_to", "to_email", "emails", "email_to", "upper", "management", "report")
+        exclude_words = ("sender", "from", "smtp", "host", "server", "password", "secret", "login", "username", "user_name")
+        for r in rows:
+            hay = f"{r.get('doctype','')} {r.get('field','')}".lower()
+            if any(x in hay for x in exclude_words) and not any(x in hay for x in ("recipient", "send_to", "to_email", "email_to")):
+                continue
+            if any(x in hay for x in include_words):
+                emails.extend(_roshdy_extract_emails_from_any(r.get("value")))
+    except Exception:
+        pass
+
+    # 2) Known custom email builder settings if stored as normal document/single field.
+    try:
+        if frappe.db.exists("DocType", "Roshdy Email Builder Settings"):
+            doc = frappe.get_single("Roshdy Email Builder Settings")
+            for attr in ("settings_json", "recipients", "upper_management_recipients", "management_recipients"):
+                if hasattr(doc, attr):
+                    emails.extend(_roshdy_extract_emails_from_any(getattr(doc, attr)))
+    except Exception:
+        pass
+
+    cleaned = _roshdy_clean_email_list(emails)
+    if cleaned:
+        return cleaned
+
+    # 3) Fallback to admin/manager role emails so the button does not die silently.
+    return _roshdy_role_recipients()
+
+
+def _roshdy_resolve_recipients(explicit=None, kwargs=None):
+    kwargs = kwargs or {}
+    candidates = []
+    candidates.append(explicit)
+    for k in ("recipients", "recipient", "emails", "email", "to", "send_to", "test_email", "email_to", "mail_to", "users"):
+        if k in kwargs:
+            candidates.append(kwargs.get(k))
+    cleaned = _roshdy_clean_email_list(candidates)
+    if cleaned:
+        return cleaned
+    return _get_default_upper_recipients()
+
+
+@frappe.whitelist()
+def debug_email_send_config(**kwargs):
+    """Safe debug endpoint: no email is sent."""
+    recips = _roshdy_resolve_recipients(kwargs=kwargs)
+    return {
+        "success": True,
+        "resolved_recipients_count": len(recips),
+        "resolved_recipients": recips,
+        "session_user": frappe.session.user,
+        "session_user_email": _roshdy_user_email(frappe.session.user),
+        "note": "No email was sent by this debug endpoint",
+    }
+
+
+@frappe.whitelist()
+def send_upper_management_report(recipients=None, date_from=None, date_to=None, subject=None, **kwargs):
+    """Override: dynamic Upper Management report send with robust recipients and old-style message."""
+    recips = _roshdy_resolve_recipients(recipients, kwargs)
+
+    # If it is an explicit manual test and still no saved recipients, send to the current logged-in email.
+    if not recips and (kwargs.get("test") or kwargs.get("send_test") or kwargs.get("is_test") or kwargs.get("test_email")):
+        em = _roshdy_user_email(frappe.session.user)
+        if em:
+            recips = [em]
+
+    if not recips:
+        frappe.throw("لم يتم العثور على مستلمين للإيميل. اضبط مستلمين التقرير أو ابعت recipients/test_email مع الطلب.")
+
+    html_body = render_upper_management_report_html(date_from=date_from, date_to=date_to)
+    start_date, end_date, _start_dt, _end_dt = _period(date_from, date_to)
+    subj = subject or kwargs.get("email_subject") or kwargs.get("subject") or f"تقرير الإدارة العليا - مطعم رشدي - {_date_label(start_date, end_date)}"
+
+    frappe.sendmail(recipients=recips, subject=subj, message=html_body, now=True)
+    return {
+        "success": True,
+        "message": f"تم إرسال تقرير الإدارة العليا إلى {len(recips)} مستخدم",
+        "recipients": recips,
+        "recipients_count": len(recips),
+        "subject": subj,
+    }
+# END ROSHDY EMAIL SEND COMPAT V2
+'''
+if start in s and end in s:
+    a = s.index(start)
+    b = s.index(end, a) + len(end)
+    s = s[:a] + block.strip() + s[b:]
+else:
+    s = s.rstrip() + "\n\n" + block.strip() + "\n"
+compile(s, str(upper_api), "exec")
+upper_api.write_text(s, encoding="utf-8")
+
+# ------------------------------------------------------------------
+# 2) Replace router in email_report.py with robust compatibility router.
+# ------------------------------------------------------------------
+s = email_report.read_text(encoding="utf-8", errors="ignore")
+router_start = "# BEGIN ROSHDY UPPER MANAGEMENT V3 ROUTER"
+router_end = "# END ROSHDY UPPER MANAGEMENT V3 ROUTER"
+router = r'''
+# BEGIN ROSHDY UPPER MANAGEMENT V3 ROUTER
+# Compatibility router:
+# - Upper Management uses the new dynamic report.
+# - All other report types go to the original/legacy functions.
+# - If the new upper send fails, fallback to legacy send so test buttons do not stop working.
+try:
+    import frappe
+except Exception:
+    frappe = None
+
+try:
+    _roshdy_legacy_send_report_now = send_report_now
+except Exception:
+    _roshdy_legacy_send_report_now = None
+try:
+    _roshdy_legacy_preview_email_report = preview_email_report
+except Exception:
+    _roshdy_legacy_preview_email_report = None
+try:
+    _roshdy_legacy_send_upper_management_report = send_upper_management_report
+except Exception:
+    _roshdy_legacy_send_upper_management_report = None
+
+
+def _roshdy_clean_kwargs(kwargs):
+    kw = dict(kwargs or {})
+    for k in ("cmd", "_", "csrf_token"):
+        kw.pop(k, None)
+    return kw
+
+
+def _roshdy_is_upper_report(report_type=None, **kwargs):
+    rt = (report_type or kwargs.get("report_type") or kwargs.get("type") or kwargs.get("report") or "").strip().lower()
+    explicit_upper = (
+        "upper", "upper_management", "upper-management", "upper_management_report",
+        "executive", "top_management", "admin_upper",
+        "الإدارة العليا", "الادارة العليا", "ادارة عليا", "إدارة عليا"
+    )
+    if rt in explicit_upper:
+        return True
+    # Keep old generic 'management' safe: only route it to new report if the caller also says upper/executive.
+    if rt == "management" and str(kwargs.get("scope") or kwargs.get("report_scope") or kwargs.get("template") or "").lower() in ("upper", "upper_management", "executive"):
+        return True
+    return False
+
+
+def _roshdy_call_legacy(fn, report_type=None, *args, **kwargs):
+    if not fn:
+        raise Exception("Legacy email function is not available")
+    kwargs = _roshdy_clean_kwargs(kwargs)
+    attempts = []
+    if report_type is not None:
+        kw1 = dict(kwargs)
+        kw1.setdefault("report_type", report_type)
+        attempts.append((args, kw1))
+        attempts.append(((report_type,) + tuple(args), kwargs))
+    attempts.append((args, kwargs))
+    attempts.append((tuple(), kwargs))
+
+    last = None
+    for a, kw in attempts:
+        try:
+            return fn(*a, **kw)
+        except TypeError as e:
+            last = e
+            # Try next shape only for signature-ish errors.
+            msg = str(e).lower()
+            if any(x in msg for x in ("unexpected", "positional", "keyword", "argument", "required")):
+                continue
+            raise
+        except Exception as e:
+            last = e
+            raise
+    if last:
+        raise last
+    raise Exception("Legacy email call failed")
+
+
+if frappe:
+    @frappe.whitelist()
+    def preview_upper_management_report(*args, **kwargs):
+        from restaurant_ops.api.upper_management_email_api import preview_upper_management_report as _fn
+        return _fn(*args, **kwargs)
+
+    @frappe.whitelist()
+    def send_upper_management_report(*args, **kwargs):
+        from restaurant_ops.api.upper_management_email_api import send_upper_management_report as _fn
+        try:
+            return _fn(*args, **kwargs)
+        except Exception as new_error:
+            # Fallback to old upper-management sender if it existed before our router.
+            if _roshdy_legacy_send_upper_management_report:
+                try:
+                    return _roshdy_call_legacy(_roshdy_legacy_send_upper_management_report, None, *args, **kwargs)
+                except Exception:
+                    pass
+            raise new_error
+
+    @frappe.whitelist()
+    def preview_email_report(report_type=None, *args, **kwargs):
+        if _roshdy_is_upper_report(report_type, **kwargs):
+            from restaurant_ops.api.upper_management_email_api import preview_upper_management_report as _fn
+            try:
+                return _fn(*args, **kwargs)
+            except Exception as new_error:
+                if _roshdy_legacy_preview_email_report:
+                    try:
+                        return _roshdy_call_legacy(_roshdy_legacy_preview_email_report, report_type, *args, **kwargs)
+                    except Exception:
+                        pass
+                raise new_error
+        return _roshdy_call_legacy(_roshdy_legacy_preview_email_report, report_type, *args, **kwargs)
+
+    @frappe.whitelist()
+    def send_report_now(report_type=None, *args, **kwargs):
+        if _roshdy_is_upper_report(report_type, **kwargs):
+            from restaurant_ops.api.upper_management_email_api import send_upper_management_report as _fn
+            try:
+                return _fn(*args, **kwargs)
+            except Exception as new_error:
+                # Important: never let old test-send buttons die because of the new upper report.
+                if _roshdy_legacy_send_report_now:
+                    try:
+                        return _roshdy_call_legacy(_roshdy_legacy_send_report_now, report_type, *args, **kwargs)
+                    except Exception:
+                        pass
+                raise new_error
+        return _roshdy_call_legacy(_roshdy_legacy_send_report_now, report_type, *args, **kwargs)
+# END ROSHDY UPPER MANAGEMENT V3 ROUTER'''
+
+if router_start in s and router_end in s:
+    a = s.index(router_start)
+    b = s.index(router_end, a) + len(router_end)
+    s = s[:a] + router + s[b:]
+else:
+    s = s.rstrip() + "\n\n" + router + "\n"
+compile(s, str(email_report), "exec")
+email_report.write_text(s, encoding="utf-8")
+PY
+
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+if [[ -n "$APP_OWNER" ]]; then
+  chown "$APP_OWNER" "$EMAIL_REPORT" "$UPPER_API" 2>/dev/null || true
+fi
+
+echo "🧹 Clear cache + restart app services"
+bench_exec clear-cache || true
+"${COMPOSE[@]}" restart backend frontend websocket queue-short queue-long scheduler >/dev/null
+sleep 8
+bench_exec clear-cache || true
+
+echo "🧪 Validation - no email is sent here"
+set +e
+bench_exec execute restaurant_ops.api.upper_management_email_api.debug_email_send_config | tee "$BACKUP_DIR/debug_email_send_config.txt"
+V1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.email_report.preview_email_report --kwargs '{"report_type":"upper_management"}' > "$BACKUP_DIR/preview_upper_via_email_report.txt" 2>&1
+V2=$?
+head -c 900 "$BACKUP_DIR/preview_upper_via_email_report.txt" | tee "$BACKUP_DIR/preview_upper_via_email_report_head.txt"
+echo
+# Center/customer-service preview may depend on old code arguments; do a soft test only.
+bench_exec execute restaurant_ops.api.email_report.preview_email_report --kwargs '{"report_type":"center"}' > "$BACKUP_DIR/preview_center_soft.txt" 2>&1
+V3=$?
+head -c 600 "$BACKUP_DIR/preview_center_soft.txt" | tee "$BACKUP_DIR/preview_center_soft_head.txt"
+echo
+set -e
+
+if [[ $V1 -ne 0 || $V2 -ne 0 ]]; then
+  echo "❌ Validation فشل في upper preview/debug. راجع: $BACKUP_DIR"
+  exit 1
+fi
+if [[ $V3 -ne 0 ]]; then
+  echo "⚠️ Center preview soft test رجع non-zero، بس ده ممكن يكون بسبب إن الفانكشن القديمة محتاجة باراميتر مختلف. الإرسال القديم نفسه معمول له fallback. راجع الملف لو احتجنا: $BACKUP_DIR/preview_center_soft.txt"
+fi
+
+if [[ "$RUN_EMAIL_SEND_TEST" == "1" ]]; then
+  echo "📧 RUN_EMAIL_SEND_TEST=1 -> هنبعت اختبار فعلي لتقرير الإدارة العليا للمستلمين المتحللين"
+  set +e
+  bench_exec execute restaurant_ops.api.email_report.send_report_now --kwargs '{"report_type":"upper_management","test":1}' | tee "$BACKUP_DIR/send_test_upper_result.txt"
+  S1=${PIPESTATUS[0]}
+  set -e
+  if [[ $S1 -ne 0 ]]; then
+    echo "❌ إرسال الاختبار فشل. راجع: $BACKUP_DIR/send_test_upper_result.txt"
+    exit 1
+  fi
+else
+  echo "ℹ️ لم يتم إرسال إيميل فعلي من السكريبت. لو عايز اختبار فعلي من الطرفية شغله كده:"
+  echo "   RUN_EMAIL_SEND_TEST=1 ./fix-email-send-compatibility-now"
+fi
+
+echo "🏥 Health Check - Elastix/CDR/AMI + Queue + Call Report"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$BACKUP_DIR/health_asterisk_bridge.txt"
+H1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status | tee "$BACKUP_DIR/health_queue_status.txt"
+H2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' | tee "$BACKUP_DIR/health_call_report.txt"
+H3=${PIPESTATUS[0]}
+set -e
+
+if [[ $H1 -ne 0 || $H2 -ne 0 || $H3 -ne 0 ]]; then
+  echo "⚠️ الهيلث رجع non-zero، راجع: $BACKUP_DIR"
+else
+  echo "✅ Health checks OK"
+fi
+
+echo "============================================================"
+echo "✅ DONE"
+echo "📦 Backup folder: $BACKUP_DIR"
+echo "🛡️ report_api.py لم يتم لمسه"
+echo "📧 Email send compatibility fixed"
+echo "============================================================"

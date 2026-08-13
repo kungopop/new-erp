@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# fix-call-report-now
+# Emergency fix for Call Report after Customer Lookup CDR enrichment patch.
+# It removes ONLY the Customer Lookup wrapper from report_api.py, preserving the original stable call report.
+# If validation still fails, it restores report_api.py from the latest backup taken before the customer lookup link patch.
+
+ROOT="/opt/frappe_crm"
+SITE="crm.local"
+APP_DIR="$ROOT/apps/restaurant_ops/restaurant_ops"
+REPORT_API="$APP_DIR/api/report_api.py"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/FIX_CALL_REPORT_NOW_BEFORE_$TS"
+
+say(){ echo -e "\n============================================================\n$1\n============================================================"; }
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo "❌ شغّل كـ root: sudo -i ثم ./fix-call-report-now"
+  exit 1
+fi
+
+say "1) Backup سريع قبل إصلاح تقرير المكالمات"
+cd "$ROOT"
+BACKEND="$(docker compose ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ لم أجد backend container. شغّل: cd /opt/frappe_crm && docker compose up -d"
+  exit 1
+fi
+mkdir -p "$BACKUP_DIR"
+cp -a "$REPORT_API" "$BACKUP_DIR/report_api.py.current.bak"
+[[ -f "$APP_DIR/www/call-report.html" ]] && cp -a "$APP_DIR/www/call-report.html" "$BACKUP_DIR/call-report.html.current.bak" || true
+echo "✅ Backup: $BACKUP_DIR"
+
+say "2) إزالة Patch ربط Customer Lookup من report_api فقط"
+python3 - <<'PY'
+from pathlib import Path
+import re
+p = Path('/opt/frappe_crm/apps/restaurant_ops/restaurant_ops/api/report_api.py')
+s = p.read_text(errors='ignore')
+orig = s
+# Remove our marked CDR enrichment block. This is the block that wrapped get_calls_report.
+s = re.sub(r'\n?# ===== ROSHDY CDR CUSTOMER LOOKUP START =====[\s\S]*?# ===== ROSHDY CDR CUSTOMER LOOKUP END =====\n?', '\n', s, flags=re.I)
+# Remove any accidental duplicate of the same wrapper if marker got duplicated oddly.
+s = re.sub(r'\n?try:\s*\n\s*_roshdy_customer_lookup_base_get_calls_report\s*=\s*get_calls_report[\s\S]*?def get_calls_report\(\*args, \*\*kwargs\):[\s\S]*?return res\s*\n', '\n', s, count=1)
+if s != orig:
+    p.write_text(s)
+    print('✅ Removed customer lookup CDR wrapper from report_api.py')
+else:
+    print('ℹ️ No marked CDR wrapper found; report_api.py unchanged')
+PY
+chmod 644 "$REPORT_API"
+
+say "3) Clear pycache + restart app services"
+docker exec "$BACKEND" bash -lc "find /home/frappe/frappe-bench/apps/restaurant_ops -name '*.pyc' -delete; find /home/frappe/frappe-bench/apps/restaurant_ops -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true"
+docker exec "$BACKEND" bench --site "$SITE" clear-cache || true
+docker exec "$BACKEND" bench --site "$SITE" clear-website-cache || true
+docker compose restart backend frontend websocket queue-short queue-long scheduler
+sleep 10
+BACKEND="$(docker compose ps -q backend)"
+
+say "4) Validation أولي لتقرير المكالمات"
+set +e
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' > /tmp/call_report_validation_1.json 2>&1
+RC=$?
+set -e
+cat /tmp/call_report_validation_1.json | head -c 4000 || true
+echo
+
+if [[ "$RC" != "0" ]] || ! grep -q '"success": true' /tmp/call_report_validation_1.json; then
+  say "5) Validation فشل — استرجاع report_api.py من أحدث Backup قبل customer lookup"
+  RESTORE_SRC=""
+  # Prefer exact backup before the patch that touched report_api.
+  RESTORE_SRC="$(ls -dt "$ROOT"/backups/CUSTOMER_LOOKUP_LINK_FINAL_BEFORE_* 2>/dev/null | head -n1 | xargs -r -I{} find "{}" -path '*/restaurant_ops/restaurant_ops/api/report_api.py' -type f | head -n1 || true)"
+  if [[ -z "$RESTORE_SRC" ]]; then
+    RESTORE_SRC="$(ls -dt "$ROOT"/backups/* 2>/dev/null | xargs -r -I{} find "{}" -path '*/restaurant_ops/restaurant_ops/api/report_api.py' -type f 2>/dev/null | head -n1 || true)"
+  fi
+  if [[ -z "$RESTORE_SRC" || ! -f "$RESTORE_SRC" ]]; then
+    echo "❌ لم أجد report_api.py في الباكابات. هعرض آخر الأخطاء فقط."
+    docker compose logs --tail=250 backend | grep -Ei 'Traceback|report_api|get_calls_report|customer_lookup|ImportError|SyntaxError|NameError' -A5 -B5 || true
+    exit 1
+  fi
+  echo "✅ Restoring from: $RESTORE_SRC"
+  cp -a "$RESTORE_SRC" "$REPORT_API"
+  chmod 644 "$REPORT_API"
+  docker exec "$BACKEND" bash -lc "find /home/frappe/frappe-bench/apps/restaurant_ops -name '*.pyc' -delete; find /home/frappe/frappe-bench/apps/restaurant_ops -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true"
+  docker exec "$BACKEND" bench --site "$SITE" clear-cache || true
+  docker exec "$BACKEND" bench --site "$SITE" clear-website-cache || true
+  docker compose restart backend frontend websocket queue-short queue-long scheduler
+  sleep 10
+  BACKEND="$(docker compose ps -q backend)"
+fi
+
+say "6) Validation نهائي للصفحات والـ API"
+echo "--- report_api.get_calls_report ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' || true
+
+echo "--- Page HTTP status ---"
+for page in call-report admin-desk social-inbox customer-lookup-settings; do
+  code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$page" || true)"
+  echo "$page => $code"
+done
+
+say "7) Health Check مهم: Elastix/CDR/AMI + Queue + Call Report"
+echo "--- Asterisk/Elastix diagnostics ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics || true
+
+echo "--- Queue status ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.queue_api.get_queue_status || true
+
+echo "--- Calls report admin sample ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' || true
+
+say "✅ Call Report fixed يا زعيم"
+echo "اللي حصل: سكريبت ربط Customer Lookup بالـ CDR لف get_calls_report وده كسر التقرير. شلناه ورجعنا التقرير المستقر."
+echo "مهم: ربط أسماء العملاء بالـ CDR هنرجعه بعدين بطريقة آمنة في API منفصل/اختياري، مش جوه report_api الأساسي."
+echo "Backup: $BACKUP_DIR"

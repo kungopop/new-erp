@@ -1,0 +1,336 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# force-quality-doctype-open
+# Goal: Quality users MUST be able to open and edit the actual Frappe Desk DocType form:
+#   /app/call-center-complaint/COMP-...
+# without breaking the normal login redirect to /quality-desk.
+# Fixes:
+# - Clean DocPerm for Complaint_Quality_User (level 0/1 only, no bad level 2 row).
+# - Ensure quality users are System User + Desk User.
+# - Patch Desk redirect JS so it does NOT redirect away from /app/call-center-complaint/*.
+# - Patch Call Center Complaint form JS so normal Save and a blue "حفظ مراجعة الجودة" button work with Arabic/English Select values.
+# - Build assets + restart + health checks.
+
+ROOT="/opt/frappe_crm"
+SITE="crm.local"
+APP_HOST="$ROOT/apps/restaurant_ops"
+APP_DIR="$APP_HOST/restaurant_ops"
+DOCTYPE_DIR="$APP_DIR/restaurant_operations/doctype/call_center_complaint"
+DOCTYPE_JS="$DOCTYPE_DIR/call_center_complaint.js"
+DOCTYPE_JSON="$DOCTYPE_DIR/call_center_complaint.json"
+PUBLIC_JS_DIR="$APP_DIR/public/js"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/FORCE_QUALITY_DOCTYPE_OPEN_BEFORE_$TS"
+
+say(){ echo -e "\n============================================================\n$1\n============================================================"; }
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo "❌ شغّل كـ root: sudo -i ثم ./force-quality-doctype-open"
+  exit 1
+fi
+
+say "1) Backup قبل إجبار فتح Doctype للجودة"
+cd "$ROOT"
+BACKEND="$(docker compose ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ لم أجد backend container. شغّل: cd /opt/frappe_crm && docker compose up -d"
+  exit 1
+fi
+mkdir -p "$BACKUP_DIR"
+cp -a "$APP_HOST" "$BACKUP_DIR/restaurant_ops"
+[[ -f "$ROOT/docker-compose.yml" ]] && cp -a "$ROOT/docker-compose.yml" "$BACKUP_DIR/docker-compose.yml"
+echo "✅ Backup: $BACKUP_DIR"
+
+say "2) Patch DocType JSON permissions: Quality level 0/1 only"
+python3 - <<'PY'
+from pathlib import Path
+import json
+p = Path('/opt/frappe_crm/apps/restaurant_ops/restaurant_ops/restaurant_operations/doctype/call_center_complaint/call_center_complaint.json')
+if not p.exists():
+    print('⚠️ call_center_complaint.json not found')
+    raise SystemExit
+j = json.loads(p.read_text())
+perms = j.get('permissions') or []
+perms = [x for x in perms if x.get('role') != 'Complaint_Quality_User']
+perms.append({'role':'Complaint_Quality_User','permlevel':0,'select':1,'read':1,'write':1,'create':0,'delete':0,'submit':0,'cancel':0,'amend':0,'report':1,'export':1,'import':0,'share':0,'print':1,'email':0})
+perms.append({'role':'Complaint_Quality_User','permlevel':1,'select':1,'read':1,'write':1,'create':0,'delete':0,'submit':0,'cancel':0,'amend':0,'report':1,'export':1,'import':0,'share':0,'print':1,'email':0})
+j['permissions'] = perms
+p.write_text(json.dumps(j, ensure_ascii=False, indent=1, sort_keys=True) + '\n')
+print('✅ JSON fixed: Quality has level 0/1 only; no level 2')
+PY
+
+say "3) Write permission/user fixer"
+mkdir -p "$APP_DIR/scripts" "$PUBLIC_JS_DIR" "$DOCTYPE_DIR"
+cat > "$APP_DIR/scripts/force_quality_doctype_open.py" <<'PY'
+import frappe
+
+
+def ensure_role(role):
+    if not frappe.db.exists('Role', role):
+        frappe.get_doc({'doctype':'Role','role_name':role,'desk_access':1}).insert(ignore_permissions=True)
+    else:
+        doc = frappe.get_doc('Role', role)
+        if not doc.desk_access:
+            doc.desk_access = 1
+            doc.save(ignore_permissions=True)
+
+
+def append_perm(doc, role, permlevel, read=0, write=0, create=0, delete=0, report=0, export=0, select=0, print_=0):
+    doc.append('permissions', {
+        'role': role,
+        'permlevel': int(permlevel),
+        'select': int(select),
+        'read': int(read),
+        'write': int(write),
+        'create': int(create),
+        'delete': int(delete),
+        'submit': 0,
+        'cancel': 0,
+        'amend': 0,
+        'report': int(report),
+        'export': int(export),
+        'import': 0,
+        'share': 0,
+        'print': int(print_ or read),
+        'email': 0,
+    })
+
+
+def fix_docperm():
+    dt='Call Center Complaint'
+    if not frappe.db.exists('DocType', dt):
+        print('⚠️ missing doctype', dt)
+        return
+    # delete old bad rows first, including permlevel 2 zero row
+    frappe.db.sql('delete from `tabDocPerm` where parent=%s and role=%s', (dt, 'Complaint_Quality_User'))
+    frappe.db.commit()
+    doc = frappe.get_doc('DocType', dt)
+    doc.permissions = [p for p in doc.permissions if p.role != 'Complaint_Quality_User']
+    append_perm(doc, 'Complaint_Quality_User', 0, select=1, read=1, write=1, create=0, delete=0, report=1, export=1, print_=1)
+    append_perm(doc, 'Complaint_Quality_User', 1, select=1, read=1, write=1, create=0, delete=0, report=1, export=1, print_=1)
+    doc.save(ignore_permissions=True)
+    frappe.clear_cache(doctype=dt)
+    print('✅ DB DocPerm fixed: level 0/1 only')
+
+
+def ensure_quality_users_desk():
+    ensure_role('Complaint_Quality_User')
+    ensure_role('Desk User')
+    users = frappe.get_all('Has Role', filters={'role':'Complaint_Quality_User','parenttype':'User'}, pluck='parent')
+    for u in users:
+        if u in ('Administrator','Guest'):
+            continue
+        try:
+            user = frappe.get_doc('User', u)
+            user.enabled = 1
+            user.user_type = 'System User'
+            user.save(ignore_permissions=True)
+            if not frappe.db.exists('Has Role', {'parent':u,'parenttype':'User','role':'Desk User'}):
+                user.add_roles('Desk User')
+            print('✅ Quality user can access Desk:', u)
+        except Exception as e:
+            print('⚠️ user fix skipped', u, e)
+
+
+def run():
+    ensure_quality_users_desk()
+    fix_docperm()
+    frappe.db.commit()
+    return {'success': True}
+PY
+chmod 644 "$APP_DIR/scripts/force_quality_doctype_open.py"
+
+say "4) Patch Desk redirect JS: allow /app/call-center-complaint/*"
+python3 - <<'PY'
+from pathlib import Path
+root = Path('/opt/frappe_crm/apps/restaurant_ops/restaurant_ops/public/js')
+root.mkdir(parents=True, exist_ok=True)
+files = list(root.glob('*redirect*.js'))
+if not files:
+    files = [root / 'desk_redirect_final.js']
+safe_js = r'''
+// ROSHDY SAFE DESK REDIRECT
+// Keeps normal login redirect behavior, but never redirects away from real Desk forms like Call Center Complaint.
+(function(){
+  function allowedDeskRoute(){
+    var p = window.location.pathname || '';
+    return p.indexOf('/app/call-center-complaint') === 0 ||
+           p.indexOf('/app/file') === 0 ||
+           p.indexOf('/app/comment') === 0 ||
+           p.indexOf('/app/communication') === 0;
+  }
+  if (allowedDeskRoute()) return;
+  function shouldRedirectFromThisDeskPage(){
+    var p = window.location.pathname || '';
+    return p === '/app' || p === '/app/' || p === '/app/home' || p.indexOf('/app/workspace') === 0;
+  }
+  function go(){
+    if (!shouldRedirectFromThisDeskPage()) return;
+    if (!window.frappe || !frappe.call) return;
+    frappe.call({
+      method: 'restaurant_ops.api.login_redirect.get_user_redirect',
+      callback: function(r){
+        var t = r && r.message && r.message.redirect;
+        if (!t || t === '/app') return;
+        if ((window.location.pathname || '') !== t) window.location.replace(t);
+      }
+    });
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', function(){ setTimeout(go, 300); });
+  else setTimeout(go, 300);
+})();
+'''
+for p in files:
+    try:
+        p.write_text(safe_js)
+        print('✅ safe redirect written:', p)
+    except Exception as e:
+        print('⚠️ redirect patch skip', p, e)
+PY
+
+say "5) Patch Call Center Complaint Desk JS for normal Save + blue API save"
+python3 - <<'PY'
+from pathlib import Path
+import re
+p = Path('/opt/frappe_crm/apps/restaurant_ops/restaurant_ops/restaurant_operations/doctype/call_center_complaint/call_center_complaint.js')
+old = p.read_text(errors='ignore') if p.exists() else ''
+# remove previous custom blocks to avoid conflicting before_save mappings
+patterns = [
+    r'// ===== ROSHDY QUALITY DESK FORM SAVE BUTTON START =====[\s\S]*?// ===== ROSHDY QUALITY DESK FORM SAVE BUTTON END =====\n?',
+    r'// ===== ROSHDY FORCE QUALITY DOCTYPE OPEN START =====[\s\S]*?// ===== ROSHDY FORCE QUALITY DOCTYPE OPEN END =====\n?',
+]
+s = old
+for pat in patterns:
+    s = re.sub(pat, '', s)
+block = r'''
+// ===== ROSHDY FORCE QUALITY DOCTYPE OPEN START =====
+(function(){
+  function has_quality_role(){
+    const roles = frappe.user_roles || [];
+    return roles.includes('Complaint_Quality_User') || roles.includes('Call Center Admin') || roles.includes('System Manager') || roles.includes('Administrator');
+  }
+  function field_options(frm, field){
+    try { return String((frm.fields_dict[field] && frm.fields_dict[field].df && frm.fields_dict[field].df.options) || '').split('\n').map(x => x.trim()).filter(Boolean); }
+    catch(e){ return []; }
+  }
+  function normalize_to_available(frm, field, value){
+    value = String(value || '').trim();
+    const statusPairs = {
+      'Draft':'مسودة', 'مسودة':'Draft',
+      'Open':'مفتوحة', 'مفتوح':'Open', 'مفتوحة':'Open',
+      'Under Review':'قيد المراجعة', 'قيد المراجعة':'Under Review', 'قيد مراجعه':'Under Review',
+      'Resolved':'تم الحل', 'تم الحل':'Resolved', 'محلولة':'Resolved',
+      'Closed':'مغلقة', 'مغلق':'Closed', 'مغلقة':'Closed'
+    };
+    const opts = field_options(frm, field);
+    if (!opts.length) return value;
+    if (opts.includes(value)) return value;
+    const alt = statusPairs[value];
+    if (alt && opts.includes(alt)) return alt;
+    return value;
+  }
+  function unlock_quality_fields(frm){
+    ['assigned_quality_inspector','investigation_analysis','corrective_action','status','closing_notes'].forEach(function(f){
+      if (frm.fields_dict[f]) frm.set_df_property(f, 'read_only', 0);
+    });
+  }
+  frappe.ui.form.on('Call Center Complaint', {
+    refresh: function(frm){
+      if(!has_quality_role()) return;
+      unlock_quality_fields(frm);
+      if(frm.is_new()) return;
+      frm.add_custom_button(__('حفظ مراجعة الجودة'), function(){
+        const statusValue = normalize_to_available(frm, 'status', frm.doc.status || 'Under Review');
+        frappe.call({
+          method: 'restaurant_ops.api.quality_api.update_quality_review',
+          args: {
+            name: frm.doc.name,
+            assigned_quality_inspector: frm.doc.assigned_quality_inspector || frappe.session.user,
+            investigation_analysis: frm.doc.investigation_analysis || '',
+            corrective_action: frm.doc.corrective_action || '',
+            status: statusValue,
+            closing_notes: frm.doc.closing_notes || ''
+          },
+          freeze: true,
+          freeze_message: __('جاري حفظ مراجعة الجودة...'),
+          callback: function(r){
+            if(r && r.message && r.message.success){
+              frappe.show_alert({message: __('تم حفظ مراجعة الجودة بنجاح'), indicator: 'green'});
+              frm.reload_doc();
+            } else {
+              frappe.msgprint((r && r.message && r.message.message) || __('فشل حفظ مراجعة الجودة'));
+              console.log('Quality save response', r);
+            }
+          },
+          error: function(r){
+            frappe.msgprint(__('حصل خطأ أثناء حفظ مراجعة الجودة. ابعتلي الخطأ من Console.'));
+            console.error(r);
+          }
+        });
+      }).addClass('btn-primary');
+      frm.add_custom_button(__('فتح Quality Desk'), function(){ window.open('/quality-desk', '_blank'); });
+    },
+    before_save: function(frm){
+      if(!has_quality_role()) return;
+      // Only change status if current value is not one of the current DocType options.
+      if(frm.doc.status && frm.fields_dict.status){
+        const fixed = normalize_to_available(frm, 'status', frm.doc.status);
+        if(fixed && fixed !== frm.doc.status) frm.set_value('status', fixed);
+      }
+    }
+  });
+})();
+// ===== ROSHDY FORCE QUALITY DOCTYPE OPEN END =====
+'''
+p.parent.mkdir(parents=True, exist_ok=True)
+p.write_text(s.rstrip() + '\n\n' + block + '\n')
+print('✅ call_center_complaint.js patched')
+PY
+chmod 644 "$DOCTYPE_JS"
+
+say "6) Execute fixes + migrate/build/restart"
+docker exec "$BACKEND" bash -lc "find /home/frappe/frappe-bench/apps/restaurant_ops -name '*.pyc' -delete; find /home/frappe/frappe-bench/apps/restaurant_ops -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.scripts.force_quality_doctype_open.run
+docker exec "$BACKEND" bench --site "$SITE" migrate
+docker exec "$BACKEND" bench build --app restaurant_ops || true
+docker exec "$BACKEND" bench --site "$SITE" clear-cache || true
+docker exec "$BACKEND" bench --site "$SITE" clear-website-cache || true
+docker compose restart backend frontend websocket queue-short queue-long scheduler
+sleep 12
+BACKEND="$(docker compose ps -q backend)"
+
+say "7) Validation"
+echo "--- redirect JS files ---"
+find "$PUBLIC_JS_DIR" -maxdepth 1 -type f -name '*redirect*.js' -print -exec head -n 5 {} \; || true
+
+echo "--- permissions check ---"
+docker exec "$BACKEND" bench --site "$SITE" execute frappe.db.sql --args '["select role, permlevel, `select`, `read`, `write`, `create`, `delete`, report, export from `tabDocPerm` where parent=\"Call Center Complaint\" and role=\"Complaint_Quality_User\" order by permlevel"]' || true
+
+echo "--- bad level 2 check ---"
+docker exec "$BACKEND" bench --site "$SITE" execute frappe.db.sql --args '["select name, role, permlevel from `tabDocPerm` where parent=\"Call Center Complaint\" and role=\"Complaint_Quality_User\" and permlevel=2"]' || true
+
+echo "--- target_for_user quality stays /quality-desk ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.login_redirect.target_for_user --args '["quality.test@roshdy.com"]' || true
+
+echo "--- Page HTTP status ---"
+for page in quality-desk app/call-center-complaint call-report admin-desk; do
+  code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$page" || true)"
+  echo "$page => $code"
+done
+
+say "8) Health Check مهم: Elastix/CDR/AMI + Queue + Call Report"
+echo "--- Asterisk/Elastix diagnostics ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics || true
+
+echo "--- Queue status ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.queue_api.get_queue_status || true
+
+echo "--- Calls report admin sample ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' || true
+
+say "✅ Quality Doctype open/save forced يا زعيم"
+echo "مهم: تسجيل الدخول الطبيعي لليوزر الجودة مازال يروح /quality-desk."
+echo "لكن لو ضغط فتح في Desk أو فتح /app/call-center-complaint/COMP... مش هيتحول بره الصفحة."
+echo "افتح الشكوى واعمل Ctrl+F5. جرب Save العادي، ولو Frappe Save متعب استخدم الزر الأزرق: حفظ مراجعة الجودة."
+echo "Backup: $BACKUP_DIR"

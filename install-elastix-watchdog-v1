@@ -1,0 +1,309 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Roshdy Elastix Watchdog installer
+# ------------------------------------------------------------
+# Installs a safe watchdog on the ERP server to monitor:
+# - Elastix TCP 3306 (CDR MySQL)
+# - Elastix TCP 5038 (AMI)
+# - SSH access to /var/log/asterisk/queue_log for Queue Journey
+# - Existing ERP health endpoints: asterisk diagnostics, queue status, call report
+# - Queue Journey fetch parser
+#
+# It can self-heal SSH key access if you choose to save Elastix root password locally.
+# Recommended: SSH key only. Optional password file is root-only chmod 600.
+#
+# Usage:
+#   cd /opt/frappe_crm
+#   chmod +x install-elastix-watchdog-v1
+#   ./install-elastix-watchdog-v1
+#
+# Optional first-time password/key setup:
+#   SET_PASSWORD=1 SETUP_KEY_NOW=1 ./install-elastix-watchdog-v1
+#
+# Optional install sshpass automatically if needed:
+#   ALLOW_APT_INSTALL=1 SET_PASSWORD=1 SETUP_KEY_NOW=1 ./install-elastix-watchdog-v1
+#
+# Safety:
+# - Does NOT edit report_api.py.
+# - Does NOT change Elastix/Asterisk configs.
+# - Does NOT restart Elastix/Asterisk.
+# - Only reads queue_log over SSH and runs ERP health checks.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+ELASTIX_HOST="${ELASTIX_HOST:-10.11.1.253}"
+ELASTIX_SSH="${ELASTIX_SSH:-root@10.11.1.253}"
+QUEUE_LOG="${QUEUE_LOG:-/var/log/asterisk/queue_log}"
+SSH_KEY="${SSH_KEY:-/root/.ssh/id_rsa_roshdy_queue_journey}"
+PASSWORD_FILE="${PASSWORD_FILE:-/root/.roshdy_elastix_root.pass}"
+CRON_MINUTES="${CRON_MINUTES:-5}"
+INSTALL_CRON="${INSTALL_CRON:-1}"
+SET_PASSWORD="${SET_PASSWORD:-0}"
+SETUP_KEY_NOW="${SETUP_KEY_NOW:-1}"
+ALLOW_APT_INSTALL="${ALLOW_APT_INSTALL:-0}"
+RUN_ONCE="${RUN_ONCE:-1}"
+TS="$(date +%Y%m%d_%H%M%S)"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "❌ docker compose/docker-compose مش موجود"
+  exit 1
+fi
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend container مش شغال أو مش لاقيه"
+  exit 1
+fi
+
+CONF="$ROOT/elastix_watchdog.conf"
+WATCHDOG="$ROOT/scripts/roshdy_elastix_watchdog"
+BACKUP_DIR="$ROOT/backups/INSTALL_ELASTIX_WATCHDOG_BEFORE_$TS"
+LOG_DIR="$ROOT/logs"
+mkdir -p "$BACKUP_DIR" "$ROOT/scripts" "$LOG_DIR" /root/.ssh
+chmod 700 /root/.ssh
+
+echo "============================================================"
+echo "🔐 Install Roshdy Elastix Watchdog"
+echo "📦 Backup: $BACKUP_DIR"
+echo "📍 Elastix: $ELASTIX_HOST"
+echo "🔐 SSH: $ELASTIX_SSH"
+echo "📄 Queue log: $QUEUE_LOG"
+echo "============================================================"
+
+for f in "$CONF" "$WATCHDOG" /etc/cron.d/roshdy_elastix_watchdog; do
+  [[ -e "$f" ]] && cp -a "$f" "$BACKUP_DIR/$(basename "$f").before" || true
+done
+
+# Create RSA key for old Elastix compatibility.
+if [[ ! -f "$SSH_KEY" ]]; then
+  echo "🔑 Creating RSA SSH key: $SSH_KEY"
+  ssh-keygen -t rsa -b 4096 -f "$SSH_KEY" -N "" -C "roshdy-elastix-watchdog"
+else
+  echo "ℹ️ SSH key exists: $SSH_KEY"
+fi
+chmod 600 "$SSH_KEY"
+chmod 644 "$SSH_KEY.pub"
+
+# Optional root password storage. We do not store unless user explicitly opts in.
+if [[ "$SET_PASSWORD" == "1" ]]; then
+  echo "⚠️ هتحفظ باسورد Elastix root في ملف محلي بصلاحية 600. الأفضل SSH key، بس ده اختيارك."
+  echo -n "اكتب باسورد root بتاع Elastix: "
+  read -r -s PASS
+  echo
+  printf '%s' "$PASS" > "$PASSWORD_FILE"
+  chmod 600 "$PASSWORD_FILE"
+  echo "✅ Password saved root-only: $PASSWORD_FILE"
+fi
+
+# sshpass optional.
+if [[ -f "$PASSWORD_FILE" ]] && ! command -v sshpass >/dev/null 2>&1; then
+  if [[ "$ALLOW_APT_INSTALL" == "1" ]]; then
+    echo "📦 Installing sshpass because password fallback is enabled..."
+    apt-get update && apt-get install -y sshpass
+  else
+    echo "ℹ️ Password file exists but sshpass not installed. Password fallback won't work until sshpass is installed."
+    echo "   To install automatically: ALLOW_APT_INSTALL=1 ./install-elastix-watchdog-v1"
+  fi
+fi
+
+# Try to install key now.
+SSH_OPTS=(-i "$SSH_KEY" -o IdentitiesOnly=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/root/.ssh/known_hosts -o PubkeyAcceptedAlgorithms=+ssh-rsa -o HostkeyAlgorithms=+ssh-rsa)
+if [[ "$SETUP_KEY_NOW" == "1" ]]; then
+  echo "🔎 Testing SSH key access..."
+  set +e
+  ssh "${SSH_OPTS[@]}" -o BatchMode=yes "$ELASTIX_SSH" "test -r '$QUEUE_LOG' && echo KEY_OK" >/tmp/roshdy_watchdog_ssh_test.out 2>&1
+  KEY_OK=$?
+  set -e
+  cat /tmp/roshdy_watchdog_ssh_test.out || true
+  if [[ $KEY_OK -ne 0 ]]; then
+    if [[ -f "$PASSWORD_FILE" && $(command -v sshpass || true) ]]; then
+      echo "🔧 SSH key not accepted. Trying sshpass-based key install..."
+      sshpass -f "$PASSWORD_FILE" ssh-copy-id -i "$SSH_KEY.pub" -o StrictHostKeyChecking=no "$ELASTIX_SSH" || true
+    else
+      echo "🔐 SSH key not accepted. Trying interactive ssh-copy-id; enter Elastix password once if prompted."
+      ssh-copy-id -i "$SSH_KEY.pub" -o StrictHostKeyChecking=no "$ELASTIX_SSH" || true
+    fi
+  fi
+fi
+
+cat > "$CONF" <<EOF
+ROOT="$ROOT"
+SITE="$SITE"
+ELASTIX_HOST="$ELASTIX_HOST"
+ELASTIX_SSH="$ELASTIX_SSH"
+QUEUE_LOG="$QUEUE_LOG"
+SSH_KEY="$SSH_KEY"
+PASSWORD_FILE="$PASSWORD_FILE"
+LOG_DIR="$LOG_DIR"
+QUEUE_JOURNEY_FETCH="$ROOT/scripts/roshdy_queue_journey_fetch_parse"
+EOF
+chmod 600 "$CONF"
+
+cat > "$WATCHDOG" <<'WATCH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+CONF="${CONF:-/opt/frappe_crm/elastix_watchdog.conf}"
+[[ -f "$CONF" ]] && source "$CONF"
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+ELASTIX_HOST="${ELASTIX_HOST:-10.11.1.253}"
+ELASTIX_SSH="${ELASTIX_SSH:-root@10.11.1.253}"
+QUEUE_LOG="${QUEUE_LOG:-/var/log/asterisk/queue_log}"
+SSH_KEY="${SSH_KEY:-/root/.ssh/id_rsa_roshdy_queue_journey}"
+PASSWORD_FILE="${PASSWORD_FILE:-/root/.roshdy_elastix_root.pass}"
+LOG_DIR="${LOG_DIR:-/opt/frappe_crm/logs}"
+QUEUE_JOURNEY_FETCH="${QUEUE_JOURNEY_FETCH:-/opt/frappe_crm/scripts/roshdy_queue_journey_fetch_parse}"
+STATUS_JSON="$LOG_DIR/elastix_watchdog_status.json"
+LOG_FILE="$LOG_DIR/elastix_watchdog.log"
+mkdir -p "$LOG_DIR"
+
+cd "$ROOT"
+if docker compose version >/dev/null 2>&1; then COMPOSE=(docker compose); else COMPOSE=(docker-compose); fi
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+
+log(){ echo "[$(date '+%F %T')] $*" | tee -a "$LOG_FILE"; }
+
+json_escape(){ python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'; }
+
+check_tcp(){
+  local host="$1" port="$2"
+  timeout 4 bash -c "</dev/tcp/$host/$port" >/dev/null 2>&1
+}
+
+bench_exec(){
+  "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"
+}
+
+SSH_OPTS=(-i "$SSH_KEY" -o IdentitiesOnly=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/root/.ssh/known_hosts -o PubkeyAcceptedAlgorithms=+ssh-rsa -o HostkeyAlgorithms=+ssh-rsa)
+
+repair_ssh_key(){
+  if [[ -f "$PASSWORD_FILE" ]] && command -v sshpass >/dev/null 2>&1; then
+    log "SSH key failed; attempting password fallback key repair with sshpass"
+    sshpass -f "$PASSWORD_FILE" ssh-copy-id -i "$SSH_KEY.pub" -o StrictHostKeyChecking=no "$ELASTIX_SSH" >> "$LOG_FILE" 2>&1 || true
+  else
+    log "SSH key failed; no password fallback available. Run setup script or install sshpass/password file."
+  fi
+}
+
+STATUS="OK"
+DETAILS=()
+
+log "---- watchdog start ----"
+
+if [[ -z "$BACKEND" ]]; then
+  STATUS="FAIL"
+  DETAILS+=("backend container not found")
+else
+  DETAILS+=("backend container ok")
+fi
+
+if check_tcp "$ELASTIX_HOST" 3306; then DETAILS+=("tcp_3306 ok"); else STATUS="FAIL"; DETAILS+=("tcp_3306 failed"); fi
+if check_tcp "$ELASTIX_HOST" 5038; then DETAILS+=("tcp_5038 ok"); else STATUS="FAIL"; DETAILS+=("tcp_5038 failed"); fi
+
+# SSH check and repair.
+set +e
+ssh "${SSH_OPTS[@]}" -o BatchMode=yes "$ELASTIX_SSH" "test -r '$QUEUE_LOG' && tail -n 1 '$QUEUE_LOG'" >/tmp/roshdy_watchdog_ssh.out 2>&1
+SSH_RC=$?
+set -e
+if [[ $SSH_RC -eq 0 ]]; then
+  DETAILS+=("ssh_queue_log ok")
+else
+  STATUS="WARN"
+  DETAILS+=("ssh_queue_log failed")
+  repair_ssh_key
+  set +e
+  ssh "${SSH_OPTS[@]}" -o BatchMode=yes "$ELASTIX_SSH" "test -r '$QUEUE_LOG' && tail -n 1 '$QUEUE_LOG'" >/tmp/roshdy_watchdog_ssh_retest.out 2>&1
+  SSH_RC2=$?
+  set -e
+  if [[ $SSH_RC2 -eq 0 ]]; then
+    DETAILS+=("ssh_queue_log repaired")
+  else
+    DETAILS+=("ssh_queue_log still failed")
+  fi
+fi
+
+# ERP diagnostics.
+if [[ -n "$BACKEND" ]]; then
+  set +e
+  bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics >/tmp/roshdy_watchdog_diag.out 2>&1
+  D1=$?
+  bench_exec execute restaurant_ops.api.queue_api.get_queue_status >/tmp/roshdy_watchdog_queue.out 2>&1
+  D2=$?
+  bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":3,"view_mode":"admin"}' >/tmp/roshdy_watchdog_report.out 2>&1
+  D3=$?
+  set -e
+  [[ $D1 -eq 0 ]] && DETAILS+=("asterisk_diagnostics ok") || { STATUS="FAIL"; DETAILS+=("asterisk_diagnostics failed"); }
+  [[ $D2 -eq 0 ]] && DETAILS+=("queue_status ok") || { STATUS="FAIL"; DETAILS+=("queue_status failed"); }
+  [[ $D3 -eq 0 ]] && DETAILS+=("call_report ok") || { STATUS="FAIL"; DETAILS+=("call_report failed"); }
+fi
+
+# Queue journey fetch, only if SSH works or repaired.
+if [[ -x "$QUEUE_JOURNEY_FETCH" ]]; then
+  set +e
+  DATE_FROM="$(date +%F)" DATE_TO="$(date +%F)" "$QUEUE_JOURNEY_FETCH" >/tmp/roshdy_watchdog_fetch.out 2>&1
+  FRC=$?
+  set -e
+  if [[ $FRC -eq 0 ]]; then
+    DETAILS+=("queue_journey_fetch ok")
+  else
+    STATUS="WARN"
+    DETAILS+=("queue_journey_fetch failed")
+  fi
+else
+  DETAILS+=("queue_journey_fetch missing")
+fi
+
+# Write simple JSON status.
+python3 - "$STATUS_JSON" "$STATUS" "${DETAILS[@]}" <<'PY'
+import json, sys, datetime
+path=sys.argv[1]
+status=sys.argv[2]
+details=sys.argv[3:]
+open(path,'w').write(json.dumps({'timestamp':datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),'status':status,'details':details},ensure_ascii=False,indent=2))
+PY
+
+log "status=$STATUS details=${DETAILS[*]}"
+log "---- watchdog end ----"
+
+# Exit non-zero only on hard fail, not WARN.
+[[ "$STATUS" == "FAIL" ]] && exit 2 || exit 0
+WATCH
+chmod +x "$WATCHDOG"
+
+if [[ "$INSTALL_CRON" == "1" ]]; then
+  cat > /etc/cron.d/roshdy_elastix_watchdog <<EOF
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+*/$CRON_MINUTES * * * * root $WATCHDOG >/dev/null 2>&1
+EOF
+  chmod 0644 /etc/cron.d/roshdy_elastix_watchdog
+  echo "✅ Cron installed: /etc/cron.d/roshdy_elastix_watchdog"
+fi
+
+if [[ "$RUN_ONCE" == "1" ]]; then
+  echo "▶️ Running watchdog once..."
+  set +e
+  "$WATCHDOG"
+  RC=$?
+  set -e
+  echo "Watchdog exit code: $RC"
+  echo "Status JSON: $LOG_DIR/elastix_watchdog_status.json"
+  cat "$LOG_DIR/elastix_watchdog_status.json" || true
+fi
+
+echo "============================================================"
+echo "✅ DONE"
+echo "Watchdog: $WATCHDOG"
+echo "Config:   $CONF"
+echo "Log:      $LOG_DIR/elastix_watchdog.log"
+echo "Status:   $LOG_DIR/elastix_watchdog_status.json"
+echo "============================================================"

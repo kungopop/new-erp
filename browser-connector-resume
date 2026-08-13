@@ -1,0 +1,325 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# browser-connector-resume
+# Resume/fix Browser Connector PoC after first build.
+# Fixes:
+# - SERVER_IP unbound variable in previous script.
+# - API health reset caused by launching Chromium during FastAPI startup.
+# It makes browser launch lazy: /health works first, then /api/open starts Chromium.
+
+ROOT="/opt/frappe_crm"
+SITE="crm.local"
+APP_DIR="$ROOT/apps/restaurant_ops/restaurant_ops"
+BC_ROOT="/opt/roshdy_browser_connector"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/BROWSER_CONNECTOR_RESUME_BEFORE_$TS"
+API_PORT="33121"
+NOVNC_PORT="33120"
+API_USER="roshdy_browser"
+API_PASS="RoshdyBrowser@123"
+VNC_PASS="RoshdyBrowser@123"
+
+say(){ echo -e "\n============================================================\n$1\n============================================================"; }
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo "❌ شغّل كـ root: sudo -i ثم ./browser-connector-resume"
+  exit 1
+fi
+
+say "1) Backup + قراءة IP"
+cd "$ROOT"
+BACKEND="$(docker compose ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ لم أجد backend container. شغّل: cd /opt/frappe_crm && docker compose up -d"
+  exit 1
+fi
+SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+[[ -z "$SERVER_IP" ]] && SERVER_IP="10.11.1.66"
+
+mkdir -p "$BACKUP_DIR"
+[[ -d "$BC_ROOT" ]] && cp -a "$BC_ROOT" "$BACKUP_DIR/roshdy_browser_connector" || true
+[[ -d "$APP_DIR" ]] && cp -a "$APP_DIR" "$BACKUP_DIR/restaurant_ops" || true
+
+echo "✅ Backup: $BACKUP_DIR"
+echo "SERVER_IP=$SERVER_IP"
+
+say "2) Patch Browser Connector API ليتشغل Lazy مش وقت startup"
+if [[ ! -d "$BC_ROOT" ]]; then
+  echo "❌ لم أجد $BC_ROOT. شغّل roshdy-browser-connector-poc الأول."
+  exit 1
+fi
+mkdir -p "$BC_ROOT/app"
+cd "$BC_ROOT"
+
+# Keep .env stable.
+if [[ ! -f .env ]]; then
+cat > .env <<EOF
+API_PORT=$API_PORT
+NOVNC_PORT=$NOVNC_PORT
+API_USER=$API_USER
+API_PASS=$API_PASS
+VNC_PASS=$VNC_PASS
+TZ=Africa/Cairo
+EOF
+else
+  grep -q '^API_PORT=' .env && sed -i "s/^API_PORT=.*/API_PORT=$API_PORT/" .env || echo "API_PORT=$API_PORT" >> .env
+  grep -q '^NOVNC_PORT=' .env && sed -i "s/^NOVNC_PORT=.*/NOVNC_PORT=$NOVNC_PORT/" .env || echo "NOVNC_PORT=$NOVNC_PORT" >> .env
+  grep -q '^API_USER=' .env && sed -i "s/^API_USER=.*/API_USER=$API_USER/" .env || echo "API_USER=$API_USER" >> .env
+  grep -q '^API_PASS=' .env && sed -i "s/^API_PASS=.*/API_PASS=$API_PASS/" .env || echo "API_PASS=$API_PASS" >> .env
+  grep -q '^VNC_PASS=' .env && sed -i "s/^VNC_PASS=.*/VNC_PASS=$VNC_PASS/" .env || echo "VNC_PASS=$VNC_PASS" >> .env
+fi
+chmod 600 .env
+
+cat > app/app.py <<'PY'
+import os, json, base64, secrets, traceback
+from pathlib import Path
+from fastapi import FastAPI, Request, Response, HTTPException
+from fastapi.responses import HTMLResponse, FileResponse
+from playwright.async_api import async_playwright
+
+API_USER = os.environ.get('API_USER', 'roshdy_browser')
+API_PASS = os.environ.get('API_PASS', 'RoshdyBrowser@123')
+PROFILE_DIR = os.environ.get('PROFILE_DIR', '/profiles/default')
+CONNECTOR_DATA = os.environ.get('CONNECTOR_DATA', '/data/connectors.json')
+DOWNLOAD_DIR = os.environ.get('DOWNLOAD_DIR', '/downloads')
+
+Path(PROFILE_DIR).mkdir(parents=True, exist_ok=True)
+Path('/data').mkdir(parents=True, exist_ok=True)
+Path(DOWNLOAD_DIR).mkdir(parents=True, exist_ok=True)
+
+TARGETS = {
+    'facebook_business_inbox': 'https://business.facebook.com/latest/inbox/',
+    'facebook_page_inbox': 'https://www.facebook.com/messages/',
+    'instagram_direct': 'https://www.instagram.com/direct/inbox/',
+    'tiktok_messages': 'https://www.tiktok.com/messages',
+    'tiktok_business': 'https://business.tiktok.com/',
+    'blank': 'about:blank',
+}
+
+app = FastAPI(title='Roshdy Browser Connector PoC')
+playwright = None
+context = None
+last_browser_error = ''
+
+
+def _check_auth(request: Request):
+    if request.url.path in ['/health']:
+        return True
+    auth = request.headers.get('authorization') or ''
+    if not auth.startswith('Basic '):
+        return False
+    try:
+        raw = base64.b64decode(auth.split(' ', 1)[1]).decode()
+        user, pwd = raw.split(':', 1)
+        return secrets.compare_digest(user, API_USER) and secrets.compare_digest(pwd, API_PASS)
+    except Exception:
+        return False
+
+
+@app.middleware('http')
+async def auth_middleware(request: Request, call_next):
+    if not _check_auth(request):
+        return Response('Auth required', status_code=401, headers={'WWW-Authenticate': 'Basic realm="Roshdy Browser Connector"'})
+    return await call_next(request)
+
+
+async def ensure_browser():
+    global playwright, context, last_browser_error
+    if context:
+        return context
+    try:
+        playwright = await async_playwright().start()
+        context = await playwright.chromium.launch_persistent_context(
+            PROFILE_DIR,
+            headless=False,
+            accept_downloads=True,
+            downloads_path=DOWNLOAD_DIR,
+            viewport={'width': 1280, 'height': 720},
+            args=[
+                '--no-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-gpu',
+                '--disable-notifications',
+                '--window-size=1280,720',
+                '--lang=ar-EG',
+            ],
+        )
+        if not context.pages:
+            await context.new_page()
+        last_browser_error = ''
+        return context
+    except Exception as e:
+        last_browser_error = str(e) + '\n' + traceback.format_exc()
+        raise
+
+
+@app.on_event('shutdown')
+async def shutdown():
+    global playwright, context
+    try:
+        if context:
+            await context.close()
+    except Exception:
+        pass
+    try:
+        if playwright:
+            await playwright.stop()
+    except Exception:
+        pass
+
+
+@app.get('/health')
+async def health():
+    return {
+        'success': True,
+        'service': 'roshdy-browser-connector',
+        'api_ready': True,
+        'browser_started': bool(context),
+        'last_browser_error': last_browser_error[-1000:] if last_browser_error else '',
+        'targets': list(TARGETS.keys()),
+    }
+
+
+@app.get('/', response_class=HTMLResponse)
+async def index(request: Request):
+    host = request.headers.get('host', '10.11.1.66:33121').split(':')[0]
+    novnc_url = f'http://{host}:33120/vnc.html?autoconnect=true&resize=scale'
+    html = f'''<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><title>Roshdy Browser Connector</title>
+<style>*{{box-sizing:border-box;font-family:Tahoma,Arial}}body{{background:#eef2f7;margin:0;direction:rtl;color:#111827}}.top{{background:#20262d;color:#fff;padding:14px 22px;border-bottom:4px solid #1F4E79}}.wrap{{padding:22px;max-width:1100px;margin:auto}}.card{{background:#fff;border:1px solid #d8dee9;border-radius:16px;padding:16px;margin:12px 0;box-shadow:0 10px 28px #0001}}a,button{{display:inline-block;margin:5px;padding:10px 14px;border-radius:11px;background:#1F4E79;color:#fff;text-decoration:none;border:0;font-weight:bold;cursor:pointer}}.fb{{background:#1877f2}}.ig{{background:linear-gradient(135deg,#f58529,#dd2a7b,#8134af)}}.tt{{background:#111827}}.note{{background:#fff7ed;border:1px solid #fed7aa;border-right:5px solid #f97316;border-radius:14px;padding:12px;line-height:1.7}}</style></head><body><div class="top"><b>🌐 Roshdy Browser Connector PoC</b></div><div class="wrap">
+<div class="note"><b>Phase 0:</b> افتح noVNC وسجل دخول. بعد ما نشوف Inbox الحقيقي هنضيف قراءة الرسائل في Phase 1.</div>
+<div class="card"><h3>1) افتح متصفح السيرفر</h3><a href="{novnc_url}" target="_blank">Open Server Browser noVNC</a><p>VNC Password: <b>{os.environ.get('VNC_PASS','RoshdyBrowser@123')}</b></p></div>
+<div class="card"><h3>2) افتح صفحات السوشيال</h3>
+<a class="fb" href="/api/open/facebook_business_inbox" target="_blank">Open Facebook Business Inbox</a>
+<a class="fb" href="/api/open/facebook_page_inbox" target="_blank">Open Facebook Messages</a>
+<a class="ig" href="/api/open/instagram_direct" target="_blank">Open Instagram Direct</a>
+<a class="tt" href="/api/open/tiktok_messages" target="_blank">Open TikTok Messages</a>
+<a class="tt" href="/api/open/tiktok_business" target="_blank">Open TikTok Business</a>
+</div>
+<div class="card"><h3>3) أدوات</h3><a href="/api/status" target="_blank">Status JSON</a><a href="/api/screenshot" target="_blank">Screenshot</a><a href="/api/dom-hint" target="_blank">DOM Hint</a></div>
+</div></body></html>'''
+    return HTMLResponse(html)
+
+
+@app.get('/api/open/{target}')
+async def open_target(target: str):
+    url = TARGETS.get(target, target)
+    if not (url.startswith('http://') or url.startswith('https://') or url == 'about:blank'):
+        raise HTTPException(400, 'Unknown target')
+    ctx = await ensure_browser()
+    page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+    await page.goto(url, wait_until='domcontentloaded', timeout=60000)
+    return {'success': True, 'target': target, 'url': url, 'current_url': page.url, 'title': await page.title()}
+
+
+@app.get('/api/status')
+async def status():
+    data = {'success': True, 'profile_dir': PROFILE_DIR, 'browser_started': bool(context), 'last_browser_error': last_browser_error[-2000:] if last_browser_error else '', 'targets': TARGETS, 'pages': []}
+    if context:
+        for p in context.pages:
+            try:
+                data['pages'].append({'url': p.url, 'title': await p.title()})
+            except Exception:
+                data['pages'].append({'url': 'unknown', 'title': 'unknown'})
+    return data
+
+
+@app.get('/api/screenshot')
+async def screenshot():
+    ctx = await ensure_browser()
+    page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+    out = '/tmp/roshdy_browser_screenshot.png'
+    await page.screenshot(path=out, full_page=False)
+    return FileResponse(out, media_type='image/png', filename='screenshot.png')
+
+
+@app.get('/api/dom-hint')
+async def dom_hint():
+    ctx = await ensure_browser()
+    page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+    try:
+        title = await page.title()
+        url = page.url
+        text = await page.locator('body').inner_text(timeout=7000)
+        return {'success': True, 'url': url, 'title': title, 'body_text_sample': text[:4000]}
+    except Exception as e:
+        return {'success': False, 'message': str(e)}
+PY
+
+say "3) Rebuild سريع وتشغيل"
+docker compose up -d --build
+sleep 8
+
+echo "--- docker compose ps ---"
+docker compose ps
+
+echo "--- logs tail ---"
+docker compose logs --tail=80 browser_connector || true
+
+echo "--- Browser Connector health ---"
+for i in $(seq 1 30); do
+  if curl -fsS "http://127.0.0.1:$API_PORT/health"; then
+    echo
+    break
+  fi
+  echo "waiting health $i/30..."
+  sleep 2
+done
+
+say "4) إنشاء/تصليح صفحة ERP /browser-connectors"
+cat > "$APP_DIR/www/browser-connectors.py" <<'PY'
+import frappe
+no_cache = 1
+
+def get_context(context):
+    user = frappe.session.user
+    roles = frappe.get_roles(user)
+    if user != "Administrator" and "System Manager" not in roles:
+        frappe.throw("System Manager only", frappe.PermissionError)
+    return context
+PY
+
+cat > "$APP_DIR/www/browser-connectors.html" <<HTML
+<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Browser Connectors</title><style>*{box-sizing:border-box;font-family:Tahoma,Arial}body{background:#eef2f7;margin:0;direction:rtl;color:#111827}.top{background:#20262d;color:#fff;padding:14px 22px;border-bottom:4px solid #1F4E79;display:flex;justify-content:space-between}.top a{color:#fff;text-decoration:none;border:1px solid #64748b;border-radius:10px;padding:8px 12px;margin:2px}.wrap{padding:22px;max-width:1100px;margin:auto}.card{background:#fff;border:1px solid #d8dee9;border-radius:16px;padding:16px;margin:12px 0;box-shadow:0 10px 28px #0001}a.btn{display:inline-block;margin:5px;padding:10px 14px;border-radius:11px;background:#1F4E79;color:#fff;text-decoration:none;font-weight:bold}.fb{background:#1877f2!important}.ig{background:linear-gradient(135deg,#f58529,#dd2a7b,#8134af)!important}.tt{background:#111827!important}.note{background:#fff7ed;border:1px solid #fed7aa;border-right:5px solid #f97316;border-radius:14px;padding:12px;line-height:1.7}</style></head><body><div class="top"><b>🌐 Browser Connectors — System Manager Only</b><div><a href="/social-settings">Social Settings</a><a href="/social-meta-settings">Meta Official</a><a href="/admin-desk">Admin Desk</a></div></div><div class="wrap"><div class="note">ده PoC للربط غير الرسمي بالمتصفح. الرسمي Meta Graph API موجود ومتلغاش. هنا هتسجل دخول في متصفح السيرفر، والجلسة هتتحفظ.</div><div class="card"><h3>Browser Connector Portal</h3><a class="btn" href="http://$SERVER_IP:$API_PORT" target="_blank">Open Browser Connector Portal</a><a class="btn" href="http://$SERVER_IP:$NOVNC_PORT/vnc.html?autoconnect=true&resize=scale" target="_blank">Open noVNC Browser</a><p>API user: <b>$API_USER</b><br>API password: <b>$API_PASS</b><br>VNC password: <b>$VNC_PASS</b></p></div><div class="card"><h3>Targets</h3><a class="btn fb" href="http://$SERVER_IP:$API_PORT/api/open/facebook_business_inbox" target="_blank">Facebook Business Inbox</a><a class="btn ig" href="http://$SERVER_IP:$API_PORT/api/open/instagram_direct" target="_blank">Instagram Direct</a><a class="btn tt" href="http://$SERVER_IP:$API_PORT/api/open/tiktok_messages" target="_blank">TikTok Messages</a></div></div></body></html>
+HTML
+chmod 644 "$APP_DIR/www/browser-connectors.py" "$APP_DIR/www/browser-connectors.html"
+
+cd "$ROOT"
+docker exec "$BACKEND" bench --site "$SITE" clear-cache || true
+docker exec "$BACKEND" bench --site "$SITE" clear-website-cache || true
+docker compose restart backend frontend
+sleep 8
+BACKEND="$(docker compose ps -q backend)"
+
+say "5) Validation"
+echo "--- Page HTTP status ---"
+for page in browser-connectors social-meta-settings social-settings social-inbox admin-desk; do
+  code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$page" || true)"
+  echo "$page => $code"
+done
+
+echo "--- noVNC HTTP status ---"
+curl -s -o /dev/null -w "noVNC => %{http_code}\n" "http://127.0.0.1:$NOVNC_PORT/vnc.html" || true
+
+echo "--- API portal HTTP status ---"
+curl -s -o /dev/null -w "API portal => %{http_code}\n" -u "$API_USER:$API_PASS" "http://127.0.0.1:$API_PORT/" || true
+
+say "6) Health Check مهم: Elastix/CDR/AMI + Queue + Call Report"
+echo "--- Asterisk/Elastix diagnostics ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics || true
+
+echo "--- Queue status ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.queue_api.get_queue_status || true
+
+echo "--- Calls report admin sample ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' || true
+
+say "✅ Browser Connector resumed يا زعيم"
+echo "ERP helper page: http://$SERVER_IP/browser-connectors"
+echo "Browser Connector portal: http://$SERVER_IP:$API_PORT"
+echo "Server Browser noVNC: http://$SERVER_IP:$NOVNC_PORT/vnc.html?autoconnect=true&resize=scale"
+echo "API username: $API_USER"
+echo "API password: $API_PASS"
+echo "VNC password: $VNC_PASS"
+echo "لو /api/open اشتغل وفتح Inbox، ابعتلي Screenshot من داخل noVNC."
+echo "Backup: $BACKUP_DIR"

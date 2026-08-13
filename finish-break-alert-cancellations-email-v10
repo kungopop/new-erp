@@ -1,0 +1,716 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Roshdy V10 Finish:
+# 1) Employee full-screen alert when admin ends a break (agent-desk polling + backend ack).
+# 2) Full page for cancellation report: /order-cancellations-report
+# 3) Branch dropdown from real system branches for cancellations.
+# 4) Link cancellation report page from the rebuilt /admin-desk.
+# 5) Validate cancellations are included in Upper Management email preview.
+# Safety: backup first; does NOT touch report_api.py / Elastix / CDR / AMI config.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "❌ docker compose/docker-compose مش موجود"
+  exit 1
+fi
+
+APP_DIR="$ROOT/apps/$APP"
+PKG_DIR="$APP_DIR/$APP"
+WWW_DIR="$PKG_DIR/www"
+API_DIR="$PKG_DIR/api"
+ADMIN_HTML="$WWW_DIR/admin-desk.html"
+AGENT_HTML="$WWW_DIR/agent-desk.html"
+BREAK_API="$API_DIR/break_api.py"
+UPPER_API="$API_DIR/upper_management_email_api.py"
+CANCEL_HTML="$WWW_DIR/order-cancellations-report.html"
+CANCEL_PY="$WWW_DIR/order-cancellations-report.py"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/FINISH_BREAK_ALERT_CANCEL_EMAIL_V10_BEFORE_$TS"
+mkdir -p "$BACKUP_DIR"
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend container مش شغال أو مش لاقيه"
+  exit 1
+fi
+
+bench_exec() {
+  "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"
+}
+
+echo "============================================================"
+echo "✅ Roshdy V10 Finish: Break alert + cancellations page + email verify"
+echo "📦 Backup: $BACKUP_DIR"
+echo "============================================================"
+
+echo "🧯 Backup files + bench backup"
+for f in "$ADMIN_HTML" "$AGENT_HTML" "$BREAK_API" "$UPPER_API" "$CANCEL_HTML" "$CANCEL_PY"; do
+  [[ -f "$f" ]] && cp -a "$f" "$BACKUP_DIR/$(basename "$f").before"
+done
+bench_exec backup --with-files | tee "$BACKUP_DIR/bench_backup_output.txt"
+
+echo "🧩 Patch backend APIs"
+export BREAK_API UPPER_API
+python3 - <<'PY'
+# -*- coding: utf-8 -*-
+from pathlib import Path
+import os
+
+break_api = Path(os.environ["BREAK_API"])
+upper_api = Path(os.environ["UPPER_API"])
+
+# ------------------------------------------------------------------
+# Break API: final employee alert + acknowledgement + admin_end_break publish
+# ------------------------------------------------------------------
+if break_api.exists():
+    s = break_api.read_text(encoding="utf-8", errors="ignore")
+    start = "# BEGIN ROSHDY BREAK API V10 EMPLOYEE ALERT FINAL"
+    end = "# END ROSHDY BREAK API V10 EMPLOYEE ALERT FINAL"
+    patch = r'''
+# BEGIN ROSHDY BREAK API V10 EMPLOYEE ALERT FINAL
+# Final break admin close + employee full-screen alert backend.
+# The agent page polls get_my_break_admin_alert, so it works even if realtime websocket is unavailable.
+try:
+    import frappe
+    from frappe.utils import now_datetime, get_datetime, flt, cstr, add_to_date
+except Exception:
+    frappe = None
+
+
+def _v10_break_admin_allowed():
+    try:
+        if frappe.session.user == "Administrator":
+            return True
+        roles = set(frappe.get_roles(frappe.session.user))
+        return bool(roles.intersection({"System Manager", "Call Center Admin", "Restaurant Manager", "Break Admin"}))
+    except Exception:
+        return False
+
+
+def _v10_employee_name(emp):
+    if not emp:
+        return "غير محدد"
+    try:
+        return frappe.db.get_value("Employee", emp, "employee_name") or emp
+    except Exception:
+        return emp
+
+
+def _v10_employee_user(emp):
+    if not emp:
+        return None
+    try:
+        return frappe.db.get_value("Employee", emp, "user_id")
+    except Exception:
+        return None
+
+
+def _v10_break_limit_minutes(break_type=None):
+    default = 30.0
+    try:
+        conf = getattr(frappe.local, "conf", {}) or {}
+        if conf.get("break_overdue_minutes"):
+            return flt(conf.get("break_overdue_minutes")) or default
+    except Exception:
+        pass
+    if break_type:
+        try:
+            if frappe.db.exists("DocType", "Break Type") and frappe.db.exists("Break Type", break_type):
+                doc = frappe.get_doc("Break Type", break_type)
+                for fn in ("max_duration_minutes", "allowed_minutes", "duration_minutes", "break_minutes", "max_minutes", "time_limit_minutes", "duration", "minutes", "limit_minutes"):
+                    if hasattr(doc, fn) and flt(getattr(doc, fn) or 0) > 0:
+                        return flt(getattr(doc, fn))
+        except Exception:
+            pass
+    return default
+
+
+def _v10_duration_minutes(start_time, end_time=None):
+    if not start_time:
+        return 0.0
+    try:
+        st = get_datetime(start_time)
+        en = get_datetime(end_time) if end_time else now_datetime()
+        return round(max((en - st).total_seconds(), 0) / 60.0, 1)
+    except Exception:
+        return 0.0
+
+
+def _v10_meta_has(dt, fieldname):
+    try:
+        return frappe.get_meta(dt).has_field(fieldname)
+    except Exception:
+        return False
+
+
+def _v10_notify_employee_break_closed(break_log, employee, closed_by_label):
+    user = _v10_employee_user(employee)
+    if not user:
+        return {"sent": False, "reason": "Employee has no user_id"}
+    payload = {
+        "break_log": break_log,
+        "closed_by": closed_by_label,
+        "message": f"تم إنهاء البريك بواسطة {closed_by_label}",
+    }
+    try:
+        frappe.publish_realtime("roshdy_break_force_closed", payload, user=user, after_commit=True)
+    except Exception:
+        pass
+    try:
+        frappe.get_doc({
+            "doctype": "Notification Log",
+            "subject": "تم إنهاء البريك بواسطة الإدارة",
+            "email_content": payload["message"],
+            "for_user": user,
+            "type": "Alert",
+            "document_type": "Employee Break Log",
+            "document_name": break_log,
+        }).insert(ignore_permissions=True)
+    except Exception:
+        pass
+    return {"sent": True, "user": user}
+
+
+@frappe.whitelist()
+def get_active_breaks():
+    if not _v10_break_admin_allowed():
+        frappe.throw("غير مسموح")
+    dt = "Employee Break Log"
+    if not frappe.db.exists("DocType", dt):
+        return {"success": False, "active_count": 0, "overdue_count": 0, "rows": [], "error": "Employee Break Log not found"}
+    rows = frappe.db.sql("""
+        select name, employee, break_type, break_date, status, start_time, end_time,
+               duration_seconds, duration_minutes, extension_at_start, notes, creation, owner,
+               closed_by, closure_type
+        from `tabEmployee Break Log`
+        where ifnull(docstatus,0) < 2
+          and (
+                lower(ifnull(status,'')) in ('active','نشط')
+                or (
+                    (end_time is null or end_time='')
+                    and lower(ifnull(status,'')) not in ('finished','closed','ended','cancelled','canceled','completed','منتهي','مغلق','ملغي')
+                )
+          )
+        order by coalesce(start_time, creation) asc
+        limit 500
+    """, as_dict=True)
+    server_now = now_datetime()
+    out = []
+    overdue_count = 0
+    for r in rows:
+        dur = _v10_duration_minutes(r.get("start_time"))
+        limit = _v10_break_limit_minutes(r.get("break_type"))
+        overdue = dur >= limit
+        if overdue:
+            overdue_count += 1
+        out.append({
+            "name": r.get("name"),
+            "employee": r.get("employee"),
+            "employee_name": _v10_employee_name(r.get("employee")),
+            "break_type": r.get("break_type") or "غير محدد",
+            "start_time": cstr(r.get("start_time") or ""),
+            "duration_minutes": dur,
+            "limit_minutes": limit,
+            "overdue": overdue,
+            "overdue_minutes": round(max(dur - limit, 0), 1),
+            "extension": r.get("extension_at_start") or "",
+            "notes": r.get("notes") or "",
+        })
+    return {"success": True, "server_now": server_now.strftime("%Y-%m-%d %H:%M:%S"), "active_count": len(out), "overdue_count": overdue_count, "rows": out}
+
+
+@frappe.whitelist()
+def admin_end_break(break_log=None, note=None):
+    if not _v10_break_admin_allowed():
+        frappe.throw("غير مسموح: إنهاء البريك من الإدارة فقط")
+    if not break_log:
+        frappe.throw("break_log مطلوب")
+    dt = "Employee Break Log"
+    if not frappe.db.exists(dt, break_log):
+        frappe.throw("سجل البريك غير موجود")
+    doc = frappe.get_doc(dt, break_log)
+    now = now_datetime()
+    dur_seconds = 0
+    if doc.get("start_time"):
+        dur_seconds = int(max((now - get_datetime(doc.get("start_time"))).total_seconds(), 0))
+    dur_minutes = round(dur_seconds / 60.0, 2)
+    admin_user = frappe.session.user
+    admin_label = frappe.db.get_value("User", admin_user, "full_name") or admin_user
+    old_notes = cstr(doc.get("notes") or "")
+    append_note = f"\n[Admin Close] تم إنهاء البريك بواسطة {admin_label} في {now.strftime('%Y-%m-%d %H:%M:%S')}"
+    if note:
+        append_note += f" - ملاحظة: {note}"
+    updates = {
+        "status": "finished",
+        "end_time": now,
+        "duration_seconds": dur_seconds,
+        "duration_minutes": dur_minutes,
+        "closed_by": admin_user,
+        "closure_type": "admin",
+        "notes": (old_notes + append_note).strip(),
+    }
+    if _v10_meta_has(dt, "admin_close_acknowledged"):
+        updates["admin_close_acknowledged"] = 0
+    if _v10_meta_has(dt, "admin_close_acknowledged_at"):
+        updates["admin_close_acknowledged_at"] = None
+    if _v10_meta_has(dt, "admin_close_message"):
+        updates["admin_close_message"] = f"تم إنهاء البريك بواسطة {admin_label}"
+    frappe.db.set_value(dt, break_log, updates, update_modified=True)
+    frappe.db.commit()
+    notify_result = _v10_notify_employee_break_closed(break_log, doc.get("employee"), admin_label)
+    return {"success": True, "message": "تم إنهاء البريك", "break_log": break_log, "closed_by": admin_label, "duration_minutes": dur_minutes, "notify": notify_result}
+
+
+@frappe.whitelist()
+def get_my_break_admin_alert():
+    user = frappe.session.user
+    if not user or user == "Guest":
+        return {"success": True, "has_alert": False, "reason": "guest"}
+    dt = "Employee Break Log"
+    if not frappe.db.exists("DocType", "Employee") or not frappe.db.exists("DocType", dt):
+        return {"success": True, "has_alert": False, "reason": "missing doctypes"}
+    employees = frappe.get_all("Employee", filters={"user_id": user}, pluck="name", limit_page_length=20)
+    if not employees:
+        return {"success": True, "has_alert": False, "reason": "no employee linked to current user", "user": user}
+    placeholders = ",".join(["%s"] * len(employees))
+    params = list(employees)
+    since = add_to_date(now_datetime(), hours=-48)
+    params.append(since)
+    ack_clause = ""
+    if _v10_meta_has(dt, "admin_close_acknowledged"):
+        ack_clause = "and ifnull(admin_close_acknowledged,0)=0"
+    rows = frappe.db.sql(f"""
+        select name, employee, break_type, start_time, end_time, duration_minutes,
+               closed_by, closure_type, modified
+        from `tabEmployee Break Log`
+        where ifnull(docstatus,0) < 2
+          and employee in ({placeholders})
+          and ifnull(closure_type,'')='admin'
+          and modified >= %s
+          {ack_clause}
+        order by modified desc
+        limit 1
+    """, params, as_dict=True)
+    if not rows:
+        return {"success": True, "has_alert": False, "employees": employees}
+    r = rows[0]
+    closed_by = r.get("closed_by") or "الإدارة"
+    closed_by_label = frappe.db.get_value("User", closed_by, "full_name") or closed_by
+    return {
+        "success": True,
+        "has_alert": True,
+        "alert": {
+            "break_log": r.get("name"),
+            "employee": r.get("employee"),
+            "break_type": r.get("break_type") or "",
+            "start_time": cstr(r.get("start_time") or ""),
+            "end_time": cstr(r.get("end_time") or ""),
+            "duration_minutes": r.get("duration_minutes"),
+            "closed_by": closed_by_label,
+            "message": f"تم إنهاء البريك بواسطة {closed_by_label}",
+        }
+    }
+
+
+@frappe.whitelist()
+def acknowledge_admin_closed_break(break_log=None):
+    if not break_log:
+        frappe.throw("break_log مطلوب")
+    dt = "Employee Break Log"
+    if not frappe.db.exists(dt, break_log):
+        frappe.throw("سجل البريك غير موجود")
+    doc = frappe.get_doc(dt, break_log)
+    user = frappe.session.user
+    employees = frappe.get_all("Employee", filters={"user_id": user}, pluck="name", limit_page_length=20) if frappe.db.exists("DocType", "Employee") else []
+    if doc.get("employee") not in employees and not _v10_break_admin_allowed():
+        frappe.throw("غير مسموح")
+    updates = {}
+    if _v10_meta_has(dt, "admin_close_acknowledged"):
+        updates["admin_close_acknowledged"] = 1
+    if _v10_meta_has(dt, "admin_close_acknowledged_at"):
+        updates["admin_close_acknowledged_at"] = now_datetime()
+    if updates:
+        frappe.db.set_value(dt, break_log, updates, update_modified=True)
+        frappe.db.commit()
+    return {"success": True}
+# END ROSHDY BREAK API V10 EMPLOYEE ALERT FINAL
+'''
+    if start in s and end in s:
+        i = s.index(start); j = s.index(end, i) + len(end); s = s[:i] + patch.strip() + s[j:]
+    else:
+        s = s.rstrip() + "\n\n" + patch.strip() + "\n"
+    compile(s, str(break_api), "exec")
+    break_api.write_text(s, encoding="utf-8")
+
+# ------------------------------------------------------------------
+# Upper API: branches + cancellation robust API + email preview helper
+# ------------------------------------------------------------------
+if upper_api.exists():
+    s = upper_api.read_text(encoding="utf-8", errors="ignore")
+    start = "# BEGIN ROSHDY CANCELLATIONS V10 BRANCHES EMAIL VERIFY"
+    end = "# END ROSHDY CANCELLATIONS V10 BRANCHES EMAIL VERIFY"
+    patch = r'''
+# BEGIN ROSHDY CANCELLATIONS V10 BRANCHES EMAIL VERIFY
+# Branch dropdown + robust cancellation listing/filtering + email inclusion verifier.
+try:
+    import frappe
+    from frappe.utils import now_datetime, get_datetime, getdate, cstr, cint
+except Exception:
+    pass
+
+
+def _v10_can_manage_cancellations():
+    try:
+        if frappe.session.user == "Administrator":
+            return True
+        roles = set(frappe.get_roles(frappe.session.user))
+        return bool(roles.intersection({"System Manager", "Call Center Admin", "Restaurant Manager"}))
+    except Exception:
+        return False
+
+
+def _v10_dedup_branch(items):
+    seen = set()
+    out = []
+    for it in items:
+        label = cstr(it.get("label") or it.get("value") or "").strip()
+        value = cstr(it.get("value") or label).strip()
+        if not label or not value:
+            continue
+        key = label.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"value": label, "label": label, "doctype": it.get("doctype"), "name": it.get("name") or value})
+    return out
+
+
+@frappe.whitelist()
+def list_cancellation_branches():
+    """Return real branches from the system. Fallback: distinct branches already used in cancellations."""
+    branches = []
+    source = "not_found"
+    candidates = ["Branch", "Restaurant Branch", "Roshdy Branch", "Company Branch"]
+    for dt in candidates:
+        try:
+            if not frappe.db.exists("DocType", dt):
+                continue
+            meta = frappe.get_meta(dt)
+            label_field = None
+            for fn in ("branch_name", "branch", "title", "name"):
+                if fn == "name" or meta.has_field(fn):
+                    label_field = fn
+                    break
+            fields = ["name"]
+            if label_field and label_field != "name":
+                fields.append(label_field)
+            rows = frappe.get_all(dt, fields=fields, order_by=(label_field if label_field else "name"), limit_page_length=1000)
+            for r in rows:
+                label = r.get(label_field) if label_field and label_field != "name" else r.get("name")
+                branches.append({"value": label, "label": label, "doctype": dt, "name": r.get("name")})
+            if branches:
+                source = dt
+                break
+        except Exception:
+            continue
+    if not branches:
+        try:
+            ensure_order_cancellation_doctype()
+            rows = frappe.db.sql(f"""
+                select distinct branch
+                from `tab{CANCELLATION_DOCTYPE}`
+                where ifnull(branch,'')!=''
+                order by branch
+                limit 1000
+            """, as_dict=True)
+            branches = [{"value": r.get("branch"), "label": r.get("branch"), "doctype": CANCELLATION_DOCTYPE, "name": r.get("branch")} for r in rows]
+            source = "existing_cancellations" if branches else "not_found"
+        except Exception:
+            pass
+    branches = _v10_dedup_branch(branches)
+    return {"success": True, "source": source, "count": len(branches), "branches": branches}
+
+
+@frappe.whitelist()
+def create_order_cancellation(order_no=None, shift=None, branch=None, customer_name=None, customer_phone=None, reason=None, notes=None, cancellation_time=None, **kwargs):
+    ensure_order_cancellation_doctype()
+    if not _v10_can_manage_cancellations():
+        frappe.throw("غير مسموح: تسجيل الإلغاءات متاح لمدير خدمة العملاء أو مدير النظام فقط")
+    order_no = cstr(order_no or kwargs.get("order") or kwargs.get("order_id") or kwargs.get("order_number") or "").strip()
+    shift = cstr(shift or kwargs.get("shift_name") or "غير محدد").strip()
+    branch = cstr(branch or kwargs.get("store") or kwargs.get("branch_name") or "").strip()
+    customer_name = cstr(customer_name or kwargs.get("customer") or kwargs.get("client_name") or "").strip()
+    customer_phone = cstr(customer_phone or kwargs.get("phone") or kwargs.get("mobile") or "").strip()
+    reason = cstr(reason or kwargs.get("cancel_reason") or kwargs.get("cancellation_reason") or "").strip()
+    notes = cstr(notes or kwargs.get("note") or kwargs.get("remarks") or "").strip()
+    if not order_no:
+        frappe.throw("رقم الطلب مطلوب")
+    if not branch:
+        frappe.throw("الفرع مطلوب")
+    if not reason:
+        frappe.throw("سبب الإلغاء مطلوب")
+    ct = get_datetime(cancellation_time) if cancellation_time else now_datetime()
+    doc = frappe.get_doc({
+        "doctype": CANCELLATION_DOCTYPE,
+        "order_no": order_no,
+        "cancellation_time": ct,
+        "report_date": getdate(ct),
+        "shift": shift or "غير محدد",
+        "branch": branch,
+        "customer_name": customer_name,
+        "customer_phone": customer_phone,
+        "reason": reason,
+        "notes": notes,
+        "logged_by": frappe.session.user,
+        "source": "manual",
+    })
+    doc.insert(ignore_permissions=True)
+    frappe.db.commit()
+    return {"success": True, "name": doc.name, "message": "تم تسجيل الإلغاء بنجاح"}
+
+
+@frappe.whitelist()
+def list_order_cancellations(date_from=None, date_to=None, branch=None, shift=None, search=None, limit=500, **kwargs):
+    ensure_order_cancellation_doctype()
+    start_date, end_date, start_dt, end_dt = _period(date_from, date_to)
+    filters = {"cancellation_time": ["between", [_iso(start_dt), _iso(end_dt)]]}
+    if branch:
+        filters["branch"] = cstr(branch).strip()
+    if shift and cstr(shift).strip() not in ("All", "الكل"):
+        filters["shift"] = cstr(shift).strip()
+    rows = frappe.get_all(
+        CANCELLATION_DOCTYPE,
+        filters=filters,
+        fields=["name", "order_no", "cancellation_time", "shift", "branch", "customer_name", "customer_phone", "reason", "notes", "logged_by", "creation"],
+        order_by="cancellation_time desc, creation desc",
+        limit_page_length=cint(limit) or 500,
+    )
+    if search:
+        q = cstr(search).strip().lower()
+        rows = [r for r in rows if q in " ".join([cstr(r.get(k) or "") for k in ("order_no", "branch", "customer_name", "customer_phone", "reason", "notes", "logged_by")]).lower()]
+    by_branch = {}
+    by_reason = {}
+    for r in rows:
+        b = cstr(r.get("branch") or "غير محدد")
+        by_branch[b] = by_branch.get(b, 0) + 1
+        rr = cstr(r.get("reason") or "غير محدد")
+        by_reason[rr] = by_reason.get(rr, 0) + 1
+    return {
+        "success": True,
+        "period": {"from": cstr(start_date), "to": cstr(end_date)},
+        "count": len(rows),
+        "rows": rows,
+        "by_branch": [{"branch": k, "count": v} for k, v in sorted(by_branch.items(), key=lambda x: (-x[1], x[0]))],
+        "by_reason": [{"reason": k, "count": v} for k, v in sorted(by_reason.items(), key=lambda x: (-x[1], x[0]))],
+    }
+
+
+@frappe.whitelist()
+def verify_cancellations_in_upper_email(date_from=None, date_to=None):
+    data = get_upper_management_report_data(date_from=date_from, date_to=date_to)
+    html = render_upper_management_report_html(date_from=date_from, date_to=date_to)
+    cancels = data.get("cancellations") or {}
+    return {
+        "success": True,
+        "cancellations_count": cancels.get("count", 0),
+        "rows_sample": (cancels.get("rows") or [])[:3],
+        "html_has_cancellation_section": ("الإلغاءات" in cstr(html) or "إلغاء" in cstr(html)),
+        "html_has_cancel_count": cstr(cancels.get("count", 0)) in cstr(html),
+    }
+# END ROSHDY CANCELLATIONS V10 BRANCHES EMAIL VERIFY
+'''
+    if start in s and end in s:
+        i = s.index(start); j = s.index(end, i) + len(end); s = s[:i] + patch.strip() + s[j:]
+    else:
+        s = s.rstrip() + "\n\n" + patch.strip() + "\n"
+    compile(s, str(upper_api), "exec")
+    upper_api.write_text(s, encoding="utf-8")
+PY
+
+echo "🧩 Patch agent-desk full-screen admin-close alert"
+export AGENT_HTML ADMIN_HTML CANCEL_HTML CANCEL_PY
+python3 - <<'PY'
+# -*- coding: utf-8 -*-
+from pathlib import Path
+import os
+
+agent = Path(os.environ["AGENT_HTML"])
+admin = Path(os.environ["ADMIN_HTML"])
+cancel_html = Path(os.environ["CANCEL_HTML"])
+cancel_py = Path(os.environ["CANCEL_PY"])
+
+# ---------------- Agent alert block ----------------
+if agent.exists():
+    s = agent.read_text(encoding="utf-8", errors="ignore")
+    blocks = [
+        ("<!-- BEGIN ROSHDY AGENT BREAK CLOSE ALERT -->", "<!-- END ROSHDY AGENT BREAK CLOSE ALERT -->"),
+        ("<!-- BEGIN ROSHDY AGENT BREAK ADMIN CLOSED V10 -->", "<!-- END ROSHDY AGENT BREAK ADMIN CLOSED V10 -->"),
+    ]
+    for a,b in blocks:
+        while a in s and b in s:
+            i=s.index(a); j=s.index(b,i)+len(b); s=s[:i]+"\n"+s[j:]
+    block = r'''
+<!-- BEGIN ROSHDY AGENT BREAK ADMIN CLOSED V10 -->
+{% raw %}
+<style>
+#roshdy-admin-break-closed-v10{position:fixed;inset:0;background:rgba(15,23,42,.86);z-index:999999;display:none;align-items:center;justify-content:center;padding:18px;direction:rtl;font-family:Tahoma,Arial,sans-serif;text-align:center}.rabc-card{background:#fff;border-radius:22px;box-shadow:0 35px 90px rgba(0,0,0,.45);width:540px;max-width:100%;padding:28px}.rabc-ico{font-size:58px;margin-bottom:10px}.rabc-title{font-size:25px;font-weight:900;color:#0f172a;margin-bottom:10px}.rabc-msg{font-size:18px;color:#334155;margin-bottom:14px}.rabc-details{background:#f8fafc;border:1px solid #e5e7eb;border-radius:14px;padding:12px;color:#475569;font-size:13px;margin-bottom:18px}.rabc-btn{background:#0f766e;color:white;border:0;border-radius:14px;padding:13px 22px;font-size:16px;font-weight:900;cursor:pointer}
+</style>
+<div id="roshdy-admin-break-closed-v10"><div class="rabc-card"><div class="rabc-ico">⏱️</div><div class="rabc-title">تم إنهاء البريك</div><div id="rabc-msg" class="rabc-msg">تم إنهاء البريك بواسطة الإدارة</div><div id="rabc-details" class="rabc-details"></div><button id="rabc-ack" class="rabc-btn">تمام، تم العلم</button></div></div>
+<script>
+(function(){
+  if(window.RoshdyBreakClosedV10)return;
+  var currentBreakLog=null;
+  function call(method,args){args=args||{};var qs=new URLSearchParams();Object.keys(args).forEach(function(k){if(args[k]!==undefined&&args[k]!==null)qs.append(k,args[k]);});return fetch('/api/method/'+method+(qs.toString()?'?'+qs.toString():''),{method:'GET',credentials:'same-origin',cache:'no-store'}).then(function(r){return r.json();}).then(function(j){if(j.exc){throw j;}return j.message||j;});}
+  function show(a){a=a||{};currentBreakLog=a.break_log||currentBreakLog;var box=document.getElementById('roshdy-admin-break-closed-v10');document.getElementById('rabc-msg').textContent=a.message||('تم إنهاء البريك بواسطة '+(a.closed_by||'الإدارة'));document.getElementById('rabc-details').innerHTML='نوع البريك: <b>'+(a.break_type||'')+'</b><br>وقت الإنهاء: <b>'+(a.end_time||'')+'</b><br>مدة البريك: <b>'+(a.duration_minutes||'')+' دقيقة</b>';box.style.display='flex';}
+  function poll(){call('restaurant_ops.api.break_api.get_my_break_admin_alert',{}).then(function(r){if(r&&r.has_alert&&r.alert)show(r.alert);}).catch(function(e){console.log('break alert poll',e);});}
+  document.getElementById('rabc-ack').onclick=function(){var box=document.getElementById('roshdy-admin-break-closed-v10');if(!currentBreakLog){box.style.display='none';return;}call('restaurant_ops.api.break_api.acknowledge_admin_closed_break',{break_log:currentBreakLog}).finally(function(){box.style.display='none';});};
+  window.RoshdyBreakClosedV10={poll:poll,show:show};
+  if(window.frappe&&frappe.realtime){try{frappe.realtime.on('roshdy_break_force_closed',function(payload){show(payload||{});});}catch(e){}}
+  setTimeout(poll,1200);setInterval(poll,5000);
+})();
+</script>
+{% endraw %}
+<!-- END ROSHDY AGENT BREAK ADMIN CLOSED V10 -->
+'''
+    low=s.lower()
+    if "</body>" in low:
+        i=low.rindex("</body>"); s=s[:i]+"\n"+block+"\n"+s[i:]
+    else:
+        s=s.rstrip()+"\n"+block+"\n"
+    agent.write_text(s, encoding="utf-8")
+
+# ---------------- Admin cancellation report links + branch select observer ----------------
+if admin.exists():
+    s = admin.read_text(encoding="utf-8", errors="ignore")
+    # Link full report page where possible, while keeping JS functions available for modal if used.
+    s = s.replace('<a href="javascript:void(0)" onclick="openCancelReport()"><b>↩️</b> <span>تقرير الإلغاءات</span></a>', '<a href="/order-cancellations-report"><b>↩️</b> <span>تقرير الإلغاءات</span></a>')
+    s = s.replace('<a href="javascript:void(0)" onclick="openCancelReport()" class="mod-card"><div class="icon">📄</div><div class="lbl">تقرير الإلغاءات</div><div class="desc">إلغاءات اليوم المسجلة يدوياً</div><span class="mini-badge" id="cancelBadge">0</span></a>', '<a href="/order-cancellations-report" class="mod-card"><div class="icon">📄</div><div class="lbl">تقرير الإلغاءات</div><div class="desc">إلغاءات اليوم المسجلة يدوياً</div><span class="mini-badge" id="cancelBadge">0</span></a>')
+    # Add branch dropdown enhancer once.
+    marker_a='<!-- BEGIN ROSHDY ADMIN CANCELLATION BRANCH SELECT V10 -->'
+    marker_b='<!-- END ROSHDY ADMIN CANCELLATION BRANCH SELECT V10 -->'
+    while marker_a in s and marker_b in s:
+        i=s.index(marker_a); j=s.index(marker_b,i)+len(marker_b); s=s[:i]+"\n"+s[j:]
+    block=r'''
+<!-- BEGIN ROSHDY ADMIN CANCELLATION BRANCH SELECT V10 -->
+<script>
+(function(){
+ if(window.RoshdyCancelBranchSelectV10)return;window.RoshdyCancelBranchSelectV10=1;
+ function api(method,args){args=args||{};var qs=new URLSearchParams();Object.keys(args).forEach(function(k){if(args[k]!==undefined&&args[k]!==null)qs.append(k,args[k]);});return fetch('/api/method/'+method+(qs.toString()?'?'+qs.toString():''),{method:'GET',credentials:'same-origin',cache:'no-store'}).then(function(r){return r.json();}).then(function(j){return j.message||j;}).catch(function(){return null;});}
+ function enhance(){var el=document.getElementById('c-branch');if(!el||el.dataset.v10Done)return;var sel;if(el.tagName!=='SELECT'){sel=document.createElement('select');sel.id='c-branch';sel.className=el.className;el.parentNode.replaceChild(sel,el);}else{sel=el;}sel.dataset.v10Done='1';sel.innerHTML='<option value="">جاري تحميل الفروع...</option>';api('restaurant_ops.api.upper_management_email_api.list_cancellation_branches',{}).then(function(r){var rows=(r&&r.branches)||[];if(!rows.length){sel.innerHTML='<option value="">لا توجد فروع معرفة</option>';return;}sel.innerHTML='<option value="">اختر الفرع</option>'+rows.map(function(x){var v=String(x.value||x.label||'').replace(/"/g,'&quot;');var l=String(x.label||x.value||'');return '<option value="'+v+'">'+l+'</option>';}).join('');});}
+ new MutationObserver(enhance).observe(document.body,{childList:true,subtree:true});setInterval(enhance,1000);
+})();
+</script>
+<!-- END ROSHDY ADMIN CANCELLATION BRANCH SELECT V10 -->
+'''
+    low=s.lower()
+    if "</body>" in low:
+        i=low.rindex("</body>"); s=s[:i]+"\n"+block+"\n"+s[i:]
+    else:
+        s=s.rstrip()+"\n"+block+"\n"
+    admin.write_text(s, encoding="utf-8")
+
+# ---------------- Full cancellation report page ----------------
+cancel_py.write_text("""import frappe\nfrom restaurant_ops.www._context import protect, ADMIN_ROLES\nno_cache = 1\n\ndef get_context(context):\n    protect(context, allowed_roles=ADMIN_ROLES)\n""", encoding="utf-8")
+
+cancel_html.write_text(r'''<!doctype html>
+<html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>تقرير الإلغاءات</title>
+<style>*{box-sizing:border-box;font-family:Tahoma,Arial}body{margin:0;background:#eef2f7;direction:rtl;color:#111827}.top{background:#20262d;color:white;padding:14px 22px;border-bottom:4px solid #1F4E79;display:flex;justify-content:space-between;align-items:center}.top a{color:#fff;text-decoration:none;border:1px solid #64748b;border-radius:10px;padding:8px 12px}.wrap{padding:22px;max-width:1500px;margin:auto}.panel{background:#fff;border:1px solid #d8dee9;border-radius:16px;box-shadow:0 10px 28px #0001;margin-bottom:16px;overflow:hidden}.head{padding:14px 16px;border-bottom:1px solid #e5e7eb;display:flex;justify-content:space-between;gap:10px;align-items:center}.body{padding:16px}.grid{display:grid;grid-template-columns:repeat(6,1fr);gap:10px}label{font-weight:800;color:#475569;font-size:12px}input,select,textarea{width:100%;border:1px solid #d1d5db;border-radius:10px;padding:9px}.btn{border:0;border-radius:10px;padding:10px 13px;background:#1F4E79;color:#fff;font-weight:800;cursor:pointer;margin:3px}.green{background:#16a34a}.orange{background:#f97316}.red{background:#dc2626}.gray{background:#e5e7eb;color:#111827}.table{width:100%;border-collapse:collapse;min-width:1000px}.table th{background:#111827;color:#fff;padding:9px}.table td{border:1px solid #e5e7eb;padding:8px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}.card{background:#fff;border:1px solid #ddd;border-radius:12px;padding:12px}.num{font-size:28px;color:#1F4E79;font-weight:bold}.scroll{overflow:auto}.muted{color:#64748b;font-size:13px}.modal-back{position:fixed;inset:0;background:#0008;display:none;align-items:center;justify-content:center;z-index:50;padding:16px}.modal{background:white;border-radius:16px;width:720px;max-width:100%;max-height:92vh;overflow:auto}.modal h3{background:#111827;color:white;margin:0;padding:13px 15px}.form{padding:14px;display:grid;grid-template-columns:1fr 1fr;gap:10px}.full{grid-column:1/-1}.actions{padding:12px 14px;border-top:1px solid #e5e7eb}.toast{position:fixed;right:18px;bottom:18px;background:#111827;color:white;padding:12px 14px;border-radius:12px;display:none;z-index:80}@media(max-width:900px){.grid,.form{grid-template-columns:1fr 1fr}.wrap{padding:12px}.table{min-width:850px}}@media(max-width:650px){.grid,.form{grid-template-columns:1fr}}</style>
+</head><body><div class="top"><b>↩️ تقرير الإلغاءات</b><div><a href="/admin-desk">Admin Desk</a></div></div><div class="wrap">
+<div class="panel"><div class="head"><b>الفلاتر</b><button class="btn green" onclick="openForm()">تسجيل إلغاء جديد</button></div><div class="body"><div class="grid"><div><label>من تاريخ</label><input type="date" id="df"></div><div><label>إلى تاريخ</label><input type="date" id="dt"></div><div><label>الفرع</label><select id="branchFilter"><option value="">كل الفروع</option></select></div><div><label>الوردية</label><select id="shiftFilter"><option>All</option><option>صباحية</option><option>مسائية</option><option>ليلية</option><option>غير محدد</option></select></div><div><label>بحث</label><input id="search" placeholder="رقم طلب / عميل / سبب"></div><div style="align-self:end"><button class="btn green" onclick="load()">تحديث</button><button class="btn orange" onclick="window.print()">طباعة/PDF</button><button class="btn" onclick="csv()">CSV</button></div></div></div></div>
+<div class="cards"><div class="card">إجمالي الإلغاءات<div class="num" id="total">0</div></div><div class="card">أكثر فرع<div class="num" id="topBranch" style="font-size:20px">--</div></div><div class="card">أكثر سبب<div class="num" id="topReason" style="font-size:20px">--</div></div></div><br>
+<div class="panel"><div class="head"><b>تفاصيل الإلغاءات</b></div><div class="body scroll"><table class="table"><thead><tr><th>وقت التسجيل</th><th>رقم الطلب</th><th>الوردية</th><th>الفرع</th><th>اسم العميل</th><th>رقم العميل</th><th>سبب الإلغاء</th><th>ملاحظات</th><th>سجلها</th></tr></thead><tbody id="rows"></tbody></table></div></div>
+</div><div id="modalBack" class="modal-back"><div class="modal"><h3>تسجيل إلغاء طلب</h3><div class="form"><div><label>رقم الطلب *</label><input id="c_order"></div><div><label>الوردية *</label><select id="c_shift"><option>صباحية</option><option>مسائية</option><option>ليلية</option><option>غير محدد</option></select></div><div><label>الفرع *</label><select id="c_branch"><option value="">اختر الفرع</option></select></div><div><label>اسم العميل</label><input id="c_customer"></div><div><label>رقم العميل</label><input id="c_phone"></div><div><label>سبب الإلغاء *</label><input id="c_reason"></div><div class="full"><label>ملاحظات</label><textarea id="c_notes" rows="3"></textarea></div></div><div class="actions"><button class="btn green" onclick="save()">حفظ</button><button class="btn gray" onclick="closeForm()">إغلاق</button></div></div></div><div id="toast" class="toast"></div>
+<script>
+let last=null,branches=[];function qs(o){let p=new URLSearchParams();Object.keys(o||{}).forEach(k=>{let v=o[k];if(v!==undefined&&v!==null&&v!==''&&v!=='All')p.append(k,v)});return p.toString()}async function api(m,args){let q=qs(args||{});let r=await fetch('/api/method/'+m+(q?'?'+q:''),{method:'GET',credentials:'same-origin',cache:'no-store'});let j=await r.json();if(j.exc)throw j;return j.message||j}function today(){return new Date().toISOString().slice(0,10)}function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function toast(x){let t=document.getElementById('toast');t.textContent=x;t.style.display='block';setTimeout(()=>t.style.display='none',3500)}
+async function loadBranches(){let r=await api('restaurant_ops.api.upper_management_email_api.list_cancellation_branches');branches=(r&&r.branches)||[];let opts='<option value="">كل الفروع</option>'+branches.map(b=>'<option value="'+esc(b.value)+'">'+esc(b.label)+'</option>').join('');branchFilter.innerHTML=opts;c_branch.innerHTML='<option value="">اختر الفرع</option>'+branches.map(b=>'<option value="'+esc(b.value)+'">'+esc(b.label)+'</option>').join('')}
+async function load(){last=await api('restaurant_ops.api.upper_management_email_api.list_order_cancellations',{date_from:df.value,date_to:dt.value,branch:branchFilter.value,shift:shiftFilter.value,search:search.value});total.textContent=last.count||0;topBranch.textContent=(last.by_branch&&last.by_branch[0])?last.by_branch[0].branch:'--';topReason.textContent=(last.by_reason&&last.by_reason[0])?last.by_reason[0].reason:'--';let rs=last.rows||[];rows.innerHTML=rs.length?rs.map(r=>'<tr><td>'+esc(r.cancellation_time)+'</td><td>'+esc(r.order_no)+'</td><td>'+esc(r.shift)+'</td><td>'+esc(r.branch)+'</td><td>'+esc(r.customer_name)+'</td><td>'+esc(r.customer_phone)+'</td><td>'+esc(r.reason)+'</td><td>'+esc(r.notes)+'</td><td>'+esc(r.logged_by)+'</td></tr>').join(''):'<tr><td colspan="9" style="text-align:center;color:#64748b;background:#f8fafc">لا توجد إلغاءات</td></tr>'}
+function openForm(){modalBack.style.display='flex'}function closeForm(){modalBack.style.display='none'}modalBack.onclick=e=>{if(e.target.id==='modalBack')closeForm()};async function save(){let args={order_no:c_order.value.trim(),shift:c_shift.value,branch:c_branch.value,customer_name:c_customer.value.trim(),customer_phone:c_phone.value.trim(),reason:c_reason.value.trim(),notes:c_notes.value.trim()};if(!args.order_no||!args.branch||!args.reason){toast('رقم الطلب والفرع وسبب الإلغاء مطلوبين');return}let r=await api('restaurant_ops.api.upper_management_email_api.create_order_cancellation',args);if(r&&r.success){toast('تم تسجيل الإلغاء');closeForm();load()}else toast('فشل التسجيل')}
+function csv(){if(!last)return;let header=['وقت التسجيل','رقم الطلب','الوردية','الفرع','اسم العميل','رقم العميل','سبب الإلغاء','ملاحظات','سجلها'];let lines=[header.join(',')].concat((last.rows||[]).map(r=>[r.cancellation_time,r.order_no,r.shift,r.branch,r.customer_name,r.customer_phone,r.reason,r.notes,r.logged_by].map(x=>'"'+String(x||'').replace(/"/g,'""')+'"').join(',')));let blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'});let a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='order-cancellations.csv';a.click()}
+df.value=today();dt.value=today();loadBranches().then(load);
+</script></body></html>''', encoding="utf-8")
+PY
+
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+if [[ -n "$APP_OWNER" ]]; then
+  chown "$APP_OWNER" "$ADMIN_HTML" "$AGENT_HTML" "$BREAK_API" "$UPPER_API" "$CANCEL_HTML" "$CANCEL_PY" 2>/dev/null || true
+fi
+
+echo "🧹 Clear cache + restart app services"
+bench_exec clear-cache || true
+"${COMPOSE[@]}" restart backend frontend websocket queue-short queue-long scheduler >/dev/null
+sleep 8
+bench_exec clear-cache || true
+
+echo "🧪 Critical page smoke checks"
+set +e
+for p in admin-desk agent-desk break-admin order-cancellations-report email-report-customizer call-report; do
+  code="$(curl -k -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$p" 2>/dev/null || echo 000)"
+  echo "$p => $code" | tee -a "$BACKUP_DIR/page_smoke_checks_v10.txt"
+done
+set -e
+
+if ! grep -q "admin-desk => 200" "$BACKUP_DIR/page_smoke_checks_v10.txt" || ! grep -q "order-cancellations-report => 200" "$BACKUP_DIR/page_smoke_checks_v10.txt"; then
+  echo "❌ Critical page failed. Auto restoring changed pages."
+  for name in admin-desk.html agent-desk.html order-cancellations-report.html order-cancellations-report.py; do
+    [[ -f "$BACKUP_DIR/$name.before" ]] && cp -a "$BACKUP_DIR/$name.before" "$WWW_DIR/$name"
+  done
+  [[ -n "$APP_OWNER" ]] && chown "$APP_OWNER" "$ADMIN_HTML" "$AGENT_HTML" "$CANCEL_HTML" "$CANCEL_PY" 2>/dev/null || true
+  bench_exec clear-cache || true
+  "${COMPOSE[@]}" restart backend frontend websocket >/dev/null
+  sleep 6
+  bench_exec clear-cache || true
+  exit 1
+fi
+
+echo "🧪 Backend validation"
+set +e
+bench_exec execute restaurant_ops.api.break_api.get_active_breaks | tee "$BACKUP_DIR/active_breaks_v10.txt"
+V1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.upper_management_email_api.list_cancellation_branches | tee "$BACKUP_DIR/branches_v10.txt"
+V2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.upper_management_email_api.list_order_cancellations | tee "$BACKUP_DIR/cancellations_v10.txt"
+V3=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.upper_management_email_api.verify_cancellations_in_upper_email | tee "$BACKUP_DIR/email_cancellation_verify_v10.txt"
+V4=${PIPESTATUS[0]}
+set -e
+
+if [[ $V1 -ne 0 || $V2 -ne 0 || $V3 -ne 0 || $V4 -ne 0 ]]; then
+  echo "❌ Backend validation failed. راجع: $BACKUP_DIR"
+  exit 1
+fi
+
+echo "🏥 Health Check - Elastix/CDR/AMI + Queue + Call Report"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$BACKUP_DIR/health_asterisk_bridge.txt"
+H1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status | tee "$BACKUP_DIR/health_queue_status.txt"
+H2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' | tee "$BACKUP_DIR/health_call_report.txt"
+H3=${PIPESTATUS[0]}
+set -e
+
+if [[ $H1 -ne 0 || $H2 -ne 0 || $H3 -ne 0 ]]; then
+  echo "⚠️ Health returned non-zero. راجع: $BACKUP_DIR"
+else
+  echo "✅ Health checks OK"
+fi
+
+echo "============================================================"
+echo "✅ DONE V10"
+echo "📦 Backup folder: $BACKUP_DIR"
+echo "⏱️ Employee full-screen break-ended alert added to /agent-desk"
+echo "↩️ Full cancellation report page: /order-cancellations-report"
+echo "🏬 Branch dropdown uses real system branches via list_cancellation_branches"
+echo "📧 Email verification endpoint confirms cancellation section/count in upper email preview"
+echo "🛡️ report_api.py لم يتم لمسه"
+echo "============================================================"

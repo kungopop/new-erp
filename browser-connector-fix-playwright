@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# browser-connector-fix-playwright
+# Fix Browser Connector crash:
+# - ModuleNotFoundError: No module named 'playwright'
+# - Xvfb lock: /tmp/.X99-lock
+# Keeps existing sessions/profiles in /opt/roshdy_browser_connector/profiles.
+
+ROOT="/opt/frappe_crm"
+SITE="crm.local"
+BC_ROOT="/opt/roshdy_browser_connector"
+APP_DIR="$ROOT/apps/restaurant_ops/restaurant_ops"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/BROWSER_CONNECTOR_FIX_PLAYWRIGHT_BEFORE_$TS"
+API_PORT="33121"
+NOVNC_PORT="33120"
+API_USER="roshdy_browser"
+API_PASS="RoshdyBrowser@123"
+VNC_PASS="RoshdyBrowser@123"
+
+say(){ echo -e "\n============================================================\n$1\n============================================================"; }
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo "❌ شغّل كـ root: sudo -i ثم ./browser-connector-fix-playwright"
+  exit 1
+fi
+
+say "1) Backup"
+cd "$ROOT"
+BACKEND="$(docker compose ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ لم أجد backend container. شغّل: cd /opt/frappe_crm && docker compose up -d"
+  exit 1
+fi
+if [[ ! -d "$BC_ROOT" ]]; then
+  echo "❌ لم أجد $BC_ROOT. شغّل roshdy-browser-connector-poc الأول."
+  exit 1
+fi
+mkdir -p "$BACKUP_DIR"
+cp -a "$BC_ROOT" "$BACKUP_DIR/roshdy_browser_connector"
+[[ -d "$APP_DIR" ]] && cp -a "$APP_DIR" "$BACKUP_DIR/restaurant_ops" || true
+
+echo "✅ Backup: $BACKUP_DIR"
+
+say "2) Patch Dockerfile: install playwright Python package"
+cd "$BC_ROOT"
+
+# Preserve .env or create it.
+if [[ ! -f .env ]]; then
+cat > .env <<EOF
+API_PORT=$API_PORT
+NOVNC_PORT=$NOVNC_PORT
+API_USER=$API_USER
+API_PASS=$API_PASS
+VNC_PASS=$VNC_PASS
+TZ=Africa/Cairo
+EOF
+else
+  grep -q '^API_PORT=' .env && sed -i "s/^API_PORT=.*/API_PORT=$API_PORT/" .env || echo "API_PORT=$API_PORT" >> .env
+  grep -q '^NOVNC_PORT=' .env && sed -i "s/^NOVNC_PORT=.*/NOVNC_PORT=$NOVNC_PORT/" .env || echo "NOVNC_PORT=$NOVNC_PORT" >> .env
+  grep -q '^API_USER=' .env && sed -i "s/^API_USER=.*/API_USER=$API_USER/" .env || echo "API_USER=$API_USER" >> .env
+  grep -q '^API_PASS=' .env && sed -i "s/^API_PASS=.*/API_PASS=$API_PASS/" .env || echo "API_PASS=$API_PASS" >> .env
+  grep -q '^VNC_PASS=' .env && sed -i "s/^VNC_PASS=.*/VNC_PASS=$VNC_PASS/" .env || echo "VNC_PASS=$VNC_PASS" >> .env
+fi
+chmod 600 .env
+
+cat > Dockerfile <<'DOCKER'
+FROM mcr.microsoft.com/playwright/python:v1.48.0-jammy
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    xvfb x11vnc fluxbox novnc websockify \
+    fonts-noto fonts-noto-cjk fonts-noto-color-emoji \
+    ca-certificates curl tzdata procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# Some Playwright base images include browsers but not the Python package in PATH used here.
+# Install the Python package explicitly. Browser binaries are already present in the base image.
+RUN pip install --no-cache-dir fastapi "uvicorn[standard]" playwright==1.48.0
+
+WORKDIR /app
+COPY app/app.py /app/app.py
+COPY app/entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+EXPOSE 6080 8000
+ENTRYPOINT ["/app/entrypoint.sh"]
+DOCKER
+
+say "3) Patch entrypoint: clean X locks before starting"
+cat > app/entrypoint.sh <<'SH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+mkdir -p /profiles/default /data /downloads /tmp/.X11-unix
+chmod -R 777 /profiles /data /downloads /tmp/.X11-unix || true
+
+export DISPLAY=${DISPLAY:-:99}
+export TZ=${TZ:-Africa/Cairo}
+
+# Clean stale X locks from prior crashes/restarts.
+pkill -f "Xvfb ${DISPLAY}" >/dev/null 2>&1 || true
+pkill -f "x11vnc" >/dev/null 2>&1 || true
+pkill -f "websockify" >/dev/null 2>&1 || true
+pkill -f "fluxbox" >/dev/null 2>&1 || true
+rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 /tmp/vnc.pass || true
+
+# X server
+Xvfb "$DISPLAY" -screen 0 1366x768x24 -ac +extension GLX +render -noreset >/tmp/xvfb.log 2>&1 &
+sleep 2
+
+# Window manager
+fluxbox >/tmp/fluxbox.log 2>&1 &
+
+# VNC server
+if [[ -n "${VNC_PASS:-}" ]]; then
+  x11vnc -storepasswd "$VNC_PASS" /tmp/vnc.pass >/dev/null 2>&1 || true
+  x11vnc -display "$DISPLAY" -forever -shared -rfbport 5900 -rfbauth /tmp/vnc.pass -quiet >/tmp/x11vnc.log 2>&1 &
+else
+  x11vnc -display "$DISPLAY" -forever -shared -rfbport 5900 -nopw -quiet >/tmp/x11vnc.log 2>&1 &
+fi
+
+# noVNC websockify
+NOVNC_WEB=/usr/share/novnc
+if [[ ! -d "$NOVNC_WEB" ]]; then NOVNC_WEB=/usr/share/novnc/utils; fi
+websockify --web="$NOVNC_WEB" 6080 localhost:5900 >/tmp/novnc.log 2>&1 &
+
+# API
+exec uvicorn app:app --host 0.0.0.0 --port 8000
+SH
+chmod +x app/entrypoint.sh
+
+say "4) Rebuild + recreate connector cleanly"
+docker compose down --remove-orphans || true
+docker compose build browser_connector
+docker compose up -d
+sleep 10
+
+echo "--- docker compose ps ---"
+docker compose ps
+
+echo "--- logs tail ---"
+docker compose logs --tail=120 browser_connector || true
+
+say "5) Wait for health"
+OK=0
+for i in $(seq 1 45); do
+  if curl -fsS "http://127.0.0.1:$API_PORT/health" > /tmp/browser_health.json 2>/tmp/browser_health.err; then
+    OK=1
+    cat /tmp/browser_health.json
+    echo
+    break
+  fi
+  echo "waiting health $i/45... $(cat /tmp/browser_health.err 2>/dev/null || true)"
+  sleep 2
+done
+
+if [[ "$OK" != "1" ]]; then
+  echo "❌ Browser Connector API still not healthy. Logs:"
+  docker compose logs --tail=250 browser_connector || true
+  echo "--- inside process list if container alive ---"
+  docker exec roshdy-browser-connector bash -lc 'ps aux; echo Xvfb log; cat /tmp/xvfb.log 2>/dev/null; echo uvicorn maybe down' || true
+  exit 1
+fi
+
+say "6) Validate noVNC + API portal"
+echo "--- noVNC HTTP status ---"
+curl -s -o /dev/null -w "noVNC => %{http_code}\n" "http://127.0.0.1:$NOVNC_PORT/vnc.html" || true
+
+echo "--- API portal HTTP status ---"
+curl -s -o /dev/null -w "API portal => %{http_code}\n" -u "$API_USER:$API_PASS" "http://127.0.0.1:$API_PORT/" || true
+
+echo "--- Browser status endpoint ---"
+curl -sS -u "$API_USER:$API_PASS" "http://127.0.0.1:$API_PORT/api/status" | head -c 2000 || true
+echo
+
+say "7) Ensure ERP helper page links are correct"
+SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+[[ -z "$SERVER_IP" ]] && SERVER_IP="10.11.1.66"
+cat > "$APP_DIR/www/browser-connectors.py" <<'PY'
+import frappe
+no_cache = 1
+
+def get_context(context):
+    user = frappe.session.user
+    roles = frappe.get_roles(user)
+    if user != "Administrator" and "System Manager" not in roles:
+        frappe.throw("System Manager only", frappe.PermissionError)
+    return context
+PY
+
+cat > "$APP_DIR/www/browser-connectors.html" <<HTML
+<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Browser Connectors</title><style>*{box-sizing:border-box;font-family:Tahoma,Arial}body{background:#eef2f7;margin:0;direction:rtl;color:#111827}.top{background:#20262d;color:#fff;padding:14px 22px;border-bottom:4px solid #1F4E79;display:flex;justify-content:space-between}.top a{color:#fff;text-decoration:none;border:1px solid #64748b;border-radius:10px;padding:8px 12px;margin:2px}.wrap{padding:22px;max-width:1100px;margin:auto}.card{background:#fff;border:1px solid #d8dee9;border-radius:16px;padding:16px;margin:12px 0;box-shadow:0 10px 28px #0001}a.btn{display:inline-block;margin:5px;padding:10px 14px;border-radius:11px;background:#1F4E79;color:#fff;text-decoration:none;font-weight:bold}.fb{background:#1877f2!important}.ig{background:linear-gradient(135deg,#f58529,#dd2a7b,#8134af)!important}.tt{background:#111827!important}.note{background:#fff7ed;border:1px solid #fed7aa;border-right:5px solid #f97316;border-radius:14px;padding:12px;line-height:1.7}</style></head><body><div class="top"><b>🌐 Browser Connectors — System Manager Only</b><div><a href="/social-settings">Social Settings</a><a href="/social-meta-settings">Meta Official</a><a href="/admin-desk">Admin Desk</a></div></div><div class="wrap"><div class="note">ده PoC للربط غير الرسمي بالمتصفح. الرسمي Meta Graph API موجود ومتلغاش. هنا هتسجل دخول في متصفح السيرفر، والجلسة هتتحفظ.</div><div class="card"><h3>Browser Connector Portal</h3><a class="btn" href="http://$SERVER_IP:$API_PORT" target="_blank">Open Browser Connector Portal</a><a class="btn" href="http://$SERVER_IP:$NOVNC_PORT/vnc.html?autoconnect=true&resize=scale" target="_blank">Open noVNC Browser</a><p>API user: <b>$API_USER</b><br>API password: <b>$API_PASS</b><br>VNC password: <b>$VNC_PASS</b></p></div><div class="card"><h3>Targets</h3><a class="btn fb" href="http://$SERVER_IP:$API_PORT/api/open/facebook_business_inbox" target="_blank">Facebook Business Inbox</a><a class="btn ig" href="http://$SERVER_IP:$API_PORT/api/open/instagram_direct" target="_blank">Instagram Direct</a><a class="btn tt" href="http://$SERVER_IP:$API_PORT/api/open/tiktok_messages" target="_blank">TikTok Messages</a></div></div></body></html>
+HTML
+chmod 644 "$APP_DIR/www/browser-connectors.py" "$APP_DIR/www/browser-connectors.html"
+
+cd "$ROOT"
+docker exec "$BACKEND" bench --site "$SITE" clear-cache || true
+docker exec "$BACKEND" bench --site "$SITE" clear-website-cache || true
+docker compose restart backend frontend
+sleep 8
+BACKEND="$(docker compose ps -q backend)"
+
+say "8) ERP page + system health"
+echo "--- Page HTTP status ---"
+for page in browser-connectors social-meta-settings social-settings social-inbox admin-desk; do
+  code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$page" || true)"
+  echo "$page => $code"
+done
+
+say "9) Health Check مهم: Elastix/CDR/AMI + Queue + Call Report"
+echo "--- Asterisk/Elastix diagnostics ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics || true
+
+echo "--- Queue status ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.queue_api.get_queue_status || true
+
+echo "--- Calls report admin sample ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' || true
+
+say "✅ Browser Connector Playwright fixed يا زعيم"
+echo "ERP helper page: http://$SERVER_IP/browser-connectors"
+echo "Browser Connector portal: http://$SERVER_IP:$API_PORT"
+echo "Server Browser noVNC: http://$SERVER_IP:$NOVNC_PORT/vnc.html?autoconnect=true&resize=scale"
+echo "API username: $API_USER"
+echo "API password: $API_PASS"
+echo "VNC password: $VNC_PASS"
+echo "بعد ما تفتح noVNC وتسجل دخول، ابعتلي Screenshot من Inbox الحقيقي."
+echo "Backup: $BACKUP_DIR"

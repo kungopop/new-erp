@@ -1,0 +1,612 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# customer-lookup-phaseA
+# Phase A: System-Manager-only Customer Lookup Connector.
+# Adds:
+# - /customer-lookup-settings page (Administrator/System Manager only)
+# - Customer Lookup Source / Query / Cache doctypes
+# - API for HTTP bridge and MySQL/MariaDB read-only lookup testing
+# - Does NOT expose settings to Center Manager/Agent/Social roles.
+# - Does NOT yet auto-hook into Social Inbox; this is safe discovery/test phase.
+
+ROOT="/opt/frappe_crm"
+SITE="crm.local"
+APP_HOST="$ROOT/apps/restaurant_ops"
+APP_DIR="$APP_HOST/restaurant_ops"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/CUSTOMER_LOOKUP_PHASEA_BEFORE_$TS"
+
+say(){ echo -e "\n============================================================\n$1\n============================================================"; }
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo "❌ شغّل كـ root: sudo -i ثم ./customer-lookup-phaseA"
+  exit 1
+fi
+
+say "1) Backup قبل Customer Lookup Phase A"
+cd "$ROOT"
+BACKEND="$(docker compose ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ لم أجد backend container. شغّل: cd /opt/frappe_crm && docker compose up -d"
+  exit 1
+fi
+mkdir -p "$BACKUP_DIR"
+cp -a "$APP_HOST" "$BACKUP_DIR/restaurant_ops"
+[[ -f "$ROOT/docker-compose.yml" ]] && cp -a "$ROOT/docker-compose.yml" "$BACKUP_DIR/docker-compose.yml"
+echo "✅ Backup: $BACKUP_DIR"
+
+say "2) Write setup script for DocTypes"
+mkdir -p "$APP_DIR/scripts" "$APP_DIR/api" "$APP_DIR/www"
+cat > "$APP_DIR/scripts/customer_lookup_setup.py" <<'PY'
+import frappe
+
+MODULE = "Restaurant Operations"
+
+
+def sys_perms():
+    return [
+        {"role": "System Manager", "read": 1, "write": 1, "create": 1, "delete": 1},
+    ]
+
+
+def ensure_doctype(name, fields, autoname, title_field=None):
+    if frappe.db.exists("DocType", name):
+        doc = frappe.get_doc("DocType", name)
+        changed = False
+        if doc.autoname != autoname:
+            doc.autoname = autoname; changed = True
+        if doc.naming_rule != "Expression":
+            doc.naming_rule = "Expression"; changed = True
+        if title_field and doc.title_field != title_field:
+            doc.title_field = title_field; changed = True
+        if changed:
+            doc.save(ignore_permissions=True)
+            print("✅ fixed DocType", name)
+        else:
+            print("⏭️ DocType exists", name)
+        return
+    data = {
+        "doctype": "DocType",
+        "name": name,
+        "module": MODULE,
+        "custom": 0,
+        "autoname": autoname,
+        "naming_rule": "Expression",
+        "track_changes": 1,
+        "sort_field": "modified",
+        "sort_order": "DESC",
+        "fields": fields,
+        "permissions": sys_perms(),
+    }
+    if title_field:
+        data["title_field"] = title_field
+    frappe.get_doc(data).insert(ignore_permissions=True)
+    print("✅ DocType", name)
+
+
+def run():
+    ensure_doctype(
+        "Customer Lookup Source",
+        [
+            {"fieldname":"source_name", "label":"Source Name", "fieldtype":"Data", "reqd":1, "in_list_view":1},
+            {"fieldname":"source_type", "label":"Source Type", "fieldtype":"Select", "options":"HTTP Bridge\nMySQL/MariaDB\nPostgreSQL (later)\nSQL Server (later)", "default":"HTTP Bridge", "in_list_view":1},
+            {"fieldname":"active", "label":"Active", "fieldtype":"Check", "default":1, "in_list_view":1},
+            {"fieldname":"cache_ttl_minutes", "label":"Cache TTL Minutes", "fieldtype":"Int", "default":5, "in_list_view":1},
+            {"fieldname":"section_http", "label":"HTTP Bridge", "fieldtype":"Section Break"},
+            {"fieldname":"http_url_template", "label":"HTTP URL Template", "fieldtype":"Small Text", "description":"Example: http://10.11.1.19/caller.php?phone={phone_local}"},
+            {"fieldname":"http_method", "label":"HTTP Method", "fieldtype":"Select", "options":"GET", "default":"GET"},
+            {"fieldname":"http_response_type", "label":"HTTP Response Type", "fieldtype":"Select", "options":"JSON\nHTML\nText", "default":"JSON"},
+            {"fieldname":"section_db", "label":"Database", "fieldtype":"Section Break"},
+            {"fieldname":"db_host", "label":"DB Host", "fieldtype":"Data"},
+            {"fieldname":"db_port", "label":"DB Port", "fieldtype":"Int", "default":3306},
+            {"fieldname":"db_name", "label":"Database Name", "fieldtype":"Data"},
+            {"fieldname":"db_user", "label":"DB Username", "fieldtype":"Data"},
+            {"fieldname":"db_password", "label":"DB Password", "fieldtype":"Password"},
+            {"fieldname":"section_notes", "label":"Notes", "fieldtype":"Section Break"},
+            {"fieldname":"notes", "label":"Notes", "fieldtype":"Small Text"},
+        ],
+        "format:CLOOK-SRC-{#####}",
+        "source_name",
+    )
+
+    ensure_doctype(
+        "Customer Lookup Query",
+        [
+            {"fieldname":"query_name", "label":"Query Name", "fieldtype":"Data", "reqd":1, "in_list_view":1},
+            {"fieldname":"source", "label":"Source", "fieldtype":"Link", "options":"Customer Lookup Source", "reqd":1, "in_list_view":1},
+            {"fieldname":"active", "label":"Active", "fieldtype":"Check", "default":1, "in_list_view":1},
+            {"fieldname":"lookup_mode", "label":"Lookup Mode", "fieldtype":"Select", "options":"Use Source Default\nHTTP URL\nSQL Query", "default":"Use Source Default"},
+            {"fieldname":"sql_query", "label":"SQL Query", "fieldtype":"Long Text", "description":"SELECT only. Variables: %(phone_local)s, %(phone_20)s, %(phone_plus)s, %(phone_like)s"},
+            {"fieldname":"max_rows", "label":"Max Rows", "fieldtype":"Int", "default":5},
+            {"fieldname":"cache_ttl_minutes", "label":"Override Cache TTL Minutes", "fieldtype":"Int", "default":0},
+            {"fieldname":"result_note", "label":"Result Note", "fieldtype":"Small Text", "description":"Optional note for System Manager"},
+        ],
+        "format:CLOOK-QRY-{#####}",
+        "query_name",
+    )
+
+    ensure_doctype(
+        "Customer Lookup Cache",
+        [
+            {"fieldname":"phone_normalized", "label":"Phone Normalized", "fieldtype":"Data", "reqd":1, "in_list_view":1},
+            {"fieldname":"query", "label":"Query", "fieldtype":"Link", "options":"Customer Lookup Query", "in_list_view":1},
+            {"fieldname":"source", "label":"Source", "fieldtype":"Link", "options":"Customer Lookup Source"},
+            {"fieldname":"status", "label":"Status", "fieldtype":"Select", "options":"OK\nNot Found\nError", "default":"OK", "in_list_view":1},
+            {"fieldname":"last_lookup_at", "label":"Last Lookup At", "fieldtype":"Datetime", "in_list_view":1},
+            {"fieldname":"expires_at", "label":"Expires At", "fieldtype":"Datetime", "in_list_view":1},
+            {"fieldname":"result_json", "label":"Result JSON", "fieldtype":"Long Text"},
+            {"fieldname":"display_text", "label":"Display Text", "fieldtype":"Long Text"},
+            {"fieldname":"error_message", "label":"Error Message", "fieldtype":"Long Text"},
+        ],
+        "format:CLOOK-CACHE-{YYYY}-{MM}-{DD}-{#####}",
+        "phone_normalized",
+    )
+
+    frappe.db.commit()
+    print("✅ Customer Lookup setup complete")
+PY
+chmod 644 "$APP_DIR/scripts/customer_lookup_setup.py"
+
+say "3) Write Customer Lookup API"
+cat > "$APP_DIR/api/customer_lookup_api.py" <<'PY'
+import json
+import re
+import html
+from datetime import timedelta
+
+import frappe
+from frappe.utils import now_datetime, add_to_date
+
+DENY_SQL_WORDS = [
+    "insert", "update", "delete", "drop", "alter", "truncate", "create", "replace", "grant", "revoke", "execute", "call", "load_file", "outfile", "dumpfile", ";"
+]
+
+
+def _sys_only():
+    user = frappe.session.user
+    roles = set(frappe.get_roles(user))
+    return user == "Administrator" or "System Manager" in roles
+
+
+def _deny():
+    return {"success": False, "message": "System Manager only"}
+
+
+def _check():
+    if not _sys_only():
+        frappe.throw("System Manager only", frappe.PermissionError)
+
+
+def normalize_phone(value):
+    s = str(value or "")
+    s = s.split("@")[0]
+    digits = re.sub(r"\D+", "", s)
+    if digits.startswith("00"):
+        digits = digits[2:]
+    if digits.startswith("2") and len(digits) == 12:
+        phone_20 = digits
+    elif digits.startswith("0") and len(digits) == 11:
+        phone_20 = "20" + digits[1:]
+    elif digits.startswith("1") and len(digits) == 10:
+        phone_20 = "20" + digits
+    else:
+        phone_20 = digits
+    phone_local = "0" + phone_20[2:] if phone_20.startswith("20") and len(phone_20) == 12 else digits
+    phone_no_country = phone_20[2:] if phone_20.startswith("20") else digits[-10:]
+    return {
+        "phone_raw": str(value or ""),
+        "phone_digits": digits,
+        "phone_20": phone_20,
+        "phone_plus": "+" + phone_20 if phone_20 else "",
+        "phone_local": phone_local,
+        "phone_no_country": phone_no_country,
+        "phone_like": "%" + phone_no_country + "%" if phone_no_country else "%%",
+    }
+
+
+def _source_password(doc):
+    try:
+        v = doc.get_password("db_password")
+        if v:
+            return v
+    except Exception:
+        pass
+    try:
+        from frappe.utils.password import get_decrypted_password
+        return get_decrypted_password(doc.doctype, doc.name, "db_password", raise_exception=False) or ""
+    except Exception:
+        return ""
+
+
+def _set_source_password(doc, value):
+    if not value:
+        return
+    try:
+        if hasattr(doc, "set_password"):
+            doc.set_password("db_password", value)
+            return
+    except Exception:
+        pass
+    try:
+        from frappe.utils.password import set_encrypted_password
+        set_encrypted_password(doc.doctype, doc.name, value, "db_password")
+        return
+    except Exception:
+        pass
+    frappe.db.set_value(doc.doctype, doc.name, "db_password", value)
+
+
+def _clean_url_template(tpl):
+    return str(tpl or "").strip()
+
+
+def _render_template(tpl, vars):
+    out = _clean_url_template(tpl)
+    for k, v in vars.items():
+        out = out.replace("{" + k + "}", str(v or ""))
+    return out
+
+
+def _safe_sql(sql):
+    s = str(sql or "").strip()
+    low = re.sub(r"\s+", " ", s.lower())
+    if not (low.startswith("select ") or low.startswith("with ")):
+        return False, "Only SELECT/WITH queries are allowed"
+    for w in DENY_SQL_WORDS:
+        if w == ";":
+            if ";" in low:
+                return False, "Multiple statements are not allowed"
+        elif re.search(r"\b" + re.escape(w) + r"\b", low):
+            return False, "Forbidden SQL keyword: " + w
+    return True, "OK"
+
+
+def _mysql_connect(source):
+    import pymysql
+    return pymysql.connect(
+        host=source.db_host,
+        port=int(source.db_port or 3306),
+        user=source.db_user,
+        password=_source_password(source),
+        database=source.db_name,
+        connect_timeout=5,
+        read_timeout=10,
+        write_timeout=10,
+        charset="utf8mb4",
+        cursorclass=pymysql.cursors.DictCursor,
+        autocommit=True,
+    )
+
+
+def _rows_to_display(rows):
+    if not rows:
+        return "لا توجد بيانات"
+    lines = []
+    for i, row in enumerate(rows, 1):
+        if len(rows) > 1:
+            lines.append(f"--- Row {i} ---")
+        for k, v in row.items():
+            lines.append(f"{k}: {v if v is not None else ''}")
+    return "\n".join(lines)
+
+
+def _parse_http_response(text, response_type):
+    rt = (response_type or "JSON").lower()
+    if rt == "json":
+        data = json.loads(text or "{}")
+        if isinstance(data, list):
+            rows = data
+        elif isinstance(data, dict):
+            rows = data.get("rows") if isinstance(data.get("rows"), list) else [data]
+        else:
+            rows = [{"value": data}]
+        return {"rows": rows, "raw": data, "display": _rows_to_display(rows)}
+    if rt == "html":
+        # Keep raw text for admin preview; also make stripped text.
+        stripped = re.sub(r"<[^>]+>", " ", text or "")
+        stripped = html.unescape(re.sub(r"\s+", " ", stripped)).strip()
+        return {"rows": [{"HTML/Text": stripped}], "raw_html": text, "display": stripped}
+    return {"rows": [{"Text": text or ""}], "raw_text": text or "", "display": text or ""}
+
+
+@frappe.whitelist(allow_guest=False)
+def list_sources():
+    if not _sys_only(): return _deny()
+    rows = frappe.get_all("Customer Lookup Source", fields=["name", "source_name", "source_type", "active", "cache_ttl_minutes", "http_url_template", "http_response_type", "db_host", "db_port", "db_name", "db_user", "notes"], order_by="modified desc", limit_page_length=200)
+    return {"success": True, "sources": rows}
+
+
+@frappe.whitelist(allow_guest=False)
+def save_source(name=None, source_name=None, source_type="HTTP Bridge", active=1, cache_ttl_minutes=5, http_url_template="", http_response_type="JSON", db_host="", db_port=3306, db_name="", db_user="", db_password="", notes=""):
+    if not _sys_only(): return _deny()
+    doc = frappe.get_doc("Customer Lookup Source", name) if name and frappe.db.exists("Customer Lookup Source", name) else frappe.get_doc({"doctype":"Customer Lookup Source"})
+    doc.source_name = source_name or doc.source_name or "Customer Source"
+    doc.source_type = source_type or "HTTP Bridge"
+    doc.active = int(active or 0)
+    doc.cache_ttl_minutes = int(cache_ttl_minutes or 5)
+    doc.http_url_template = http_url_template or ""
+    doc.http_method = "GET"
+    doc.http_response_type = http_response_type or "JSON"
+    doc.db_host = db_host or ""
+    doc.db_port = int(db_port or 3306)
+    doc.db_name = db_name or ""
+    doc.db_user = db_user or ""
+    doc.notes = notes or ""
+    if doc.is_new(): doc.insert(ignore_permissions=True)
+    else: doc.save(ignore_permissions=True)
+    if db_password:
+        _set_source_password(doc, db_password)
+    frappe.db.commit()
+    return {"success": True, "message": "تم حفظ مصدر البيانات", "name": doc.name}
+
+
+@frappe.whitelist(allow_guest=False)
+def test_source(source_name, test_phone="01000000000"):
+    if not _sys_only(): return _deny()
+    source = frappe.get_doc("Customer Lookup Source", source_name)
+    if source.source_type == "HTTP Bridge":
+        return run_http_source(source.name, test_phone, no_cache=1)
+    if source.source_type == "MySQL/MariaDB":
+        try:
+            con = _mysql_connect(source)
+            with con.cursor() as cur:
+                cur.execute("select 1 as ok")
+                row = cur.fetchone()
+            con.close()
+            return {"success": True, "message": "DB connection OK", "result": row}
+        except Exception as e:
+            return {"success": False, "message": str(e)}
+    return {"success": False, "message": "هذا النوع لسه غير مفعل في Phase A"}
+
+
+@frappe.whitelist(allow_guest=False)
+def list_tables(source_name):
+    if not _sys_only(): return _deny()
+    source = frappe.get_doc("Customer Lookup Source", source_name)
+    if source.source_type != "MySQL/MariaDB":
+        return {"success": False, "message": "List tables متاح حالياً لـ MySQL/MariaDB فقط"}
+    try:
+        con = _mysql_connect(source)
+        with con.cursor() as cur:
+            cur.execute("select table_name from information_schema.tables where table_schema=%s order by table_name", (source.db_name,))
+            rows = cur.fetchall()
+        con.close()
+        return {"success": True, "tables": [r["table_name"] for r in rows]}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
+@frappe.whitelist(allow_guest=False)
+def list_columns(source_name, table_name):
+    if not _sys_only(): return _deny()
+    if not re.match(r"^[A-Za-z0-9_]+$", table_name or ""):
+        return {"success": False, "message": "Invalid table name"}
+    source = frappe.get_doc("Customer Lookup Source", source_name)
+    try:
+        con = _mysql_connect(source)
+        with con.cursor() as cur:
+            cur.execute("select column_name, data_type from information_schema.columns where table_schema=%s and table_name=%s order by ordinal_position", (source.db_name, table_name))
+            rows = cur.fetchall()
+        con.close()
+        return {"success": True, "columns": rows}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
+@frappe.whitelist(allow_guest=False)
+def sample_rows(source_name, table_name, limit=5):
+    if not _sys_only(): return _deny()
+    if not re.match(r"^[A-Za-z0-9_]+$", table_name or ""):
+        return {"success": False, "message": "Invalid table name"}
+    limit = max(1, min(int(limit or 5), 20))
+    source = frappe.get_doc("Customer Lookup Source", source_name)
+    try:
+        con = _mysql_connect(source)
+        with con.cursor() as cur:
+            cur.execute(f"select * from `{table_name}` limit {limit}")
+            rows = cur.fetchall()
+        con.close()
+        return {"success": True, "rows": rows}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
+@frappe.whitelist(allow_guest=False)
+def list_queries():
+    if not _sys_only(): return _deny()
+    rows = frappe.get_all("Customer Lookup Query", fields=["name", "query_name", "source", "active", "lookup_mode", "sql_query", "max_rows", "cache_ttl_minutes", "result_note"], order_by="modified desc", limit_page_length=200)
+    return {"success": True, "queries": rows}
+
+
+@frappe.whitelist(allow_guest=False)
+def save_query(name=None, query_name=None, source=None, active=1, lookup_mode="Use Source Default", sql_query="", max_rows=5, cache_ttl_minutes=0, result_note=""):
+    if not _sys_only(): return _deny()
+    if not source:
+        return {"success": False, "message": "Source مطلوب"}
+    doc = frappe.get_doc("Customer Lookup Query", name) if name and frappe.db.exists("Customer Lookup Query", name) else frappe.get_doc({"doctype":"Customer Lookup Query"})
+    doc.query_name = query_name or doc.query_name or "Customer Query"
+    doc.source = source
+    doc.active = int(active or 0)
+    doc.lookup_mode = lookup_mode or "Use Source Default"
+    doc.sql_query = sql_query or ""
+    doc.max_rows = int(max_rows or 5)
+    doc.cache_ttl_minutes = int(cache_ttl_minutes or 0)
+    doc.result_note = result_note or ""
+    if doc.sql_query:
+        ok, msg = _safe_sql(doc.sql_query)
+        if not ok:
+            return {"success": False, "message": msg}
+    if doc.is_new(): doc.insert(ignore_permissions=True)
+    else: doc.save(ignore_permissions=True)
+    frappe.db.commit()
+    return {"success": True, "message": "تم حفظ الكويري", "name": doc.name}
+
+
+def _cache_key(phone_norm, query_name):
+    return frappe.db.get_value("Customer Lookup Cache", {"phone_normalized": phone_norm, "query": query_name}, "name")
+
+
+def _get_cache(phone_norm, query_name):
+    name = _cache_key(phone_norm, query_name)
+    if not name: return None
+    doc = frappe.get_doc("Customer Lookup Cache", name)
+    try:
+        if doc.expires_at and doc.expires_at > now_datetime():
+            return doc
+    except Exception:
+        pass
+    return None
+
+
+def _save_cache(phone_norm, query_name, source_name, result, ttl):
+    name = _cache_key(phone_norm, query_name)
+    doc = frappe.get_doc("Customer Lookup Cache", name) if name else frappe.get_doc({"doctype":"Customer Lookup Cache"})
+    doc.phone_normalized = phone_norm
+    doc.query = query_name
+    doc.source = source_name
+    doc.status = "OK" if result.get("rows") else "Not Found"
+    doc.last_lookup_at = now_datetime()
+    doc.expires_at = add_to_date(now_datetime(), minutes=int(ttl or 5))
+    doc.result_json = json.dumps(result, ensure_ascii=False, default=str)[:50000]
+    doc.display_text = (result.get("display") or _rows_to_display(result.get("rows") or []))[:50000]
+    doc.error_message = ""
+    if doc.is_new(): doc.insert(ignore_permissions=True)
+    else: doc.save(ignore_permissions=True)
+    frappe.db.commit()
+    return doc
+
+
+@frappe.whitelist(allow_guest=False)
+def variables_for_phone(phone):
+    if not _sys_only(): return _deny()
+    return {"success": True, "variables": normalize_phone(phone)}
+
+
+@frappe.whitelist(allow_guest=False)
+def run_http_source(source_name, phone, no_cache=0):
+    if not _sys_only(): return _deny()
+    source = frappe.get_doc("Customer Lookup Source", source_name)
+    vars = normalize_phone(phone)
+    url = _render_template(source.http_url_template, vars)
+    try:
+        import requests
+        r = requests.get(url, timeout=10)
+        parsed = _parse_http_response(r.text, source.http_response_type)
+        return {"success": r.ok, "url": url, "status_code": r.status_code, "result": parsed, "preview": parsed.get("display")}
+    except Exception as e:
+        return {"success": False, "url": url, "message": str(e)}
+
+
+@frappe.whitelist(allow_guest=False)
+def run_lookup(query_name, phone, force=0):
+    if not _sys_only(): return _deny()
+    query = frappe.get_doc("Customer Lookup Query", query_name)
+    source = frappe.get_doc("Customer Lookup Source", query.source)
+    vars = normalize_phone(phone)
+    phone_norm = vars.get("phone_20") or vars.get("phone_digits")
+    ttl = int(query.cache_ttl_minutes or source.cache_ttl_minutes or 5)
+    if not int(force or 0):
+        cached = _get_cache(phone_norm, query.name)
+        if cached:
+            return {"success": True, "cached": True, "phone": phone_norm, "result": json.loads(cached.result_json or "{}"), "display": cached.display_text, "expires_at": str(cached.expires_at)}
+    mode = query.lookup_mode
+    if mode == "Use Source Default":
+        mode = "HTTP URL" if source.source_type == "HTTP Bridge" else "SQL Query"
+    if mode == "HTTP URL":
+        res = run_http_source(source.name, phone, no_cache=1)
+        result = res.get("result") or {"rows": [], "display": res.get("message") or ""}
+        cache = _save_cache(phone_norm, query.name, source.name, result, ttl)
+        return {"success": res.get("success"), "cached": False, "phone": phone_norm, "result": result, "display": cache.display_text, "http": {"url": res.get("url"), "status_code": res.get("status_code")}}
+    # SQL Query
+    ok, msg = _safe_sql(query.sql_query)
+    if not ok:
+        return {"success": False, "message": msg}
+    max_rows = max(1, min(int(query.max_rows or 5), 50))
+    sql = query.sql_query.strip()
+    if not re.search(r"\blimit\b", sql, flags=re.I):
+        sql += f" limit {max_rows}"
+    try:
+        con = _mysql_connect(source)
+        with con.cursor() as cur:
+            cur.execute(sql, vars)
+            rows = cur.fetchall()
+        con.close()
+        result = {"rows": rows, "summary": rows[0] if rows else {}, "display": _rows_to_display(rows), "variables": vars}
+        cache = _save_cache(phone_norm, query.name, source.name, result, ttl)
+        return {"success": True, "cached": False, "phone": phone_norm, "result": result, "display": cache.display_text, "expires_at": str(cache.expires_at)}
+    except Exception as e:
+        return {"success": False, "message": str(e), "variables": vars}
+PY
+chmod 644 "$APP_DIR/api/customer_lookup_api.py"
+
+say "4) Write System-Manager-only page"
+cat > "$APP_DIR/www/customer-lookup-settings.py" <<'PY'
+import frappe
+no_cache = 1
+
+def get_context(context):
+    user = frappe.session.user
+    roles = frappe.get_roles(user)
+    if user != "Administrator" and "System Manager" not in roles:
+        frappe.throw("System Manager only", frappe.PermissionError)
+    return context
+PY
+
+cat > "$APP_DIR/www/customer-lookup-settings.html" <<'HTML'
+<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Customer Lookup Settings</title><style>*{box-sizing:border-box;font-family:'Segoe UI',Tahoma,Arial}body{margin:0;background:#eef2f7;color:#111827;direction:rtl}.top{background:#20262d;color:#fff;padding:14px 22px;display:flex;justify-content:space-between;border-bottom:4px solid #1F4E79}.top a{color:white;text-decoration:none;border:1px solid #64748b;border-radius:10px;padding:8px 12px;margin:2px}.wrap{padding:22px;max-width:1600px;margin:auto}.panel{background:#fff;border:1px solid #d8dee9;border-radius:16px;box-shadow:0 10px 28px #0001;margin-bottom:16px;overflow:hidden}.head{padding:14px 16px;border-bottom:1px solid #e5e7eb;display:flex;justify-content:space-between;gap:10px;align-items:center}.body{padding:16px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}.field label{display:block;font-weight:800;color:#475569;font-size:13px;margin-bottom:6px}input,select,textarea{width:100%;border:1px solid #d1d5db;border-radius:11px;padding:10px}.btn{border:0;border-radius:11px;padding:10px 14px;background:#1F4E79;color:white;font-weight:800;cursor:pointer;margin:3px}.btn.green{background:#16a34a}.btn.orange{background:#f97316}.btn.light{background:white;color:#111827;border:1px solid #d1d5db}.table{width:100%;border-collapse:collapse}.table th{background:#111827;color:#fff;padding:10px}.table td{border:1px solid #e5e7eb;padding:9px;text-align:center}.muted{color:#64748b;font-size:12px}.note{background:#fff7ed;border:1px solid #fed7aa;border-right:5px solid #f97316;border-radius:14px;padding:12px;line-height:1.7}pre{background:#0f172a;color:#dcfce7;border-radius:12px;padding:12px;white-space:pre-wrap;max-height:360px;overflow:auto;direction:ltr;text-align:left}.ltr{direction:ltr;text-align:left}@media(max-width:950px){.grid,.grid2{grid-template-columns:1fr}.top{display:block}}</style></head><body><div class="top"><b>🔐 Customer Lookup Settings — System Manager Only</b><div><a href="/social-inbox">Social Inbox</a><a href="/admin-desk">Admin Desk</a></div></div><div class="wrap"><div class="note"><b>المرحلة A:</b> الصفحة دي للـ System Manager فقط. هنا نضيف مصدر بيانات HTTP/PHP Bridge أو MySQL، نكتشف الجداول، ونجرّب Query برقم عميل. الربط التلقائي بالشات هيكون المرحلة B بعد ما نثبت الكويري.</div><br><div class="grid2"><div class="panel"><div class="head"><b>Data Sources</b><button class="btn green" onclick="clearSource()">+ مصدر جديد</button></div><div class="body"><table class="table"><thead><tr><th>الاسم</th><th>النوع</th><th>Active</th><th>TTL</th><th>إجراء</th></tr></thead><tbody id="sourcesTb"></tbody></table></div></div><div class="panel"><div class="head"><b>إضافة/تعديل مصدر</b></div><div class="body"><input type="hidden" id="src_name"><div class="grid"><div class="field"><label>Source Name</label><input id="source_name" value="Orders HTTP Bridge"></div><div class="field"><label>Source Type</label><select id="source_type" onchange="sourceTypeChanged()"><option>HTTP Bridge</option><option>MySQL/MariaDB</option><option>PostgreSQL (later)</option><option>SQL Server (later)</option></select></div><div class="field"><label>Cache TTL Minutes</label><input id="cache_ttl" value="5"></div><div class="field"><label>HTTP URL Template</label><textarea id="http_url" rows="2" class="ltr">http://10.11.1.19/caller.php?phone={phone_local}</textarea></div><div class="field"><label>HTTP Response Type</label><select id="http_response_type"><option>JSON</option><option>HTML</option><option>Text</option></select></div><div class="field"><label>DB Host</label><input id="db_host" placeholder="10.11.1.xx"></div><div class="field"><label>DB Port</label><input id="db_port" value="3306"></div><div class="field"><label>DB Name</label><input id="db_name"></div><div class="field"><label>DB User</label><input id="db_user"></div><div class="field"><label>DB Password</label><input id="db_password" type="password" placeholder="اتركه فارغ لو مش هتغيره"></div><div class="field"><label>Notes</label><textarea id="notes" rows="2"></textarea></div></div><button class="btn green" onclick="saveSource()">حفظ المصدر</button><button class="btn orange" onclick="testSource()">Test Source</button><button class="btn light" onclick="tables()">List Tables</button><pre id="sourceOut"></pre></div></div></div><div class="grid2"><div class="panel"><div class="head"><b>Queries</b><button class="btn green" onclick="clearQuery()">+ Query جديد</button></div><div class="body"><table class="table"><thead><tr><th>الاسم</th><th>Source</th><th>Mode</th><th>Max Rows</th><th>إجراء</th></tr></thead><tbody id="queriesTb"></tbody></table></div></div><div class="panel"><div class="head"><b>إضافة/تعديل Query</b></div><div class="body"><input type="hidden" id="qry_name"><div class="grid"><div class="field"><label>Query Name</label><input id="query_name" value="آخر بيانات العميل"></div><div class="field"><label>Source</label><select id="query_source"></select></div><div class="field"><label>Lookup Mode</label><select id="lookup_mode"><option>Use Source Default</option><option>HTTP URL</option><option>SQL Query</option></select></div><div class="field"><label>Max Rows</label><input id="max_rows" value="5"></div><div class="field"><label>Cache TTL Override</label><input id="query_ttl" value="0"></div></div><div class="field"><label>SQL Query</label><textarea id="sql_query" rows="8" class="ltr" placeholder="SELECT customer_name AS `اسم العميل`, order_no AS `رقم آخر أوردر` FROM orders WHERE phone LIKE %(phone_like)s ORDER BY order_date DESC LIMIT 5"></textarea></div><button class="btn green" onclick="saveQuery()">حفظ Query</button><button class="btn orange" onclick="runLookup(false)">Test Lookup</button><button class="btn light" onclick="runLookup(true)">Force Refresh</button><pre id="queryOut"></pre></div></div></div><div class="panel"><div class="head"><b>Discovery / Variables</b></div><div class="body"><div class="grid"><div class="field"><label>Test Phone</label><input id="test_phone" value="01028567017"></div><div class="field"><label>Table Name</label><input id="table_name" placeholder="orders"></div><div class="field"><label>Limit</label><input id="sample_limit" value="5"></div></div><button class="btn light" onclick="varsPhone()">Show Phone Variables</button><button class="btn light" onclick="columns()">List Columns</button><button class="btn light" onclick="sample()">Sample Rows</button><pre id="discOut"></pre></div></div></div><script>function M(a){return a.join('')}async function api(method,args){let qs=new URLSearchParams();args=args||{};Object.keys(args).forEach(k=>{if(args[k]!==undefined&&args[k]!==null)qs.append(k,args[k])});let r=await fetch('/api/method/'+method+(qs.toString()?'?'+qs.toString():''),{credentials:'same-origin',cache:'no-store'});let j=await r.json();return j.message}function esc(x){return String(x||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}let sources=[],queries=[];function show(el,o){el.textContent=JSON.stringify(o,null,2)}async function load(){let s=await api(M(['restaurant','_ops.api.customer_lookup','_api.list_sources']));sources=(s&&s.sources)||[];sourcesTb.innerHTML=sources.map(x=>'<tr><td>'+esc(x.source_name)+'</td><td>'+esc(x.source_type)+'</td><td>'+esc(x.active)+'</td><td>'+esc(x.cache_ttl_minutes)+'</td><td><button class="btn light" onclick="editSource(\''+x.name+'\')">تعديل</button></td></tr>').join('')||'<tr><td colspan="5">لا توجد مصادر</td></tr>';query_source.innerHTML=sources.map(x=>'<option value="'+esc(x.name)+'">'+esc(x.source_name)+'</option>').join('');let q=await api(M(['restaurant','_ops.api.customer_lookup','_api.list_queries']));queries=(q&&q.queries)||[];queriesTb.innerHTML=queries.map(x=>'<tr><td>'+esc(x.query_name)+'</td><td>'+esc(x.source)+'</td><td>'+esc(x.lookup_mode)+'</td><td>'+esc(x.max_rows)+'</td><td><button class="btn light" onclick="editQuery(\''+x.name+'\')">تعديل</button></td></tr>').join('')||'<tr><td colspan="5">لا توجد Queries</td></tr>'}function clearSource(){src_name.value='';source_name.value='Orders HTTP Bridge';source_type.value='HTTP Bridge';cache_ttl.value='5';http_url.value='http://10.11.1.19/caller.php?phone={phone_local}';http_response_type.value='JSON';db_host.value='';db_port.value='3306';db_name.value='';db_user.value='';db_password.value='';notes.value=''}function editSource(n){let x=sources.find(a=>a.name===n);if(!x)return;src_name.value=x.name;source_name.value=x.source_name;source_type.value=x.source_type;cache_ttl.value=x.cache_ttl_minutes||5;http_url.value=x.http_url_template||'';http_response_type.value=x.http_response_type||'JSON';db_host.value=x.db_host||'';db_port.value=x.db_port||3306;db_name.value=x.db_name||'';db_user.value=x.db_user||'';db_password.value='';notes.value=x.notes||''}async function saveSource(){let d=await api(M(['restaurant','_ops.api.customer_lookup','_api.save_source']),{name:src_name.value,source_name:source_name.value,source_type:source_type.value,active:1,cache_ttl_minutes:cache_ttl.value,http_url_template:http_url.value,http_response_type:http_response_type.value,db_host:db_host.value,db_port:db_port.value,db_name:db_name.value,db_user:db_user.value,db_password:db_password.value,notes:notes.value});show(sourceOut,d);await load()}async function testSource(){let d=await api(M(['restaurant','_ops.api.customer_lookup','_api.test_source']),{source_name:src_name.value||query_source.value,test_phone:test_phone.value});show(sourceOut,d)}async function tables(){let d=await api(M(['restaurant','_ops.api.customer_lookup','_api.list_tables']),{source_name:src_name.value||query_source.value});show(sourceOut,d)}function clearQuery(){qry_name.value='';query_name.value='آخر بيانات العميل';lookup_mode.value='Use Source Default';max_rows.value='5';query_ttl.value='0';sql_query.value=''}function editQuery(n){let x=queries.find(a=>a.name===n);if(!x)return;qry_name.value=x.name;query_name.value=x.query_name;query_source.value=x.source;lookup_mode.value=x.lookup_mode;max_rows.value=x.max_rows||5;query_ttl.value=x.cache_ttl_minutes||0;sql_query.value=x.sql_query||''}async function saveQuery(){let d=await api(M(['restaurant','_ops.api.customer_lookup','_api.save_query']),{name:qry_name.value,query_name:query_name.value,source:query_source.value,active:1,lookup_mode:lookup_mode.value,sql_query:sql_query.value,max_rows:max_rows.value,cache_ttl_minutes:query_ttl.value});show(queryOut,d);await load()}async function runLookup(force){let d=await api(M(['restaurant','_ops.api.customer_lookup','_api.run_lookup']),{query_name:qry_name.value,phone:test_phone.value,force:force?1:0});show(queryOut,d)}async function varsPhone(){let d=await api(M(['restaurant','_ops.api.customer_lookup','_api.variables_for_phone']),{phone:test_phone.value});show(discOut,d)}async function columns(){let d=await api(M(['restaurant','_ops.api.customer_lookup','_api.list_columns']),{source_name:src_name.value||query_source.value,table_name:table_name.value});show(discOut,d)}async function sample(){let d=await api(M(['restaurant','_ops.api.customer_lookup','_api.sample_rows']),{source_name:src_name.value||query_source.value,table_name:table_name.value,limit:sample_limit.value});show(discOut,d)}function sourceTypeChanged(){}load();</script></body></html>
+HTML
+
+say "5) Patch admin-desk safe link to Customer Lookup for System Manager"
+python3 - <<'PY'
+from pathlib import Path
+import re
+p=Path('/opt/frappe_crm/apps/restaurant_ops/restaurant_ops/www/admin-desk.html')
+if p.exists():
+    s=p.read_text(errors='ignore')
+    s=re.sub(r'<!-- ROSHDY_CUSTOMER_LOOKUP_LINK_START -->[\s\S]*?<!-- ROSHDY_CUSTOMER_LOOKUP_LINK_END -->','',s)
+    block='''\n<!-- ROSHDY_CUSTOMER_LOOKUP_LINK_START -->\n<a href="/customer-lookup-settings" style="position:fixed;left:18px;top:180px;z-index:99999;background:#7c3aed;color:#fff;text-decoration:none;border-radius:14px;padding:10px 13px;box-shadow:0 8px 24px rgba(0,0,0,.14);font-weight:800;font-family:Tahoma,Arial">🔐 Customer Lookup</a>\n<!-- ROSHDY_CUSTOMER_LOOKUP_LINK_END -->\n'''
+    if '<body' in s.lower():
+        s=re.sub(r'(<body[^>]*>)', r'\1\n'+block, s, count=1, flags=re.I)
+    else:
+        s=block+s
+    s=s.replace('{#','{ #')
+    p.write_text(s)
+    print('✅ admin link patched')
+PY
+
+say "6) Migrate/Clear/Restart"
+docker exec "$BACKEND" bash -lc "find /home/frappe/frappe-bench/apps/restaurant_ops -name '*.pyc' -delete; find /home/frappe/frappe-bench/apps/restaurant_ops -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.scripts.customer_lookup_setup.run
+docker exec "$BACKEND" bench --site "$SITE" migrate
+docker exec "$BACKEND" bench --site "$SITE" clear-cache || true
+docker exec "$BACKEND" bench --site "$SITE" clear-website-cache || true
+docker compose restart backend frontend websocket queue-short queue-long scheduler
+sleep 10
+BACKEND="$(docker compose ps -q backend)"
+
+say "7) Validation"
+echo "--- Page HTTP status ---"
+for page in customer-lookup-settings admin-desk social-inbox social-settings; do
+  code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$page" || true)"
+  echo "$page => $code"
+done
+
+echo "--- Customer Lookup API variables test ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.customer_lookup_api.variables_for_phone --kwargs '{"phone":"+201028567017"}' || true
+
+say "8) Health Check مهم: Elastix/CDR/AMI + Queue + Call Report"
+echo "--- Asterisk/Elastix diagnostics ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics || true
+
+echo "--- Queue status ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.queue_api.get_queue_status || true
+
+echo "--- Calls report admin sample ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' || true
+
+say "✅ Customer Lookup Phase A Done يا زعيم"
+echo "افتح كـ Administrator/System Manager فقط: http://$(hostname -I | awk '{print $1}')/customer-lookup-settings"
+echo "لو عندك PHP القديم، ابدأ بمصدر HTTP Bridge URL template: http://10.11.1.19/caller.php?phone={phone_local}"
+echo "الأفضل لاحقاً نخلي PHP يرجع JSON. لو بيرجع HTML هنقدر نعرض Text preview بس."
+echo "Backup: $BACKUP_DIR"

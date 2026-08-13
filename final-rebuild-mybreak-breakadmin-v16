@@ -1,0 +1,764 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Roshdy V16 FINAL rebuild for break flow.
+# Fixes the last break issue:
+# - /my-break is rebuilt cleanly with server-state polling.
+# - When admin closes break, timer stops immediately, full-screen alert appears, employee acknowledges, page reloads.
+# - /break-admin rebuilt with active-break panel and report table showing who closed the break and whether it was admin/employee.
+# - /agent-desk break alert blocks are cleaned and replaced with a safe no-Jinja overlay.
+# - break_api final endpoints are appended: get_break_page_data, start_break, end_break, admin_end_break,
+#   get_my_break_admin_alert, acknowledge_admin_closed_break, get_active_breaks, get_break_report_detailed.
+# Safety:
+# - Backup first.
+# - Does NOT edit report_api.py.
+# - Does NOT touch Elastix/CDR/AMI config.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "❌ docker compose/docker-compose مش موجود"
+  exit 1
+fi
+
+APP_DIR="$ROOT/apps/$APP"
+PKG_DIR="$APP_DIR/$APP"
+WWW_DIR="$PKG_DIR/www"
+API_DIR="$PKG_DIR/api"
+SCRIPTS_DIR="$PKG_DIR/scripts"
+BREAK_API="$API_DIR/break_api.py"
+MY_BREAK_HTML="$WWW_DIR/my-break.html"
+BREAK_ADMIN_HTML="$WWW_DIR/break-admin.html"
+AGENT_HTML="$WWW_DIR/agent-desk.html"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/FINAL_V16_REBUILD_MYBREAK_BREAKADMIN_BEFORE_$TS"
+mkdir -p "$BACKUP_DIR" "$SCRIPTS_DIR"
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend container مش شغال أو مش لاقيه"
+  exit 1
+fi
+
+bench_exec() {
+  "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"
+}
+
+echo "============================================================"
+echo "🚀 Roshdy FINAL V16: rebuild my-break + break-admin"
+echo "📦 Backup: $BACKUP_DIR"
+echo "============================================================"
+
+echo "🧯 Step 1: Backup files + bench backup"
+for f in "$BREAK_API" "$MY_BREAK_HTML" "$BREAK_ADMIN_HTML" "$AGENT_HTML"; do
+  [[ -f "$f" ]] && cp -a "$f" "$BACKUP_DIR/$(basename "$f").before"
+done
+bench_exec backup --with-files | tee "$BACKUP_DIR/bench_backup_output.txt"
+
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+
+echo "🧱 Step 2: Ensure Employee Break Log custom fields"
+cat > "$SCRIPTS_DIR/setup_break_fields_v16.py" <<'PY'
+import frappe
+from frappe.custom.doctype.custom_field.custom_field import create_custom_field
+
+def execute():
+    dt = "Employee Break Log"
+    if not frappe.db.exists("DocType", dt):
+        return {"success": False, "error": "Employee Break Log not found"}
+    meta = frappe.get_meta(dt)
+    fields = {
+        "admin_close_target_user": {"label": "Admin Close Target User", "fieldtype": "Data", "insert_after": "closure_type"},
+        "admin_close_acknowledged": {"label": "Admin Close Acknowledged", "fieldtype": "Check", "default": "0", "insert_after": "admin_close_target_user"},
+        "admin_close_acknowledged_at": {"label": "Admin Close Acknowledged At", "fieldtype": "Datetime", "insert_after": "admin_close_acknowledged"},
+        "admin_close_message": {"label": "Admin Close Message", "fieldtype": "Small Text", "insert_after": "admin_close_acknowledged_at"},
+    }
+    made=[]
+    for fn, df in fields.items():
+        if not meta.has_field(fn) and not frappe.db.exists("Custom Field", {"dt": dt, "fieldname": fn}):
+            data=dict(df); data["fieldname"]=fn
+            create_custom_field(dt, data, ignore_validate=True)
+            made.append(fn)
+    frappe.db.commit(); frappe.clear_cache(doctype=dt)
+    return {"success": True, "created": made}
+PY
+[[ -n "$APP_OWNER" ]] && chown "$APP_OWNER" "$SCRIPTS_DIR/setup_break_fields_v16.py" 2>/dev/null || true
+bench_exec execute restaurant_ops.scripts.setup_break_fields_v16.execute | tee "$BACKUP_DIR/setup_break_fields_v16.txt"
+
+echo "🧩 Step 3: Patch break_api final endpoints"
+export BREAK_API
+python3 - <<'PY'
+# -*- coding: utf-8 -*-
+from pathlib import Path
+import os
+
+p = Path(os.environ["BREAK_API"])
+s = p.read_text(encoding="utf-8", errors="ignore") if p.exists() else "# -*- coding: utf-8 -*-\n"
+start = "# BEGIN ROSHDY BREAK FINAL V16"
+end = "# END ROSHDY BREAK FINAL V16"
+patch = r'''
+# BEGIN ROSHDY BREAK FINAL V16
+try:
+    import frappe
+    from frappe.utils import now_datetime, get_datetime, getdate, today, cstr, flt, cint
+except Exception:
+    frappe = None
+
+BREAK_LOG_DT = "Employee Break Log"
+
+
+def _v16_meta_has(dt, fn):
+    try:
+        return frappe.get_meta(dt).has_field(fn)
+    except Exception:
+        return False
+
+
+def _v16_admin_allowed():
+    try:
+        if frappe.session.user == "Administrator":
+            return True
+        roles = set(frappe.get_roles(frappe.session.user))
+        return bool(roles.intersection({"System Manager", "Call Center Admin", "Restaurant Manager", "Break Admin"}))
+    except Exception:
+        return False
+
+
+def _v16_user_employees(user=None):
+    user = user or frappe.session.user
+    try:
+        if frappe.db.exists("DocType", "Employee"):
+            return frappe.get_all("Employee", filters={"user_id": user}, pluck="name", limit_page_length=50) or []
+    except Exception:
+        pass
+    return []
+
+
+def _v16_employee_name(emp):
+    if not emp:
+        return "غير محدد"
+    try:
+        return frappe.db.get_value("Employee", emp, "employee_name") or emp
+    except Exception:
+        return emp
+
+
+def _v16_employee_user(emp):
+    if not emp:
+        return None
+    try:
+        return frappe.db.get_value("Employee", emp, "user_id")
+    except Exception:
+        return None
+
+
+def _v16_user_extensions(user=None):
+    user = user or frappe.session.user
+    out = []
+    try:
+        if frappe.db.exists("DocType", "Extension Session"):
+            rows = frappe.get_all("Extension Session", filters={"user": user, "session_status": "active"}, fields=["extension"], limit_page_length=20)
+            out += [cstr(r.get("extension")) for r in rows if r.get("extension")]
+    except Exception:
+        pass
+    try:
+        emps = _v16_user_employees(user)
+        if emps and frappe.db.exists("DocType", "Employee"):
+            meta = frappe.get_meta("Employee")
+            for df in meta.fields:
+                fn = cstr(df.fieldname).lower()
+                if any(x in fn for x in ("extension", "ext", "sip")):
+                    for emp in emps:
+                        v = frappe.db.get_value("Employee", emp, df.fieldname)
+                        if v:
+                            out.append(cstr(v))
+    except Exception:
+        pass
+    ded=[]
+    for x in out:
+        if x and x not in ded:
+            ded.append(x)
+    return ded
+
+
+def _v16_current_employee():
+    user = frappe.session.user
+    emps = _v16_user_employees(user)
+    if emps:
+        return emps[0]
+    return None
+
+
+def _v16_current_extension():
+    exts = _v16_user_extensions(frappe.session.user)
+    return exts[0] if exts else ""
+
+
+def _v16_break_limit_minutes(break_type=None):
+    default = 30.0
+    try:
+        conf = getattr(frappe.local, "conf", {}) or {}
+        if conf.get("break_overdue_minutes"):
+            return flt(conf.get("break_overdue_minutes")) or default
+    except Exception:
+        pass
+    if break_type:
+        try:
+            if frappe.db.exists("DocType", "Break Type") and frappe.db.exists("Break Type", break_type):
+                doc = frappe.get_doc("Break Type", break_type)
+                for fn in ("max_duration_minutes", "allowed_minutes", "duration_minutes", "break_minutes", "max_minutes", "time_limit_minutes", "duration", "minutes", "limit_minutes"):
+                    if hasattr(doc, fn) and flt(getattr(doc, fn) or 0) > 0:
+                        return flt(getattr(doc, fn))
+        except Exception:
+            pass
+    return default
+
+
+def _v16_duration_minutes(start_time, end_time=None):
+    if not start_time:
+        return 0.0
+    try:
+        st = get_datetime(start_time)
+        en = get_datetime(end_time) if end_time else now_datetime()
+        return round(max((en - st).total_seconds(), 0) / 60.0, 1)
+    except Exception:
+        return 0.0
+
+
+def _v16_duration_seconds(start_time, end_time=None):
+    if not start_time:
+        return 0
+    try:
+        st = get_datetime(start_time)
+        en = get_datetime(end_time) if end_time else now_datetime()
+        return int(max((en - st).total_seconds(), 0))
+    except Exception:
+        return 0
+
+
+def _v16_active_where_for_user(user=None):
+    user = user or frappe.session.user
+    clauses = ["owner=%s"]
+    params = [user]
+    emps = _v16_user_employees(user)
+    exts = _v16_user_extensions(user)
+    if emps:
+        clauses.append("employee in (" + ",".join(["%s"] * len(emps)) + ")")
+        params.extend(emps)
+    if exts and _v16_meta_has(BREAK_LOG_DT, "extension_at_start"):
+        clauses.append("extension_at_start in (" + ",".join(["%s"] * len(exts)) + ")")
+        params.extend(exts)
+    return clauses, params
+
+
+def _v16_active_condition():
+    return """
+    ifnull(docstatus,0)<2
+    and (
+        lower(ifnull(status,'')) in ('active','نشط')
+        or (
+            (end_time is null or end_time='')
+            and lower(ifnull(status,'')) not in ('finished','closed','ended','cancelled','canceled','completed','منتهي','مغلق','ملغي')
+        )
+    )
+    """
+
+
+def _v16_get_user_active_break(user=None):
+    user = user or frappe.session.user
+    clauses, params = _v16_active_where_for_user(user)
+    sql = f"""
+        select name, employee, break_type, start_time, end_time, status, owner, extension_at_start,
+               duration_minutes, duration_seconds
+        from `tabEmployee Break Log`
+        where {_v16_active_condition()}
+          and ({' or '.join(clauses)})
+        order by coalesce(start_time, creation) desc
+        limit 1
+    """
+    rows = frappe.db.sql(sql, params, as_dict=True)
+    return rows[0] if rows else None
+
+
+def _v16_target_user_for_break(doc):
+    u = _v16_employee_user(doc.get("employee"))
+    if u:
+        return u
+    ext = cstr(doc.get("extension_at_start") or "").strip()
+    if ext:
+        try:
+            u = frappe.db.get_value("Extension Session", {"extension": ext, "session_status": "active"}, "user")
+            if u:
+                return u
+        except Exception:
+            pass
+    owner = doc.get("owner")
+    if owner and owner not in ("Administrator", "Guest"):
+        return owner
+    return None
+
+
+def _v16_close_break(name, closed_by, closure_type, target_user=None, note=None):
+    doc = frappe.get_doc(BREAK_LOG_DT, name)
+    now = now_datetime()
+    dur_seconds = _v16_duration_seconds(doc.get("start_time"), now)
+    dur_minutes = round(dur_seconds / 60.0, 2)
+    old_notes = cstr(doc.get("notes") or "")
+    who_label = frappe.db.get_value("User", closed_by, "full_name") or closed_by
+    if closure_type == "admin":
+        append = f"\n[Admin Close] تم إنهاء البريك بواسطة {who_label} في {now.strftime('%Y-%m-%d %H:%M:%S')}"
+    else:
+        append = f"\n[Employee Close] تم إنهاء البريك بواسطة الموظف {who_label} في {now.strftime('%Y-%m-%d %H:%M:%S')}"
+    if note:
+        append += f" - ملاحظة: {note}"
+    updates = {
+        "status": "finished",
+        "end_time": now,
+        "duration_seconds": dur_seconds,
+        "duration_minutes": dur_minutes,
+        "closed_by": closed_by,
+        "closure_type": closure_type,
+        "notes": (old_notes + append).strip(),
+    }
+    if closure_type == "admin":
+        if _v16_meta_has(BREAK_LOG_DT, "admin_close_target_user"):
+            updates["admin_close_target_user"] = target_user or ""
+        if _v16_meta_has(BREAK_LOG_DT, "admin_close_acknowledged"):
+            updates["admin_close_acknowledged"] = 0
+        if _v16_meta_has(BREAK_LOG_DT, "admin_close_acknowledged_at"):
+            updates["admin_close_acknowledged_at"] = None
+        if _v16_meta_has(BREAK_LOG_DT, "admin_close_message"):
+            updates["admin_close_message"] = f"تم إنهاء البريك بواسطة {who_label}"
+    else:
+        if _v16_meta_has(BREAK_LOG_DT, "admin_close_acknowledged"):
+            updates["admin_close_acknowledged"] = 1
+    frappe.db.set_value(BREAK_LOG_DT, name, updates, update_modified=True)
+    frappe.db.commit()
+    return {"duration_seconds": dur_seconds, "duration_minutes": dur_minutes, "closed_by_label": who_label}
+
+
+@frappe.whitelist()
+def get_break_page_data():
+    user = frappe.session.user
+    if not user or user == "Guest":
+        return {"success": False, "message": "يجب تسجيل الدخول"}
+    emp = _v16_current_employee()
+    ext = _v16_current_extension()
+    active = _v16_get_user_active_break(user)
+    active_payload = None
+    if active:
+        elapsed = _v16_duration_seconds(active.get("start_time"))
+        active_payload = {
+            "name": active.get("name"),
+            "employee": active.get("employee"),
+            "break_type": active.get("break_type"),
+            "start_time": cstr(active.get("start_time") or ""),
+            "elapsed_seconds": elapsed,
+            "duration_minutes": round(elapsed / 60.0, 1),
+            "extension_at_start": active.get("extension_at_start") or "",
+        }
+    types = []
+    try:
+        if frappe.db.exists("DocType", "Break Type"):
+            names = frappe.get_all("Break Type", fields=["name"], order_by="name", limit_page_length=100)
+            for n in names:
+                nm = n.name
+                label = nm
+                mins = _v16_break_limit_minutes(nm)
+                try:
+                    doc = frappe.get_doc("Break Type", nm)
+                    label = getattr(doc, "break_type", None) or getattr(doc, "title", None) or nm
+                except Exception:
+                    pass
+                types.append({"name": nm, "break_type": label, "max_duration_minutes": mins})
+    except Exception:
+        pass
+    if not types:
+        types = [{"name": "Personal", "break_type": "Personal", "max_duration_minutes": _v16_break_limit_minutes("Personal")}]
+    return {
+        "success": True,
+        "user": user,
+        "employee": emp,
+        "employee_name": _v16_employee_name(emp) if emp else (frappe.db.get_value("User", user, "full_name") or user),
+        "extension": ext,
+        "active_break": active_payload,
+        "break_types": types,
+        "policy": {"limit_minutes": 0, "over_limit": False, "has_unused_approval": True, "total_formatted": ""},
+        "server_now": now_datetime().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+@frappe.whitelist()
+def start_break(break_type=None):
+    user = frappe.session.user
+    if not user or user == "Guest":
+        frappe.throw("يجب تسجيل الدخول")
+    if _v16_get_user_active_break(user):
+        return {"success": False, "message": "لديك بريك نشط بالفعل"}
+    emp = _v16_current_employee()
+    if not emp:
+        frappe.throw("لا يوجد Employee مربوط بهذا المستخدم")
+    ext = _v16_current_extension()
+    bt = break_type or "Personal"
+    now = now_datetime()
+    doc = frappe.get_doc({
+        "doctype": BREAK_LOG_DT,
+        "employee": emp,
+        "break_type": bt,
+        "break_date": getdate(now),
+        "status": "active",
+        "start_time": now,
+        "extension_at_start": ext,
+        "extension_was_online": 1 if ext else 0,
+    })
+    doc.insert(ignore_permissions=True)
+    frappe.db.commit()
+    return {"success": True, "message": "تم بدء البريك", "break_log": doc.name}
+
+
+@frappe.whitelist()
+def end_break():
+    user = frappe.session.user
+    if not user or user == "Guest":
+        frappe.throw("يجب تسجيل الدخول")
+    active = _v16_get_user_active_break(user)
+    if not active:
+        return {"success": False, "message": "لا يوجد بريك نشط لإنهائه"}
+    close = _v16_close_break(active.get("name"), user, "employee")
+    return {"success": True, "message": "تم إنهاء البريك بواسطة الموظف", "break_log": active.get("name"), "closure_type": "employee", **close}
+
+
+@frappe.whitelist()
+def admin_end_break(break_log=None, note=None):
+    if not _v16_admin_allowed():
+        frappe.throw("غير مسموح: إنهاء البريك من الإدارة فقط")
+    if not break_log:
+        frappe.throw("break_log مطلوب")
+    if not frappe.db.exists(BREAK_LOG_DT, break_log):
+        frappe.throw("سجل البريك غير موجود")
+    doc = frappe.get_doc(BREAK_LOG_DT, break_log)
+    target_user = _v16_target_user_for_break(doc)
+    close = _v16_close_break(break_log, frappe.session.user, "admin", target_user=target_user, note=note)
+    if target_user:
+        payload = {"break_log": break_log, "closed_by": close.get("closed_by_label"), "message": f"تم إنهاء البريك بواسطة {close.get('closed_by_label')}", "break_type": doc.get("break_type") or "", "end_time": now_datetime().strftime('%Y-%m-%d %H:%M:%S'), "duration_minutes": close.get("duration_minutes")}
+        try:
+            frappe.publish_realtime("roshdy_break_force_closed", payload, user=target_user, after_commit=True)
+        except Exception:
+            pass
+        try:
+            frappe.get_doc({"doctype": "Notification Log", "subject": "تم إنهاء البريك بواسطة الإدارة", "email_content": payload["message"], "for_user": target_user, "type": "Alert", "document_type": BREAK_LOG_DT, "document_name": break_log}).insert(ignore_permissions=True)
+        except Exception:
+            pass
+    return {"success": True, "message": "تم إنهاء البريك", "break_log": break_log, "closure_type": "admin", "target_user": target_user or "", **close}
+
+
+@frappe.whitelist()
+def get_my_break_admin_alert():
+    user = frappe.session.user
+    if not user or user == "Guest":
+        return {"success": True, "has_alert": False, "reason": "guest"}
+    clauses = []
+    params = []
+    if _v16_meta_has(BREAK_LOG_DT, "admin_close_target_user"):
+        clauses.append("admin_close_target_user=%s")
+        params.append(user)
+    clauses.append("owner=%s")
+    params.append(user)
+    emps = _v16_user_employees(user)
+    exts = _v16_user_extensions(user)
+    if emps:
+        clauses.append("employee in (" + ",".join(["%s"] * len(emps)) + ")")
+        params.extend(emps)
+    if exts and _v16_meta_has(BREAK_LOG_DT, "extension_at_start"):
+        clauses.append("extension_at_start in (" + ",".join(["%s"] * len(exts)) + ")")
+        params.extend(exts)
+    params.append(add_to_date(now_datetime(), hours=-96))
+    ack = "and ifnull(admin_close_acknowledged,0)=0" if _v16_meta_has(BREAK_LOG_DT, "admin_close_acknowledged") else ""
+    sql = f"""
+        select name, employee, break_type, start_time, end_time, duration_minutes,
+               closed_by, closure_type, modified, owner, extension_at_start
+        from `tabEmployee Break Log`
+        where ifnull(docstatus,0)<2
+          and ifnull(closure_type,'')='admin'
+          and ({' or '.join(clauses)})
+          and modified >= %s
+          {ack}
+        order by modified desc
+        limit 1
+    """
+    rows = frappe.db.sql(sql, params, as_dict=True)
+    if not rows:
+        return {"success": True, "has_alert": False, "user": user, "employees": emps, "extensions": exts}
+    r = rows[0]
+    closed_by = r.get("closed_by") or "الإدارة"
+    label = frappe.db.get_value("User", closed_by, "full_name") or closed_by
+    return {"success": True, "has_alert": True, "alert": {"break_log": r.get("name"), "employee": r.get("employee"), "break_type": r.get("break_type") or "", "start_time": cstr(r.get("start_time") or ""), "end_time": cstr(r.get("end_time") or ""), "duration_minutes": r.get("duration_minutes"), "closed_by": label, "message": f"تم إنهاء البريك بواسطة {label}"}}
+
+
+@frappe.whitelist()
+def acknowledge_admin_closed_break(break_log=None):
+    if not break_log:
+        frappe.throw("break_log مطلوب")
+    if not frappe.db.exists(BREAK_LOG_DT, break_log):
+        frappe.throw("سجل البريك غير موجود")
+    doc = frappe.get_doc(BREAK_LOG_DT, break_log)
+    user = frappe.session.user
+    allowed = doc.get("owner") == user or doc.get("employee") in _v16_user_employees(user) or (_v16_meta_has(BREAK_LOG_DT, "admin_close_target_user") and doc.get("admin_close_target_user") == user) or (doc.get("extension_at_start") and cstr(doc.get("extension_at_start")) in _v16_user_extensions(user)) or _v16_admin_allowed()
+    if not allowed:
+        frappe.throw("غير مسموح")
+    updates = {}
+    if _v16_meta_has(BREAK_LOG_DT, "admin_close_acknowledged"):
+        updates["admin_close_acknowledged"] = 1
+    if _v16_meta_has(BREAK_LOG_DT, "admin_close_acknowledged_at"):
+        updates["admin_close_acknowledged_at"] = now_datetime()
+    if updates:
+        frappe.db.set_value(BREAK_LOG_DT, break_log, updates, update_modified=True)
+        frappe.db.commit()
+    return {"success": True}
+
+
+@frappe.whitelist()
+def get_active_breaks():
+    if not _v16_admin_allowed():
+        frappe.throw("غير مسموح")
+    rows = frappe.db.sql(f"""
+        select name, employee, break_type, break_date, status, start_time, end_time,
+               duration_seconds, duration_minutes, extension_at_start, notes, creation, owner,
+               closed_by, closure_type
+        from `tabEmployee Break Log`
+        where {_v16_active_condition()}
+        order by coalesce(start_time, creation) asc
+        limit 500
+    """, as_dict=True)
+    now = now_datetime()
+    out = []
+    overdue_count = 0
+    for r in rows:
+        dur = _v16_duration_minutes(r.get("start_time"))
+        limit = _v16_break_limit_minutes(r.get("break_type"))
+        over = dur >= limit
+        if over:
+            overdue_count += 1
+        out.append({"name": r.name, "employee": r.employee, "employee_name": _v16_employee_name(r.employee), "break_type": r.break_type or "غير محدد", "start_time": cstr(r.start_time or ""), "duration_minutes": dur, "limit_minutes": limit, "overdue": over, "overdue_minutes": round(max(dur-limit,0),1), "extension": r.extension_at_start or "", "notes": r.notes or ""})
+    return {"success": True, "server_now": now.strftime("%Y-%m-%d %H:%M:%S"), "active_count": len(out), "overdue_count": overdue_count, "rows": out}
+
+
+@frappe.whitelist()
+def get_break_report_detailed(date_from=None, date_to=None, start_time="00:00", end_time="23:59", employee=None, status="All"):
+    if not _v16_admin_allowed():
+        frappe.throw("غير مسموح")
+    date_from = date_from or today()
+    date_to = date_to or date_from
+    start_time = start_time or "00:00"
+    end_time = end_time or "23:59"
+    where = ["ifnull(b.docstatus,0)<2", "coalesce(b.start_time,b.creation) between %s and %s"]
+    params = [f"{date_from} {start_time}:00" if len(start_time)<=5 else f"{date_from} {start_time}", f"{date_to} {end_time}:59" if len(end_time)<=5 else f"{date_to} {end_time}"]
+    if employee:
+        where.append("b.employee=%s"); params.append(employee)
+    if status and status not in ("All", "الكل"):
+        where.append("b.status=%s"); params.append(status)
+    sql = f"""
+        select b.name, b.employee, coalesce(e.employee_name,b.employee) employee_name,
+               b.break_type, b.status, b.start_time, b.end_time, b.duration_minutes,
+               b.duration_seconds, b.extension_at_start, b.closed_by, b.closure_type,
+               b.admin_close_acknowledged, b.admin_close_acknowledged_at, b.notes
+        from `tabEmployee Break Log` b
+        left join `tabEmployee` e on e.name=b.employee
+        where {' and '.join(where)}
+        order by coalesce(b.start_time,b.creation) desc
+        limit 2000
+    """
+    rows = frappe.db.sql(sql, params, as_dict=True)
+    out = []
+    total_minutes = 0
+    by = {}
+    for r in rows:
+        mins = flt(r.get("duration_minutes") or 0)
+        if not mins and r.get("start_time"):
+            mins = _v16_duration_minutes(r.get("start_time"), r.get("end_time"))
+        total_minutes += mins
+        emp_name = r.get("employee_name") or r.get("employee") or "غير محدد"
+        by.setdefault(emp_name, {"employee_name": emp_name, "count": 0, "minutes": 0})
+        by[emp_name]["count"] += 1
+        by[emp_name]["minutes"] += mins
+        closed_by = r.get("closed_by") or ""
+        closed_by_name = ""
+        if closed_by:
+            try:
+                closed_by_name = frappe.db.get_value("User", closed_by, "full_name") or closed_by
+            except Exception:
+                closed_by_name = closed_by
+        ctype = cstr(r.get("closure_type") or "")
+        if ctype == "admin":
+            ctype_label = "إغلاق إداري"
+        elif ctype == "employee":
+            ctype_label = "إغلاق الموظف"
+        elif cstr(r.get("status") or "").lower() in ("active", "نشط"):
+            ctype_label = "نشط"
+        else:
+            ctype_label = "غير محدد"
+        out.append({
+            "name": r.get("name"), "employee": r.get("employee"), "employee_name": emp_name,
+            "break_type": r.get("break_type") or "", "status": r.get("status") or "",
+            "start_time_text": cstr(r.get("start_time") or ""), "end_time_text": cstr(r.get("end_time") or ""),
+            "duration_minutes_calc": round(mins, 2), "extension_at_start": r.get("extension_at_start") or "",
+            "closed_by": closed_by, "closed_by_name": closed_by_name,
+            "closure_type": ctype, "closure_type_label": ctype_label,
+            "admin_close_acknowledged": r.get("admin_close_acknowledged"),
+        })
+    by_rows = list(by.values())
+    for x in by_rows:
+        x["minutes"] = round(x["minutes"], 2)
+    csv_lines = ["رقم,الموظف,النوع,الحالة,بداية,نهاية,الدقائق,التحويلة,نوع الإغلاق,أغلق بواسطة"]
+    for r in out:
+        csv_lines.append(",".join('"'+cstr(v).replace('"','""')+'"' for v in [r["name"], r["employee_name"], r["break_type"], r["status"], r["start_time_text"], r["end_time_text"], r["duration_minutes_calc"], r["extension_at_start"], r["closure_type_label"], r["closed_by_name"]]))
+    employees = []
+    try:
+        employees = frappe.get_all("Employee", filters={"status": "Active"} if _v16_meta_has("Employee","status") else {}, fields=["name", "employee_name"], order_by="employee_name", limit_page_length=1000)
+    except Exception:
+        pass
+    return {"success": True, "summary": {"total_breaks": len(out), "total_minutes": round(total_minutes,2)}, "rows": out, "by_employee": by_rows, "employees": employees, "csv": "\n".join(csv_lines)}
+
+
+@frappe.whitelist()
+def debug_my_break_alert_binding():
+    user = frappe.session.user
+    return {"success": True, "user": user, "employees": _v16_user_employees(user), "extensions": _v16_user_extensions(user), "active_break": _v16_get_user_active_break(user), "pending_alert": get_my_break_admin_alert()}
+# END ROSHDY BREAK FINAL V16
+'''
+if start in s and end in s:
+    i = s.index(start); j = s.index(end, i) + len(end); s = s[:i] + patch.strip() + s[j:]
+else:
+    s = s.rstrip() + "\n\n" + patch.strip() + "\n"
+compile(s, str(p), "exec")
+p.write_text(s, encoding="utf-8")
+PY
+
+echo "🏗️ Step 4: Rewrite /my-break cleanly"
+cat > "$MY_BREAK_HTML" <<'HTML'
+<!doctype html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>إدارة البريك</title><style>*{box-sizing:border-box;margin:0;padding:0;font-family:'Segoe UI',Tahoma,Arial}body{background:#111827;color:white;direction:rtl;min-height:100vh}.hdr{background:#24292e;padding:14px 25px;display:flex;justify-content:space-between;align-items:center;border-bottom:3px solid #ff5252}.hdr a{color:white;border:1px solid #888;border-radius:8px;padding:8px 14px;text-decoration:none;margin:0 4px}.box{min-height:calc(100vh - 64px);display:flex;align-items:center;justify-content:center;padding:30px}.panel{background:#1f2937;border:1px solid #374151;border-radius:24px;padding:38px;max-width:920px;width:100%;text-align:center;box-shadow:0 15px 45px #0004}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:18px;margin-top:18px}.b{background:#0f172a;color:white;border:2px solid #22c55e;border-radius:18px;padding:25px;cursor:pointer}.timer{font-size:76px;color:#ff5252;font-family:Consolas,monospace;margin:10px 0}.btn{border:0;border-radius:12px;padding:13px 28px;font-weight:bold;cursor:pointer;margin:8px}.end{background:white;color:#111827}.warn{background:#f59e0b;color:white}.muted{color:#9ca3af;font-size:14px}.closed-note{background:#fee2e2;color:#991b1b;border:2px solid #ef4444;border-radius:18px;padding:24px;font-size:22px;font-weight:900}#adminClosedOverlay{position:fixed;inset:0;background:#b30000;z-index:2147483000;display:none;align-items:center;justify-content:center;padding:18px;text-align:center;color:white}.ov-card{background:rgba(0,0,0,.28);border:2px solid rgba(255,255,255,.55);border-radius:24px;box-shadow:0 35px 90px rgba(0,0,0,.45);width:760px;max-width:96vw;padding:34px}.ov-ico{font-size:74px}.ov-title{font-size:48px;font-weight:900;margin:8px 0}.ov-msg{font-size:28px;margin-bottom:15px}.ov-admin{font-size:44px;color:#ffdd33;font-weight:900;text-shadow:2px 2px 7px #000;margin:8px 0}.ov-details{background:rgba(255,255,255,.14);border-radius:16px;padding:16px;font-size:19px;margin:18px 0}.ov-btn{background:#fff;color:#b30000;border:0;border-radius:16px;padding:16px 30px;font-size:22px;font-weight:900;cursor:pointer}#globalQueue{position:fixed;left:22px;bottom:22px;background:#14532d;color:white;border-radius:14px;padding:13px 16px;border:2px solid #fff;box-shadow:0 12px 34px #0008}@media(max-width:700px){.timer{font-size:48px}.ov-title{font-size:34px}.ov-admin{font-size:30px}.ov-msg{font-size:22px}.box{padding:15px}.panel{padding:22px}#globalQueue{left:10px;right:10px;bottom:10px}}</style></head><body>
+<div class="hdr"><div>⏱️ مطعم رشدي — إدارة البريك</div><div><a href="/agent-desk">الديسك</a><a href="/roshdy-logout">خروج</a></div></div>
+<div class="box"><div class="panel"><h1 id="title">جاري التحميل...</h1><div id="content"></div></div></div>
+<div id="globalQueue">📞 أوردرات: <b id="qo">0</b> | شكاوى: <b id="qc">0</b> | الإجمالي: <b id="qt">0</b></div>
+<div id="adminClosedOverlay"><div class="ov-card"><div class="ov-ico">🚨</div><div class="ov-title">تنبيه إداري</div><div class="ov-msg">تم إنهاء البريك بواسطة الأدمن</div><div id="ovAdmin" class="ov-admin">الإدارة</div><div id="ovDetails" class="ov-details"></div><button id="ovAck" class="ov-btn">أعلم .. العودة للعمل</button></div></div>
+<script>
+let timer=null, baseElapsed=0, basePerf=0, currentBreak=null, employeeSelfClosing=false, alertShown=false;
+function api(m,args){args=args||{};let q=new URLSearchParams();Object.keys(args).forEach(k=>{if(args[k]!==undefined&&args[k]!==null)q.append(k,args[k])});return fetch('/api/method/'+m+(q.toString()?'?'+q.toString():''),{method:'GET',credentials:'same-origin',cache:'no-store'}).then(r=>r.json()).then(j=>{if(j.exc)throw j;return j.message||j})}
+function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function fmt(sec){sec=Math.max(0,parseInt(sec||0));return String(Math.floor(sec/3600)).padStart(2,'0')+':'+String(Math.floor((sec%3600)/60)).padStart(2,'0')+':'+String(sec%60).padStart(2,'0')}
+function stopTimer(){if(timer){clearInterval(timer);timer=null}}
+function startTimer(elapsed){baseElapsed=parseInt(elapsed||0);basePerf=performance.now();stopTimer();timer=setInterval(()=>{let s=baseElapsed+Math.floor((performance.now()-basePerf)/1000);let e=document.getElementById('tm');if(e)e.textContent=fmt(s)},1000);let e=document.getElementById('tm');if(e)e.textContent=fmt(baseElapsed)}
+function showAdminClosed(a,generic){if(alertShown)return;alertShown=true;stopTimer();a=a||{};currentBreak=a.break_log||currentBreak;document.getElementById('title').textContent='تم إنهاء البريك';document.getElementById('content').innerHTML='<div class="closed-note">تم إنهاء البريك بواسطة الإدارة.<br><span class="muted">اضغط أعلم للعودة للعمل وتحديث الصفحة.</span></div>';document.getElementById('ovAdmin').textContent=a.closed_by||(generic?'الإدارة / النظام':'الإدارة');document.getElementById('ovDetails').innerHTML='نوع البريك: <b>'+esc(a.break_type||'')+'</b><br>وقت الإغلاق: <b>'+esc(a.end_time||'')+'</b><br>مدة البريك: <b>'+esc(a.duration_minutes||'')+' دقيقة</b>'+(generic?'<br><span style="font-size:14px">تم تحديث الحالة من السيرفر لأن البريك لم يعد نشطًا.</span>':'');document.getElementById('adminClosedOverlay').style.display='flex'}
+async function pollAdminAlert(){try{let r=await api('restaurant_ops.api.break_api.get_my_break_admin_alert');if(r&&r.has_alert&&r.alert)showAdminClosed(r.alert,false)}catch(e){console.log('alert poll',e)}}
+async function pollStateGuard(){if(!currentBreak||alertShown||employeeSelfClosing)return;try{let d=await api('restaurant_ops.api.break_api.get_break_page_data');if(d&&d.success&&!d.active_break){showAdminClosed({message:'تم إنهاء البريك بواسطة الإدارة'},true)}}catch(e){console.log('state guard',e)}}
+async function load(){try{let d=await api('restaurant_ops.api.break_api.get_break_page_data');if(!d||!d.success){content.innerHTML='<p>'+(d&&d.message?esc(d.message):'تعذر التحميل')+'</p>';return}title.textContent='أهلاً '+esc(d.employee_name||'')+(d.extension?' — Ext: '+esc(d.extension):'');if(d.active_break){currentBreak=d.active_break.name;content.innerHTML='<p>أنت الآن في بريك: <b>'+esc(d.active_break.break_type||'Break')+'</b></p><div class="timer" id="tm">00:00:00</div><button class="btn end" onclick="endBreak()">إنهاء البريك</button><div class="muted">العداد محسوب من السيرفر ولا يعتمد على ساعة الجهاز.</div>';startTimer(d.active_break.elapsed_seconds||0);return}currentBreak=null;stopTimer();let types=d.break_types||[];content.innerHTML='<div class="grid">'+types.map(t=>'<button class="b" onclick="startBreak(\''+esc(t.name)+'\')"><div style="font-size:40px">⏱️</div><b>'+esc(t.break_type||t.name)+'</b><br>'+esc(t.max_duration_minutes||15)+' دقيقة</button>').join('')+'</div><p class="muted" style="margin-top:15px">اختر نوع البريك للبدء</p>'}catch(e){console.error(e);content.innerHTML='<p>تعذر التحميل</p>'}}
+async function startBreak(x){try{let r=await api('restaurant_ops.api.break_api.start_break',{break_type:x});alert((r&&r.message)||'تم');load()}catch(e){alert('تعذر بدء البريك')}}
+async function endBreak(){employeeSelfClosing=true;setTimeout(()=>employeeSelfClosing=false,12000);try{let r=await api('restaurant_ops.api.break_api.end_break');alert((r&&r.message)||'تم');currentBreak=null;stopTimer();load()}catch(e){alert('تعذر إنهاء البريك')}}
+async function refreshQueue(){try{let d=await api('restaurant_ops.api.queue_api.get_queue_status')||{};qo.textContent=d.orders||0;qc.textContent=d.complaints||0;qt.textContent=d.total||0}catch(e){}}
+document.getElementById('ovAck').onclick=function(){let done=()=>location.reload();if(currentBreak){api('restaurant_ops.api.break_api.acknowledge_admin_closed_break',{break_log:currentBreak}).then(done).catch(done)}else done()};
+load();refreshQueue();pollAdminAlert();setInterval(refreshQueue,3000);setInterval(pollAdminAlert,2500);setInterval(pollStateGuard,2000);
+</script></body></html>
+HTML
+
+echo "🏗️ Step 5: Rewrite /break-admin with closure columns"
+cat > "$BREAK_ADMIN_HTML" <<'HTML'
+<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>تقرير البريكات</title><style>*{box-sizing:border-box;font-family:Tahoma,Arial}body{margin:0;background:#eef2f7;direction:rtl;color:#111827}.top{background:#20262d;color:white;padding:14px 22px;border-bottom:4px solid #1F4E79;display:flex;justify-content:space-between;align-items:center}.top a{color:#fff;text-decoration:none;border:1px solid #64748b;border-radius:10px;padding:8px 12px}.wrap{padding:22px;max-width:1600px;margin:auto}.panel{background:#fff;border:1px solid #d8dee9;border-radius:16px;box-shadow:0 10px 28px #0001;margin-bottom:16px;overflow:hidden}.head{padding:14px 16px;border-bottom:1px solid #e5e7eb;display:flex;justify-content:space-between;gap:10px;align-items:center}.body{padding:16px}.grid{display:grid;grid-template-columns:repeat(6,1fr);gap:10px}label{font-weight:800;color:#475569;font-size:12px}input,select{width:100%;border:1px solid #d1d5db;border-radius:10px;padding:9px}.btn{border:0;border-radius:10px;padding:10px 13px;background:#1F4E79;color:#fff;font-weight:800;cursor:pointer;margin:3px}.green{background:#16a34a}.orange{background:#f97316}.red{background:#dc2626}.table{width:100%;border-collapse:collapse;min-width:1250px}.table th{background:#111827;color:#fff;padding:9px}.table td{border:1px solid #e5e7eb;padding:8px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}.card{background:#fff;border:1px solid #ddd;border-radius:12px;padding:12px}.num{font-size:28px;color:#1F4E79;font-weight:bold}.scroll{overflow:auto}.overdue{background:#fef2f2}.muted{color:#64748b;font-size:13px}.admin-close{color:#b45309;font-weight:bold}.emp-close{color:#15803d;font-weight:bold}.toast{position:fixed;right:18px;bottom:18px;background:#111827;color:#fff;padding:12px 14px;border-radius:12px;display:none;z-index:99}@media(max-width:900px){.grid{grid-template-columns:1fr 1fr}.wrap{padding:12px}.table{min-width:1050px}}</style></head><body><div class="top"><b>⏱️ تقرير البريكات</b><div><a href="/admin-desk">Admin Desk</a></div></div><div class="wrap"><div class="panel"><div class="head"><div><b>البريكات النشطة الآن</b><div class="muted">محسوبة من السيرفر، وبإمكان الأدمن إنهاء أي بريك نشط.</div></div><button class="btn" onclick="loadActive()">تحديث</button></div><div class="body scroll" id="activeBox">جاري التحميل...</div></div><div class="panel"><div class="head"><b>الفلاتر</b></div><div class="body"><div class="grid"><div><label>من تاريخ</label><input type="date" id="df"></div><div><label>إلى تاريخ</label><input type="date" id="dt"></div><div><label>من ساعة</label><input id="st" value="00:00"></div><div><label>إلى ساعة</label><input id="et" value="23:59"></div><div><label>الموظف</label><select id="emp"></select></div><div><label>الحالة</label><select id="status"><option>All</option><option>active</option><option>finished</option><option>Completed</option></select></div></div><br><button class="btn green" onclick="load()">تحديث</button><button class="btn orange" onclick="window.print()">طباعة/PDF</button><button class="btn" onclick="csv()">CSV Excel</button></div></div><div class="cards"><div class="card">إجمالي البريكات<div class="num" id="total">0</div></div><div class="card">إجمالي الدقائق<div class="num" id="mins">0</div></div></div><br><div class="panel"><div class="head"><b>ملخص الموظفين</b></div><div class="body scroll"><table class="table"><thead><tr><th>الموظف</th><th>عدد</th><th>الدقائق</th></tr></thead><tbody id="byemp"></tbody></table></div></div><div class="panel"><div class="head"><b>تفاصيل البريكات</b></div><div class="body scroll"><table class="table"><thead><tr><th>رقم</th><th>الموظف</th><th>النوع</th><th>الحالة</th><th>بداية</th><th>نهاية</th><th>الدقائق</th><th>التحويلة</th><th>نوع الإغلاق</th><th>أغلق بواسطة</th><th>إقرار الموظف</th></tr></thead><tbody id="rows"></tbody></table></div></div></div><div id="toast" class="toast"></div><script>let last=null;function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function qs(o){let p=new URLSearchParams();Object.keys(o||{}).forEach(k=>{let v=o[k];if(v!==undefined&&v!==null&&v!=='')p.append(k,v)});return p.toString()}async function api(m,args){let q=qs(args||{});let r=await fetch('/api/method/'+m+(q?'?'+q:''),{method:'GET',credentials:'same-origin',cache:'no-store'});let j=await r.json();if(j.exc)throw j;return j.message||j}function today(){return new Date().toISOString().slice(0,10)}function toast(x){let t=document.getElementById('toast');t.textContent=x;t.style.display='block';setTimeout(()=>t.style.display='none',3500)}async function loadActive(){try{let d=await api('restaurant_ops.api.break_api.get_active_breaks');let box=document.getElementById('activeBox');let rs=d.rows||[];if(!rs.length){box.innerHTML='<div class="muted" style="text-align:center;padding:14px;background:#f8fafc;border-radius:10px">لا توجد بريكات نشطة حالياً</div>';return}box.innerHTML='<div style="margin-bottom:8px"><b>الإجمالي: '+(d.active_count||rs.length)+'</b> | <b style="color:#dc2626">عدت الوقت: '+(d.overdue_count||0)+'</b> | <span class="muted">آخر تحديث: '+esc(d.server_now||'')+'</span></div><table class="table"><thead><tr><th>الموظف</th><th>نوع البريك</th><th>بدأ من</th><th>المدة</th><th>الحد</th><th>الحالة</th><th>إجراء</th></tr></thead><tbody>'+rs.map(r=>'<tr class="'+(r.overdue?'overdue':'')+'"><td>'+esc(r.employee_name||r.employee)+'</td><td>'+esc(r.break_type)+'</td><td>'+esc(r.start_time)+'</td><td><b>'+esc(r.duration_minutes)+' دقيقة</b></td><td>'+esc(r.limit_minutes)+' دقيقة</td><td>'+(r.overdue?'⚠️ عدى الوقت بـ '+esc(r.overdue_minutes)+' دقيقة':'داخل الوقت')+'</td><td><button class="btn red" onclick="endAdmin(\''+esc(r.name)+'\')">إنهاء البريك</button></td></tr>').join('')+'</tbody></table>'}catch(e){console.error(e);activeBox.innerHTML='<div style="color:#b91c1c;background:#fef2f2;padding:14px;border-radius:10px">فشل تحميل البريكات النشطة</div>'}}async function endAdmin(name){if(!confirm('تأكيد إنهاء البريك؟'))return;let r=await api('restaurant_ops.api.break_api.admin_end_break',{break_log:name});if(r&&r.success){toast((r.message||'تم')+(r.target_user?' — تم إرسال تنبيه للموظف':' — لا يوجد مستخدم هدف'));loadActive();load()}else toast('فشل إنهاء البريك')}async function load(){last=await api('restaurant_ops.api.break_api.get_break_report_detailed',{date_from:df.value,date_to:dt.value,start_time:st.value,end_time:et.value,employee:emp.value,status:status.value});if(!last||!last.success){alert((last&&last.message)||'Error');return}total.textContent=last.summary.total_breaks;mins.textContent=last.summary.total_minutes;let opts='<option value="">الكل</option>'+((last.employees)||[]).map(e=>'<option value="'+esc(e.name)+'" '+(emp.value===e.name?'selected':'')+'>'+esc(e.employee_name||e.name)+'</option>').join('');if(!emp.dataset.loaded){emp.innerHTML=opts;emp.dataset.loaded='1'}byemp.innerHTML=(last.by_employee||[]).map(x=>'<tr><td>'+esc(x.employee_name)+'</td><td>'+x.count+'</td><td>'+x.minutes+'</td></tr>').join('');rows.innerHTML=(last.rows||[]).map(r=>'<tr><td>'+esc(r.name)+'</td><td>'+esc(r.employee_name||r.employee)+'</td><td>'+esc(r.break_type)+'</td><td>'+esc(r.status)+'</td><td>'+esc(r.start_time_text)+'</td><td>'+esc(r.end_time_text)+'</td><td>'+esc(r.duration_minutes_calc)+'</td><td>'+esc(r.extension_at_start||'')+'</td><td class="'+(r.closure_type==='admin'?'admin-close':(r.closure_type==='employee'?'emp-close':''))+'">'+esc(r.closure_type_label||'')+'</td><td>'+esc(r.closed_by_name||r.closed_by||'')+'</td><td>'+(r.closure_type==='admin'?(r.admin_close_acknowledged?'✅ تم العلم':'⏳ لم يقر بعد'):'—')+'</td></tr>').join('')}function csv(){if(!last)return;let blob=new Blob(['\ufeff'+(last.csv||'')],{type:'text/csv;charset=utf-8'});let a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='break-report.csv';a.click()}df.value=today();dt.value=today();load().then(loadActive);setInterval(loadActive,10000);</script></body></html>
+HTML
+
+# Clean agent-desk old/bad overlay and add V16 overlay safely before body.
+echo "🧩 Step 6: Clean /agent-desk break overlay and add safe V16 overlay"
+python3 - <<'PY'
+from pathlib import Path
+import os
+agent = Path(os.environ['AGENT_HTML'])
+block = r'''
+<!-- BEGIN ROSHDY BREAK ADMIN CLOSED OVERLAY V16 -->
+<style>#agentAdminCloseOverlayV16{position:fixed;inset:0;background:#b30000;z-index:2147483000;display:none;align-items:center;justify-content:center;padding:18px;direction:rtl;font-family:Tahoma,Arial,sans-serif;text-align:center;color:white}.aa16-card{background:rgba(0,0,0,.28);border:2px solid rgba(255,255,255,.55);border-radius:24px;width:760px;max-width:96vw;padding:34px}.aa16-title{font-size:44px;font-weight:900}.aa16-admin{font-size:36px;color:#ffdd33;font-weight:900;margin:10px}.aa16-btn{background:white;color:#b30000;border:0;border-radius:14px;padding:14px 24px;font-weight:900;font-size:20px;cursor:pointer}</style>
+<div id="agentAdminCloseOverlayV16"><div class="aa16-card"><div style="font-size:70px">🚨</div><div class="aa16-title">تم إنهاء البريك بواسطة الأدمن</div><div id="aa16admin" class="aa16-admin">الإدارة</div><div id="aa16details" style="font-size:18px;margin:14px"></div><button id="aa16ack" class="aa16-btn">أعلم .. العودة للعمل</button></div></div>
+<script>(function(){if(window.AgentAdminCloseV16)return;window.AgentAdminCloseV16=1;var cur=null;function api(m,args){args=args||{};var q=new URLSearchParams();Object.keys(args).forEach(function(k){if(args[k]!==undefined&&args[k]!==null)q.append(k,args[k])});return fetch('/api/method/'+m+(q.toString()?'?'+q.toString():''),{method:'GET',credentials:'same-origin',cache:'no-store'}).then(r=>r.json()).then(j=>{if(j.exc)throw j;return j.message||j})}function show(a){a=a||{};cur=a.break_log||cur;document.getElementById('aa16admin').textContent=a.closed_by||'الإدارة';document.getElementById('aa16details').innerHTML='نوع البريك: <b>'+(a.break_type||'')+'</b><br>وقت الإغلاق: <b>'+(a.end_time||'')+'</b><br>مدة البريك: <b>'+(a.duration_minutes||'')+' دقيقة</b>';document.getElementById('agentAdminCloseOverlayV16').style.display='flex'}function poll(){api('restaurant_ops.api.break_api.get_my_break_admin_alert',{}).then(function(r){if(r&&r.has_alert&&r.alert)show(r.alert)}).catch(function(){})}document.getElementById('aa16ack').onclick=function(){var done=function(){document.getElementById('agentAdminCloseOverlayV16').style.display='none'};if(cur)api('restaurant_ops.api.break_api.acknowledge_admin_closed_break',{break_log:cur}).then(done).catch(done);else done()};setTimeout(poll,600);setInterval(poll,2500);})();</script>
+<!-- END ROSHDY BREAK ADMIN CLOSED OVERLAY V16 -->
+'''
+if agent.exists():
+    text = agent.read_text(encoding='utf-8', errors='ignore')
+    markers=[('<!-- BEGIN ROSHDY AGENT BREAK CLOSE ALERT -->','<!-- END ROSHDY AGENT BREAK CLOSE ALERT -->'),('<!-- BEGIN ROSHDY AGENT BREAK ADMIN CLOSED V10 -->','<!-- END ROSHDY AGENT BREAK ADMIN CLOSED V10 -->'),('<!-- BEGIN ROSHDY AGENT BREAK ADMIN CLOSED V12 -->','<!-- END ROSHDY AGENT BREAK ADMIN CLOSED V12 -->'),('<!-- BEGIN ROSHDY AGENT BREAK ADMIN CLOSED V13 -->','<!-- END ROSHDY AGENT BREAK ADMIN CLOSED V13 -->'),('<!-- BEGIN ROSHDY BREAK ADMIN CLOSED OVERLAY V14 -->','<!-- END ROSHDY BREAK ADMIN CLOSED OVERLAY V14 -->'),('<!-- BEGIN ROSHDY BREAK ADMIN CLOSED OVERLAY V15 -->','<!-- END ROSHDY BREAK ADMIN CLOSED OVERLAY V15 -->'),('<!-- BEGIN ROSHDY BREAK ADMIN CLOSED OVERLAY V16 -->','<!-- END ROSHDY BREAK ADMIN CLOSED OVERLAY V16 -->')]
+    for a,b in markers:
+        while a in text and b in text:
+            i=text.index(a); j=text.index(b,i)+len(b); text=text[:i]+'\n'+text[j:]
+    low=text.lower(); idx=low.rfind('</body>')
+    if idx>=0: text=text[:idx]+'\n'+block+'\n'+text[idx:]
+    else: text=text.rstrip()+'\n'+block+'\n'
+    agent.write_text(text, encoding='utf-8')
+PY
+
+if [[ -n "$APP_OWNER" ]]; then
+  chown "$APP_OWNER" "$BREAK_API" "$MY_BREAK_HTML" "$BREAK_ADMIN_HTML" "$AGENT_HTML" 2>/dev/null || true
+fi
+
+echo "🧹 Step 7: Clear cache + restart app services"
+bench_exec clear-cache || true
+"${COMPOSE[@]}" restart backend frontend websocket queue-short queue-long scheduler >/dev/null
+sleep 8
+bench_exec clear-cache || true
+
+echo "🧪 Step 8: Page smoke checks"
+set +e
+for p in my-break agent-desk break-admin admin-desk call-report; do
+  code="$(curl -k -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$p" 2>/dev/null || echo 000)"
+  echo "$p => $code" | tee -a "$BACKUP_DIR/page_smoke_checks_v16.txt"
+done
+set -e
+
+if ! grep -q "my-break => 200" "$BACKUP_DIR/page_smoke_checks_v16.txt" || ! grep -q "break-admin => 200" "$BACKUP_DIR/page_smoke_checks_v16.txt"; then
+  echo "❌ Critical page failed. Restore from: $BACKUP_DIR"
+  exit 1
+fi
+
+echo "🧪 Step 9: Backend validation"
+set +e
+bench_exec execute restaurant_ops.api.break_api.get_break_page_data | tee "$BACKUP_DIR/get_break_page_data_v16.txt"
+V1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.break_api.get_active_breaks | tee "$BACKUP_DIR/get_active_breaks_v16.txt"
+V2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.break_api.get_break_report_detailed | tee "$BACKUP_DIR/get_break_report_detailed_v16.txt"
+V3=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.break_api.debug_my_break_alert_binding | tee "$BACKUP_DIR/debug_my_break_alert_binding_v16.txt"
+V4=${PIPESTATUS[0]}
+set -e
+
+if [[ $V1 -ne 0 || $V2 -ne 0 || $V3 -ne 0 || $V4 -ne 0 ]]; then
+  echo "❌ Backend validation failed. راجع: $BACKUP_DIR"
+  exit 1
+fi
+
+echo "🏥 Step 10: Health Check - Elastix/CDR/AMI + Queue + Call Report"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$BACKUP_DIR/health_asterisk_bridge.txt"
+H1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status | tee "$BACKUP_DIR/health_queue_status.txt"
+H2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' | tee "$BACKUP_DIR/health_call_report.txt"
+H3=${PIPESTATUS[0]}
+set -e
+
+if [[ $H1 -ne 0 || $H2 -ne 0 || $H3 -ne 0 ]]; then
+  echo "⚠️ Health returned non-zero. راجع: $BACKUP_DIR"
+else
+  echo "✅ Health checks OK"
+fi
+
+echo "============================================================"
+echo "✅ DONE FINAL V16"
+echo "📦 Backup folder: $BACKUP_DIR"
+echo "⏱️ /my-break rebuilt: timer stops immediately after admin close"
+echo "🚨 full-screen admin close alert + acknowledgement"
+echo "📋 /break-admin now shows closure type and closed_by"
+echo "🛡️ report_api.py / Elastix / CDR / AMI untouched"
+echo "============================================================"

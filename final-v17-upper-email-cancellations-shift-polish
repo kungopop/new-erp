@@ -1,0 +1,578 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Roshdy V17 FINAL polish:
+# - Upper Management email uses the SAME missed-attempt source as Customer Service email:
+#   restaurant_ops.api.report_api.get_staff_missed_attempts(date_from,date_to,15)
+# - No misleading conflict: answered calls are shown as answered; missed employee attempts are shown as attempts inside queue.
+# - Removes technical wording: Busy/Declined / Call Report / staff_missed labels from the management email.
+# - Open complaints are highlighted first.
+# - Complaint queue wording is human-friendly, no "Queue 123".
+# - Cancellation reason is management-friendly.
+# - Adds "رقم الوردية" to cancellation DocType/API/full page/admin desk/email.
+# - Does NOT edit report_api.py / Elastix / CDR / AMI config.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "❌ docker compose/docker-compose مش موجود"
+  exit 1
+fi
+
+APP_DIR="$ROOT/apps/$APP"
+PKG_DIR="$APP_DIR/$APP"
+WWW_DIR="$PKG_DIR/www"
+API_DIR="$PKG_DIR/api"
+SCRIPTS_DIR="$PKG_DIR/scripts"
+UPPER_API="$API_DIR/upper_management_email_api.py"
+ADMIN_HTML="$WWW_DIR/admin-desk.html"
+CANCEL_HTML="$WWW_DIR/order-cancellations-report.html"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/FINAL_V17_UPPER_EMAIL_CANCEL_SHIFT_BEFORE_$TS"
+mkdir -p "$BACKUP_DIR" "$SCRIPTS_DIR"
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend container مش شغال أو مش لاقيه"
+  exit 1
+fi
+
+bench_exec() {
+  "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"
+}
+
+echo "============================================================"
+echo "🚀 Roshdy FINAL V17: upper email + missed attempts + shift number"
+echo "📦 Backup: $BACKUP_DIR"
+echo "============================================================"
+
+echo "🧯 Step 1: Backup files + bench backup"
+for f in "$UPPER_API" "$ADMIN_HTML" "$CANCEL_HTML"; do
+  [[ -f "$f" ]] && cp -a "$f" "$BACKUP_DIR/$(basename "$f").before"
+done
+bench_exec backup --with-files | tee "$BACKUP_DIR/bench_backup_output.txt"
+
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+
+echo "🧱 Step 2: Ensure cancellation shift_number field"
+cat > "$SCRIPTS_DIR/setup_cancellation_shift_number_v17.py" <<'PY'
+import frappe
+from frappe.custom.doctype.custom_field.custom_field import create_custom_field
+
+def execute():
+    dt = "Call Center Order Cancellation"
+    if not frappe.db.exists("DocType", dt):
+        # Try creating it through existing API first
+        try:
+            from restaurant_ops.api.upper_management_email_api import ensure_order_cancellation_doctype
+            ensure_order_cancellation_doctype()
+        except Exception:
+            pass
+    if not frappe.db.exists("DocType", dt):
+        return {"success": False, "error": "Cancellation DocType not found"}
+    meta = frappe.get_meta(dt)
+    made = []
+    if not meta.has_field("shift_number") and not frappe.db.exists("Custom Field", {"dt": dt, "fieldname": "shift_number"}):
+        create_custom_field(dt, {
+            "fieldname": "shift_number",
+            "label": "رقم الوردية",
+            "fieldtype": "Data",
+            "insert_after": "shift",
+            "in_list_view": 1,
+        }, ignore_validate=True)
+        made.append("shift_number")
+    frappe.db.commit(); frappe.clear_cache(doctype=dt)
+    return {"success": True, "created": made}
+PY
+[[ -n "$APP_OWNER" ]] && chown "$APP_OWNER" "$SCRIPTS_DIR/setup_cancellation_shift_number_v17.py" 2>/dev/null || true
+bench_exec execute restaurant_ops.scripts.setup_cancellation_shift_number_v17.execute | tee "$BACKUP_DIR/setup_cancellation_shift_number_v17.txt"
+
+echo "🧩 Step 3: Patch upper_management_email_api final V17"
+export UPPER_API
+python3 - <<'PY'
+# -*- coding: utf-8 -*-
+from pathlib import Path
+import os
+p = Path(os.environ["UPPER_API"])
+s = p.read_text(encoding="utf-8", errors="ignore")
+start = "# BEGIN ROSHDY UPPER EMAIL FINAL V17"
+end = "# END ROSHDY UPPER EMAIL FINAL V17"
+patch = r'''
+# BEGIN ROSHDY UPPER EMAIL FINAL V17
+try:
+    import frappe
+    from frappe.utils import today, now_datetime, getdate, cstr, cint, flt, get_datetime
+    import html as _v17_html
+    import re as _v17_re
+except Exception:
+    pass
+
+_BLOCKED_REPORT_EMAILS_V17 = {"admin@roshdy.com", "el.alfy@roshdy.com", "administrator@roshdy.com"}
+
+def _v17_e(v):
+    return _v17_html.escape(cstr(v) if v is not None else "")
+
+def _v17_n(v):
+    try:
+        f = flt(v or 0)
+        return f"{int(f):,}" if float(f).is_integer() else f"{f:,.1f}"
+    except Exception:
+        return cstr(v)
+
+def _v17_period(date_from=None, date_to=None):
+    if not date_from: date_from = today()
+    if not date_to: date_to = date_from
+    sd, ed = getdate(date_from), getdate(date_to)
+    return sd, ed, cstr(sd) + " 00:00:00", cstr(ed) + " 23:59:59"
+
+def _v17_extract_emails(value):
+    out=[]
+    if value is None: return out
+    if isinstance(value,(list,tuple,set)):
+        for x in value: out.extend(_v17_extract_emails(x))
+        return out
+    if isinstance(value,dict):
+        for x in value.values(): out.extend(_v17_extract_emails(x))
+        return out
+    out.extend(_v17_re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", cstr(value)))
+    return out
+
+def _v17_clean_recipients(values):
+    seen=set(); cleaned=[]
+    for e in _v17_extract_emails(values):
+        e=cstr(e).strip().strip(",; ")
+        if not e: continue
+        k=e.lower()
+        if k in _BLOCKED_REPORT_EMAILS_V17 or k.endswith("@local.local") or k.endswith("@example.com"):
+            continue
+        if k in seen: continue
+        seen.add(k); cleaned.append(e)
+    return cleaned
+
+def _v17_resolve_upper_recipients(direct=None, kwargs=None):
+    kwargs=kwargs or {}
+    candidates=[direct]
+    for k in ("recipients","recipient","emails","email","to","send_to","test_email","email_to","mail_to","upper_management_emails","upper_management_recipients","upper_emails","management_emails"):
+        if kwargs.get(k): candidates.append(kwargs.get(k))
+    explicit=_v17_clean_recipients(candidates)
+    if explicit: return explicit, "explicit_ui_or_api"
+    for fn_name in ("_r5_resolve_upper_recipients", "_roshdy_v4_resolve_upper_recipients"):
+        try:
+            fn=globals().get(fn_name)
+            if fn:
+                res=fn(direct=direct, kwargs=kwargs)
+                recips=res[0] if isinstance(res, tuple) else res
+                clean=_v17_clean_recipients(recips)
+                if clean: return clean, fn_name + "_filtered"
+        except Exception:
+            pass
+    return [], "not_found"
+
+def _v17_call_report(date_from=None, date_to=None, page=1, page_size=5000):
+    try:
+        from restaurant_ops.api import report_api
+        res = report_api.get_calls_report(page=page, page_size=page_size, view_mode="admin", date_from=cstr(date_from), date_to=cstr(date_to))
+        return res.get("message") if isinstance(res, dict) and isinstance(res.get("message"), dict) else res
+    except TypeError:
+        try:
+            from restaurant_ops.api import report_api
+            res = report_api.get_calls_report(page=page, page_size=page_size, view_mode="admin")
+            return res.get("message") if isinstance(res, dict) and isinstance(res.get("message"), dict) else res
+        except Exception as e:
+            return {"success": False, "error": cstr(e)}
+    except Exception as e:
+        return {"success": False, "error": cstr(e)}
+
+def _v17_rows(obj):
+    if isinstance(obj,dict):
+        for k in ("calls","rows","data","records","items","result"):
+            if isinstance(obj.get(k),list): return obj.get(k)
+    return []
+
+def _v17_all_call_rows(sd, ed):
+    first=_v17_call_report(sd,ed,page=1,page_size=5000)
+    rows=list(_v17_rows(first))
+    summary=first.get("summary") if isinstance(first,dict) and isinstance(first.get("summary"),dict) else {}
+    pagination=first.get("pagination") if isinstance(first,dict) and isinstance(first.get("pagination"),dict) else {}
+    try: pages=min(max(cint(pagination.get("total_pages") or 1),1),10)
+    except Exception: pages=1
+    for page in range(2,pages+1):
+        more=_v17_rows(_v17_call_report(sd,ed,page=page,page_size=5000))
+        if not more: break
+        rows.extend(more)
+    return first, summary, pagination, rows
+
+def _v17_queue_match(row, queue="123"):
+    q=cstr(queue or "123")
+    dst=cstr(row.get("dst") or "").strip()
+    actual=cstr(row.get("actual_ext") or "").strip()
+    lastdata=cstr(row.get("lastdata") or "")
+    rec=cstr(row.get("recordingfile") or row.get("recording_url") or "")
+    agent=cstr(row.get("agent_name") or "")
+    return dst==q or (actual==q and "طابور" in agent) or lastdata.startswith(q+",") or f"q-{q}-" in rec
+
+def _v17_closed_values():
+    return ["Closed","Resolved","Done","مغلقة","تم الحل","محلولة","مغلقة/محلولة","مقفولة","ملغي","Cancelled","Canceled"]
+
+def _v17_pick_field(meta, fields):
+    for f in fields:
+        try:
+            if meta.has_field(f): return f
+        except Exception: pass
+    return None
+
+def _v17_complaints(start_dt, end_dt):
+    dt="Call Center Complaint"
+    out={"exists":False,"registered_today":0,"open_all":0,"resolved_today":0,"today_rows":[],"open_rows":[],"status_breakdown_today":[],"category_breakdown_today":[]}
+    if not frappe.db.exists("DocType",dt): return out
+    out["exists"]=True
+    try:
+        meta=frappe.get_meta(dt)
+        sf=_v17_pick_field(meta,["status","complaint_status","workflow_state"])
+        cf=_v17_pick_field(meta,["category","complaint_category","complaint_type","type","issue_type","reason","complaint_reason"])
+        pf=_v17_pick_field(meta,["priority","complaint_priority","urgency"])
+        fields=["name","creation","modified"]
+        for f in (sf,cf,pf,"customer_name","customer_phone","subject"):
+            if f and f not in fields and (f not in ("customer_name","customer_phone","subject") or meta.has_field(f)):
+                fields.append(f)
+        today_rows=frappe.get_all(dt,filters={"creation":["between",[start_dt,end_dt]]},fields=fields,order_by="creation desc",limit_page_length=500)
+        open_filters={sf:["not in",_v17_closed_values()]} if sf else {}
+        open_rows=frappe.get_all(dt,filters=open_filters,fields=fields,order_by="modified desc",limit_page_length=500)
+        out["registered_today"]=len(today_rows); out["open_all"]=len(open_rows)
+        st_counts={}; cat_counts={}
+        def pack(r):
+            return {"name":r.get("name"),"creation":cstr(r.get("creation") or ""),"status":cstr(r.get(sf) if sf else "غير محدد") or "غير محدد","category":cstr(r.get(cf) if cf else "غير محدد") or "غير محدد","priority":cstr(r.get(pf) if pf else "") or "","customer_name":r.get("customer_name") or "","customer_phone":r.get("customer_phone") or "","subject":r.get("subject") or ""}
+        for r in today_rows:
+            st=cstr(r.get(sf) if sf else "غير محدد") or "غير محدد"
+            cat=cstr(r.get(cf) if cf else "غير محدد") or "غير محدد"
+            st_counts[st]=st_counts.get(st,0)+1; cat_counts[cat]=cat_counts.get(cat,0)+1
+            if st in _v17_closed_values(): out["resolved_today"]+=1
+        out["today_rows"]=[pack(r) for r in today_rows]
+        out["open_rows"]=[pack(r) for r in open_rows]
+        out["status_breakdown_today"]=[{"label":k,"count":v} for k,v in sorted(st_counts.items(), key=lambda x:(-x[1],x[0]))]
+        out["category_breakdown_today"]=[{"label":k,"count":v} for k,v in sorted(cat_counts.items(), key=lambda x:(-x[1],x[0]))]
+    except Exception as e:
+        out["error"]=cstr(e)
+    return out
+
+def _v17_public_employee_label(row):
+    ext=cstr(row.get("extension") or row.get("actual_ext") or "").strip()
+    emp=cstr(row.get("employee_name") or "").strip()
+    if emp and emp not in ("غير مربوط وقت المكالمة","None"):
+        return emp
+    if ext: return "غير محدد (تحويلة " + ext + ")"
+    return "غير محدد"
+
+def _v17_staff_missed_attempts(sd, ed):
+    try:
+        from restaurant_ops.api.report_api import get_staff_missed_attempts
+        d=get_staff_missed_attempts(cstr(sd), cstr(ed), 15) or {}
+    except Exception as e:
+        return {"success":False,"total_attempts":0,"rows":[],"grouped":[],"error":cstr(e)}
+    rows=[]
+    for r in (d.get("details") or [])[:500]:
+        disp=cstr(r.get("disposition") or "")
+        action="سابها ترن ولم يرد" if disp=="NO ANSWER" else ("فشل/اتكنسلت على التحويلة" if disp=="FAILED" else "محاولة فائتة على التحويلة")
+        rows.append({"time":cstr(r.get("calldate") or ""),"employee":_v17_public_employee_label(r),"extension":cstr(r.get("extension") or ""),"caller":cstr(r.get("src") or ""),"action":action,"duration":cstr(r.get("duration") or ""),"uniqueid":cstr(r.get("uniqueid") or "")})
+    if not rows and d.get("grouped"):
+        for g in (d.get("grouped") or [])[:100]:
+            rows.append({"time":"--","employee":_v17_public_employee_label(g),"extension":cstr(g.get("extension") or ""),"caller":"--","action":"عدد محاولات فائتة: "+cstr(g.get("count") or 0),"duration":cstr(g.get("duration") or g.get("total_duration") or ""),"uniqueid":""})
+    return {"success":d.get("success",True),"total_attempts":cint(d.get("total_attempts") or len(rows) or 0),"extensions_count":cint(d.get("extensions_count") or len(d.get("grouped") or []) or 0),"total_duration":cint(d.get("total_duration") or 0),"grouped":d.get("grouped") or [],"rows":rows,"raw":d}
+
+def _v17_target_items(start_dt,end_dt):
+    try: return _get_target_items(start_dt,end_dt)
+    except Exception: return {"total_qty":0,"total_entries":0,"rows":[]}
+
+def _v17_cancellations(start_dt,end_dt):
+    try:
+        ensure_order_cancellation_doctype()
+        fields=["name","order_no","cancellation_time","shift","branch","customer_name","customer_phone","reason","notes","logged_by"]
+        try:
+            if frappe.get_meta(CANCELLATION_DOCTYPE).has_field("shift_number"): fields.insert(4,"shift_number")
+        except Exception: pass
+        rows=frappe.get_all(CANCELLATION_DOCTYPE,filters={"cancellation_time":["between",[start_dt,end_dt]]},fields=fields,order_by="cancellation_time desc, creation desc",limit_page_length=500)
+        return {"count":len(rows),"rows":rows}
+    except Exception as e:
+        return {"count":0,"rows":[],"error":cstr(e)}
+
+def _v17_cancel_reason_public(reason):
+    raw=cstr(reason or "").strip(); low=raw.lower()
+    if not raw: return "غير محدد"
+    if any(x in low for x in ("مزاج","mood","مش عايز","غير رأيه","غير رايه")):
+        return "العميل لم يرغب في استكمال الطلب"
+    if raw.startswith("العميل ألغى الطلب — عدم رغبة العميل"):
+        return "العميل لم يرغب في استكمال الطلب"
+    return raw
+
+@frappe.whitelist()
+def create_order_cancellation(order_no=None, shift=None, shift_number=None, branch=None, customer_name=None, customer_phone=None, reason=None, notes=None, cancellation_time=None, **kwargs):
+    ensure_order_cancellation_doctype()
+    # permission: same old rule if function exists, otherwise admin roles
+    try:
+        allowed = _v10_can_manage_cancellations()
+    except Exception:
+        allowed = frappe.session.user == "Administrator" or bool(set(frappe.get_roles(frappe.session.user)).intersection({"System Manager","Call Center Admin","Restaurant Manager"}))
+    if not allowed: frappe.throw("غير مسموح: تسجيل الإلغاءات متاح لمدير خدمة العملاء أو مدير النظام فقط")
+    order_no=cstr(order_no or kwargs.get("order") or kwargs.get("order_id") or kwargs.get("order_number") or "").strip()
+    shift=cstr(shift or kwargs.get("shift_name") or "غير محدد").strip()
+    shift_number=cstr(shift_number or kwargs.get("shift_no") or kwargs.get("shift_num") or "").strip()
+    branch=cstr(branch or kwargs.get("store") or kwargs.get("branch_name") or "").strip()
+    customer_name=cstr(customer_name or kwargs.get("customer") or kwargs.get("client_name") or "").strip()
+    customer_phone=cstr(customer_phone or kwargs.get("phone") or kwargs.get("mobile") or "").strip()
+    reason=cstr(reason or kwargs.get("cancel_reason") or kwargs.get("cancellation_reason") or "").strip()
+    notes=cstr(notes or kwargs.get("note") or kwargs.get("remarks") or "").strip()
+    if not order_no: frappe.throw("رقم الطلب مطلوب")
+    if not branch: frappe.throw("الفرع مطلوب")
+    if not reason: frappe.throw("سبب الإلغاء مطلوب")
+    ct=get_datetime(cancellation_time) if cancellation_time else now_datetime()
+    data={"doctype":CANCELLATION_DOCTYPE,"order_no":order_no,"cancellation_time":ct,"report_date":getdate(ct),"shift":shift or "غير محدد","branch":branch,"customer_name":customer_name,"customer_phone":customer_phone,"reason":reason,"notes":notes,"logged_by":frappe.session.user,"source":"manual"}
+    try:
+        if frappe.get_meta(CANCELLATION_DOCTYPE).has_field("shift_number"): data["shift_number"]=shift_number
+    except Exception: pass
+    doc=frappe.get_doc(data); doc.insert(ignore_permissions=True); frappe.db.commit()
+    return {"success":True,"name":doc.name,"message":"تم تسجيل الإلغاء بنجاح"}
+
+@frappe.whitelist()
+def list_order_cancellations(date_from=None,date_to=None,branch=None,shift=None,search=None,limit=500,**kwargs):
+    ensure_order_cancellation_doctype()
+    sd,ed,start_dt,end_dt=_v17_period(date_from,date_to)
+    filters={"cancellation_time":["between",[start_dt,end_dt]]}
+    if branch: filters["branch"]=cstr(branch).strip()
+    if shift and cstr(shift).strip() not in ("All","الكل"): filters["shift"]=cstr(shift).strip()
+    fields=["name","order_no","cancellation_time","shift","branch","customer_name","customer_phone","reason","notes","logged_by","creation"]
+    try:
+        if frappe.get_meta(CANCELLATION_DOCTYPE).has_field("shift_number"): fields.insert(4,"shift_number")
+    except Exception: pass
+    rows=frappe.get_all(CANCELLATION_DOCTYPE,filters=filters,fields=fields,order_by="cancellation_time desc, creation desc",limit_page_length=cint(limit) or 500)
+    if search:
+        q=cstr(search).lower().strip()
+        rows=[r for r in rows if q in " ".join(cstr(r.get(k) or "") for k in ("order_no","shift_number","branch","customer_name","customer_phone","reason","notes","logged_by")).lower()]
+    by_branch={}; by_reason={}
+    for r in rows:
+        b=cstr(r.get("branch") or "غير محدد"); by_branch[b]=by_branch.get(b,0)+1
+        rr=_v17_cancel_reason_public(r.get("reason")); by_reason[rr]=by_reason.get(rr,0)+1
+    return {"success":True,"period":{"from":cstr(sd),"to":cstr(ed)},"count":len(rows),"rows":rows,"by_branch":[{"branch":k,"count":v} for k,v in sorted(by_branch.items(),key=lambda x:(-x[1],x[0]))],"by_reason":[{"reason":k,"count":v} for k,v in sorted(by_reason.items(),key=lambda x:(-x[1],x[0]))]}
+
+@frappe.whitelist()
+def get_upper_management_report_data(date_from=None,date_to=None):
+    sd,ed,start_dt,end_dt=_v17_period(date_from,date_to)
+    first,summary,pagination,call_rows=_v17_all_call_rows(sd,ed)
+    answered=cint(summary.get("answered") or 0)
+    total=cint(summary.get("total") or pagination.get("total_records") or len(call_rows) or 0)
+    missed=_v17_staff_missed_attempts(sd,ed)
+    comps=_v17_complaints(start_dt,end_dt)
+    cancels=_v17_cancellations(start_dt,end_dt)
+    target=_v17_target_items(start_dt,end_dt)
+    cq_count=sum(1 for r in call_rows if _v17_queue_match(r,"123"))
+    follow=[]
+    if flt(comps.get("open_all") or 0)>0: follow.append(f"مراجعة الشكاوى المفتوحة حاليًا وعددها {_v17_n(comps.get('open_all'))}.")
+    if missed.get("total_attempts"): follow.append("مراجعة المحاولات الفائتة على تحويلات الموظفين.")
+    if flt(cancels.get("count") or 0)>0: follow.append("مراجعة سبب الإلغاء المسجل اليوم والتأكد أنه مصنف بشكل واضح.")
+    if flt(target.get("total_qty") or 0)<=0: follow.append("لم يتم تسجيل أي عرض للأصناف المطلوبة خلال الفترة.")
+    return {"success":True,"period":{"from":cstr(sd),"to":cstr(ed),"label":cstr(sd) if cstr(sd)==cstr(ed) else f"{sd} إلى {ed}"},"generated_at":now_datetime().strftime("%Y-%m-%d %H:%M:%S"),"calls":{"total":total,"answered":answered,"staff_missed_count":missed.get("total_attempts",0),"employee_issue_count":missed.get("total_attempts",0),"employee_issue_rows":missed.get("rows",[]),"staff_missed_grouped":missed.get("grouped",[]),"staff_missed_total_duration":missed.get("total_duration",0),"source":"report_api.get_staff_missed_attempts_same_as_center_v17"},"complaint_queue":{"count":cq_count,"queue":"123","source":"report_api"},"complaints":comps,"cancellations":cancels,"target_items":target,"followups":follow,"status_label":"يوجد نقاط تحتاج متابعة" if follow else "لا توجد مشكلة ظاهرة في بيانات خدمة العملاء"}
+
+def _v17_td(v,strong=False):
+    val=_v17_e(v)
+    if strong: val="<b>"+val+"</b>"
+    return f"<td style='padding:8px;border:1px solid #e5e7eb;text-align:right;direction:rtl;font-size:12px'>{val}</td>"
+
+def _v17_empty(cols,text):
+    return f"<tr><td colspan='{cols}' style='padding:12px;border:1px solid #e5e7eb;text-align:center;color:#64748b;background:#f8fafc'>{_v17_e(text)}</td></tr>"
+
+def _v17_table(headers,body):
+    th="".join(f"<th style='background:#111827;color:white;padding:9px;border:1px solid #e5e7eb;text-align:right;direction:rtl;font-size:12px'>{_v17_e(h)}</th>" for h in headers)
+    return f"<table dir='rtl' width='100%' cellpadding='0' cellspacing='0' style='border-collapse:collapse;width:100%;direction:rtl;text-align:right;margin-top:8px;font-family:Tahoma,Arial,sans-serif'><thead><tr>{th}</tr></thead><tbody>{body}</tbody></table>"
+
+def _v17_card(title,value,note,color="#1F4E79",bg="#fff"):
+    return f"<td style='width:25%;padding:6px;vertical-align:top'><div style='background:{bg};border:1px solid #e5e7eb;border-right:6px solid {color};border-radius:14px;padding:13px;min-height:102px;text-align:right;direction:rtl'><div style='font-size:13px;color:#475569;font-weight:bold'>{_v17_e(title)}</div><div style='font-size:28px;font-weight:900;color:{color};margin-top:5px'>{_v17_e(value)}</div><div style='font-size:12px;color:#64748b;margin-top:4px'>{note}</div></div></td>"
+
+@frappe.whitelist()
+def render_upper_management_report_html(date_from=None,date_to=None):
+    d=get_upper_management_report_data(date_from,date_to)
+    calls=d.get("calls") or {}; comps=d.get("complaints") or {}; cancels=d.get("cancellations") or {}; target=d.get("target_items") or {}; cq=d.get("complaint_queue") or {}
+    missed_count=calls.get("staff_missed_count") or calls.get("employee_issue_count") or 0
+    issue_html="".join(f"<tr>{_v17_td(r.get('time'))}{_v17_td(r.get('employee'))}{_v17_td(r.get('extension'))}{_v17_td(r.get('caller'))}{_v17_td(r.get('action'),True)}{_v17_td(r.get('duration'))}</tr>" for r in (calls.get("employee_issue_rows") or [])[:80]) or _v17_empty(6,"لا توجد محاولات فائتة على تحويلات الموظفين خلال الفترة")
+    open_html="".join(f"<tr>{_v17_td(r.get('name'))}{_v17_td(r.get('status'))}{_v17_td(r.get('category'))}{_v17_td(r.get('priority'))}{_v17_td(r.get('customer_name'))}{_v17_td(r.get('creation'))}</tr>" for r in (comps.get("open_rows") or [])[:100]) or _v17_empty(6,"لا توجد شكاوى مفتوحة حاليًا")
+    cancel_html="".join(f"<tr>{_v17_td(r.get('cancellation_time'))}{_v17_td(r.get('order_no'))}{_v17_td(r.get('shift'))}{_v17_td(r.get('shift_number') or '')}{_v17_td(r.get('branch'))}{_v17_td(r.get('customer_name'))}{_v17_td(_v17_cancel_reason_public(r.get('reason')))}{_v17_td(r.get('logged_by'))}</tr>" for r in (cancels.get("rows") or [])[:80]) or _v17_empty(8,"لا توجد إلغاءات مسجلة اليوم")
+    today_html="".join(f"<tr>{_v17_td(r.get('creation'))}{_v17_td(r.get('name'))}{_v17_td(r.get('status'))}{_v17_td(r.get('category'))}{_v17_td(r.get('priority'))}{_v17_td(r.get('customer_name'))}</tr>" for r in (comps.get("today_rows") or [])[:80]) or _v17_empty(6,"لا توجد شكاوى جديدة مسجلة اليوم")
+    target_html="".join(f"<tr>{_v17_td(r.get('item'))}{_v17_td(_v17_n(r.get('qty')),True)}{_v17_td(_v17_n(r.get('entries')),True)}</tr>" for r in (target.get("rows") or [])[:80]) or _v17_empty(3,"لا توجد تسجيلات عرض للأصناف المطلوبة خلال الفترة")
+    follow=d.get("followups") or ["لا توجد ملاحظات تحتاج متابعة اليوم."]
+    follow_html="".join(f"<div style='background:#fffbeb;border:1px solid #fde68a;border-radius:10px;padding:9px;margin:6px 0;color:#92400e;font-size:13px'>• {_v17_e(x)}</div>" for x in follow)
+    open_color="#dc2626" if flt(comps.get("open_all") or 0)>0 else "#16a34a"
+    return f"""<!doctype html><html lang='ar' dir='rtl'><head><meta charset='utf-8'></head><body dir='rtl' style='margin:0;background:#f3f4f6;direction:rtl;text-align:right;font-family:Tahoma,Arial,sans-serif;color:#111827'><table dir='rtl' width='100%' style='direction:rtl;text-align:right;background:#f3f4f6'><tr><td align='right' style='padding:16px'><div style='max-width:960px;margin:0 0 0 auto;background:white;border:1px solid #e5e7eb;border-radius:16px;overflow:hidden'><div style='height:8px;background:#1F4E79'></div><div style='padding:18px'><h1 style='margin:0;font-size:22px;color:#0f172a'>مطعم رشدي — تقرير الإدارة العليا</h1><div style='color:#64748b;font-size:13px;margin-top:6px'>الفترة: {_v17_e(d['period']['label'])} | وقت الإصدار: {_v17_e(d['generated_at'])}</div><div style='margin-top:10px;display:inline-block;background:#eff6ff;color:#1d4ed8;border:1px solid #bfdbfe;border-radius:999px;padding:7px 11px;font-weight:bold;font-size:12px'>{_v17_e(d.get('status_label'))}</div><h2 style='font-size:18px;margin:16px 0 8px'>ملخص اليوم</h2><table width='100%' dir='rtl'><tr>{_v17_card('شكاوى مفتوحة حاليًا', _v17_n(comps.get('open_all')), 'كل الشكاوى غير المغلقة وتحتاج متابعة', open_color, '#fef2f2' if flt(comps.get('open_all') or 0)>0 else '#f0fdf4')}{_v17_card('مكالمات واردة على خط الشكاوى', _v17_n(cq.get('count')), 'مكالمة دخلت على خط الشكاوى خلال الفترة', '#2563eb')}{_v17_card('المكالمات التي تم الرد عليها', _v17_n(calls.get('answered')), 'المكالمات المكتملة بالرد خلال الفترة', '#16a34a')}{_v17_card('محاولات فائتة على الموظفين', _v17_n(missed_count), 'محاولات رنت على تحويلات ولم يتم الرد عليها', '#dc2626' if flt(missed_count)>0 else '#1F4E79')}</tr><tr>{_v17_card('شكاوى جديدة اليوم', _v17_n(comps.get('registered_today')), 'المسجلة خلال الفترة', '#f97316')}{_v17_card('إلغاءات اليوم', _v17_n(cancels.get('count')), 'مدخلة يدويًا من الإدارة', '#6f42c1')}{_v17_card('تسجيلات عرض الأصناف المطلوبة', _v17_n(target.get('total_qty')), 'لا تمثل إجمالي مبيعات المطعم', '#f59e0b')}<td style='width:25%;padding:6px'></td></tr></table><div style='border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-top:14px'><h3 style='margin:0 0 8px'>🔴 المطلوب متابعته اليوم</h3>{follow_html}</div><div style='border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-top:14px'><h3 style='margin:0 0 8px'>🔴 الشكاوى المفتوحة حاليًا</h3>{_v17_table(['رقم الشكوى','الحالة','التصنيف','الأولوية','العميل','تاريخ التسجيل'], open_html)}</div><div style='border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-top:14px'><h3 style='margin:0 0 8px'>↩️ الإلغاءات المسجلة اليوم</h3>{_v17_table(['وقت التسجيل','رقم الطلب','الوردية','رقم الوردية','الفرع','اسم العميل','سبب الإلغاء','سجلها'], cancel_html)}</div><div style='border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-top:14px'><h3 style='margin:0 0 8px'>👤 المحاولات الفائتة على الموظفين</h3><div style='color:#64748b;font-size:12px'>المقصود: المكالمة دخلت الطابور ثم رنت على تحويلة موظف ولم يرد، حتى لو تم تحويلها لاحقًا لموظف آخر.</div>{_v17_table(['الوقت','الموظف','التحويلة','رقم العميل','ما حدث','مدة الرن'], issue_html)}</div><div style='border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-top:14px'><h3 style='margin:0 0 8px'>📋 شكاوى جديدة اليوم</h3>{_v17_table(['وقت التسجيل','رقم الشكوى','الحالة','التصنيف','الأولوية','العميل'], today_html)}</div><div style='border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-top:14px'><h3 style='margin:0 0 8px'>🛒 تسجيلات عرض الأصناف المطلوبة</h3>{_v17_table(['الصنف المطلوب عرضه','القطع/التسجيلات','عدد مرات التسجيل'], target_html)}<div style='font-size:12px;color:#64748b;margin-top:8px'>هذا الجزء لا يعرض إجمالي مبيعات المطعم ولا إجمالي الإيراد.</div></div></div></div></td></tr></table></body></html>"""
+
+@frappe.whitelist()
+def preview_upper_management_report(date_from=None,date_to=None,**kwargs):
+    return {"success":True,"html":render_upper_management_report_html(date_from=date_from,date_to=date_to),"data":get_upper_management_report_data(date_from,date_to)}
+
+@frappe.whitelist()
+def debug_employee_missed_rows(date_from=None,date_to=None):
+    sd,ed,_,_=_v17_period(date_from,date_to)
+    d=_v17_staff_missed_attempts(sd,ed)
+    return {"success":True,"date_from":cstr(sd),"date_to":cstr(ed),"count":d.get("total_attempts"),"extensions_count":d.get("extensions_count"),"total_duration":d.get("total_duration"),"grouped":d.get("grouped"),"rows":d.get("rows")[:100]}
+
+@frappe.whitelist()
+def debug_email_send_config(**kwargs):
+    recips,source=_v17_resolve_upper_recipients(kwargs=kwargs)
+    return {"success":True,"upper_recipients_count":len(recips),"upper_recipients":recips,"source":source,"blocked_hidden_recipients":sorted(list(_BLOCKED_REPORT_EMAILS_V17))}
+
+@frappe.whitelist()
+def send_upper_management_report(recipients=None,date_from=None,date_to=None,subject=None,**kwargs):
+    recips,source=_v17_resolve_upper_recipients(direct=recipients,kwargs=kwargs)
+    if not recips: frappe.throw("لم يتم العثور على إيميلات الإدارة العليا بعد الفلترة")
+    subj=subject or kwargs.get('subject') or kwargs.get('email_subject') or f"تقرير الإدارة العليا - مطعم رشدي - {date_from or today()}"
+    frappe.sendmail(recipients=recips, subject=subj, message=render_upper_management_report_html(date_from,date_to), now=True)
+    return {"success":True,"message":f"تم إرسال تقرير الإدارة العليا إلى {len(recips)} مستخدم","recipients":recips,"recipients_count":len(recips),"source":source,"subject":subj}
+
+@frappe.whitelist()
+def verify_cancellations_in_upper_email(date_from=None,date_to=None):
+    data=get_upper_management_report_data(date_from,date_to); html=render_upper_management_report_html(date_from,date_to)
+    return {"success":True,"cancellations_count":(data.get('cancellations') or {}).get('count',0),"open_complaints_all":(data.get('complaints') or {}).get('open_all',0),"missed_attempts_count":(data.get('calls') or {}).get('staff_missed_count',0),"html_has_shift_number":'رقم الوردية' in cstr(html),"html_has_no_busy_declined_note":'Busy/Declined' not in cstr(html) and 'staff_missed' not in cstr(html),"html_has_human_queue_wording":'مكالمات واردة على خط الشكاوى' in cstr(html),"html_has_missed_attempts":'محاولات فائتة على الموظفين' in cstr(html),"html_has_cancellation_section":'الإلغاءات' in cstr(html)}
+# END ROSHDY UPPER EMAIL FINAL V17
+'''
+if start in s and end in s:
+    i=s.index(start); j=s.index(end,i)+len(end); s=s[:i]+patch.strip()+s[j:]
+else:
+    s=s.rstrip()+"\n\n"+patch.strip()+"\n"
+compile(s, str(p), "exec")
+p.write_text(s, encoding="utf-8")
+PY
+
+echo "🧩 Step 4: Patch admin-desk cancellation form to include shift_number"
+python3 - <<'PY'
+from pathlib import Path
+import os
+p=Path(os.environ.get('ADMIN_HTML',''))
+# We use env fallback because this heredoc is executed with shell export below in newer runs.
+if not p or not p.exists():
+    p=Path('/opt/frappe_crm/apps/restaurant_ops/restaurant_ops/www/admin-desk.html')
+if not p.exists():
+    raise SystemExit(0)
+s=p.read_text(encoding='utf-8', errors='ignore')
+marker_a='<!-- BEGIN ROSHDY ADMIN CANCELLATION SHIFT NUMBER V17 -->'
+marker_b='<!-- END ROSHDY ADMIN CANCELLATION SHIFT NUMBER V17 -->'
+while marker_a in s and marker_b in s:
+    i=s.index(marker_a); j=s.index(marker_b,i)+len(marker_b); s=s[:i]+'\n'+s[j:]
+block=r'''
+<!-- BEGIN ROSHDY ADMIN CANCELLATION SHIFT NUMBER V17 -->
+<script>
+(function(){
+ if(window.RoshdyCancelShiftV17)return; window.RoshdyCancelShiftV17=1;
+ function addShiftNumber(){
+   var shift=document.getElementById('c-shift');
+   if(!shift || document.getElementById('c-shift-number')) return;
+   var wrap=document.createElement('div'); wrap.className='field';
+   wrap.innerHTML='<label>رقم الوردية</label><input id="c-shift-number" placeholder="مثال: 1 / 2 / 3">';
+   var parent=shift.closest('.field') || shift.parentElement;
+   if(parent && parent.parentElement) parent.parentElement.insertBefore(wrap, parent.nextSibling);
+ }
+ function patchSave(){
+   if(typeof window.saveCancel==='function' && !window.saveCancel.__shiftV17){
+     var old=window.saveCancel;
+     window.saveCancel=function(){
+       var sn=document.getElementById('c-shift-number');
+       if(sn){
+         var oldApi=window.api;
+         window.api=function(m,args){
+           if(m==='restaurant_ops.api.upper_management_email_api.create_order_cancellation'){
+             args=args||{}; args.shift_number=sn.value.trim();
+           }
+           return oldApi(m,args);
+         };
+         try{return old.apply(this,arguments)} finally {window.api=oldApi;}
+       }
+       return old.apply(this,arguments);
+     };
+     window.saveCancel.__shiftV17=true;
+   }
+ }
+ new MutationObserver(function(){addShiftNumber();patchSave();}).observe(document.body,{childList:true,subtree:true});
+ setInterval(function(){addShiftNumber();patchSave();},1000);
+})();
+</script>
+<!-- END ROSHDY ADMIN CANCELLATION SHIFT NUMBER V17 -->
+'''
+idx=s.lower().rfind('</body>')
+if idx>=0: s=s[:idx]+'\n'+block+'\n'+s[idx:]
+else: s=s.rstrip()+'\n'+block+'\n'
+p.write_text(s, encoding='utf-8')
+PY
+
+echo "🏗️ Step 5: Rewrite cancellation full page with shift_number"
+cat > "$CANCEL_HTML" <<'HTML'
+<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>تقرير الإلغاءات</title><style>*{box-sizing:border-box;font-family:Tahoma,Arial}body{margin:0;background:#eef2f7;direction:rtl;color:#111827}.top{background:#20262d;color:white;padding:14px 22px;border-bottom:4px solid #1F4E79;display:flex;justify-content:space-between;align-items:center}.top a{color:#fff;text-decoration:none;border:1px solid #64748b;border-radius:10px;padding:8px 12px}.wrap{padding:22px;max-width:1500px;margin:auto}.panel{background:#fff;border:1px solid #d8dee9;border-radius:16px;box-shadow:0 10px 28px #0001;margin-bottom:16px;overflow:hidden}.head{padding:14px 16px;border-bottom:1px solid #e5e7eb;display:flex;justify-content:space-between;gap:10px;align-items:center}.body{padding:16px}.grid{display:grid;grid-template-columns:repeat(6,1fr);gap:10px}label{font-weight:800;color:#475569;font-size:12px}input,select,textarea{width:100%;border:1px solid #d1d5db;border-radius:10px;padding:9px}.btn{border:0;border-radius:10px;padding:10px 13px;background:#1F4E79;color:#fff;font-weight:800;cursor:pointer;margin:3px}.green{background:#16a34a}.orange{background:#f97316}.gray{background:#e5e7eb;color:#111827}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px;margin-bottom:16px}.card{background:#fff;border:1px solid #ddd;border-right:5px solid #1F4E79;border-radius:14px;padding:14px;box-shadow:0 5px 18px #0000000d}.card.red{border-right-color:#dc2626}.card.orange{border-right-color:#f97316}.card.green{border-right-color:#16a34a}.num{font-size:30px;color:#1F4E79;font-weight:bold;margin-top:5px}.table{width:100%;border-collapse:collapse;min-width:1100px}.table th{background:#111827;color:#fff;padding:9px}.table td{border:1px solid #e5e7eb;padding:8px}.scroll{overflow:auto}.muted{color:#64748b;font-size:13px}.modal-back{position:fixed;inset:0;background:#0008;display:none;align-items:center;justify-content:center;z-index:50;padding:16px}.modal{background:white;border-radius:16px;width:760px;max-width:100%;max-height:92vh;overflow:auto}.modal h3{background:#111827;color:white;margin:0;padding:13px 15px}.form{padding:14px;display:grid;grid-template-columns:1fr 1fr;gap:10px}.full{grid-column:1/-1}.actions{padding:12px 14px;border-top:1px solid #e5e7eb}.toast{position:fixed;right:18px;bottom:18px;background:#111827;color:white;padding:12px 14px;border-radius:12px;display:none;z-index:80}@media(max-width:900px){.grid,.form{grid-template-columns:1fr 1fr}.wrap{padding:12px}.table{min-width:900px}}@media(max-width:650px){.grid,.form{grid-template-columns:1fr}}@media print{.top,.filters-actions,.btn,.modal-back{display:none!important}.wrap{padding:0}.panel,.card{box-shadow:none}}</style></head><body><div class="top"><b>↩️ تقرير الإلغاءات</b><div><a href="/admin-desk">Admin Desk</a></div></div><div class="wrap"><div class="cards"><div class="card red">إلغاءات الفترة<div class="num" id="total">0</div><div class="muted">حسب الفلاتر المختارة</div></div><div class="card orange">أكثر فرع<div class="num" id="topBranch" style="font-size:20px">--</div></div><div class="card green">أكثر سبب<div class="num" id="topReason" style="font-size:20px">--</div></div></div><div class="panel"><div class="head"><b>الفلاتر</b><button class="btn green" onclick="openForm()">تسجيل إلغاء جديد</button></div><div class="body"><div class="grid"><div><label>من تاريخ</label><input type="date" id="df"></div><div><label>إلى تاريخ</label><input type="date" id="dt"></div><div><label>الفرع</label><select id="branchFilter"><option value="">كل الفروع</option></select></div><div><label>الوردية</label><select id="shiftFilter"><option>All</option><option>صباحية</option><option>مسائية</option><option>ليلية</option><option>غير محدد</option></select></div><div><label>بحث</label><input id="search" placeholder="رقم طلب / رقم وردية / عميل / سبب"></div><div class="filters-actions" style="align-self:end"><button class="btn green" onclick="load()">تحديث</button><button class="btn orange" onclick="window.print()">PDF / طباعة</button><button class="btn" onclick="csv()">CSV Excel</button></div></div></div></div><div class="panel"><div class="head"><b>تفاصيل الإلغاءات</b><span class="muted" id="periodTxt"></span></div><div class="body scroll"><table class="table"><thead><tr><th>وقت التسجيل</th><th>رقم الطلب</th><th>الوردية</th><th>رقم الوردية</th><th>الفرع</th><th>اسم العميل</th><th>رقم العميل</th><th>سبب الإلغاء</th><th>ملاحظات</th><th>سجلها</th></tr></thead><tbody id="rows"></tbody></table></div></div></div><div id="modalBack" class="modal-back"><div class="modal"><h3>تسجيل إلغاء طلب</h3><div class="form"><div><label>رقم الطلب *</label><input id="c_order"></div><div><label>الوردية *</label><select id="c_shift"><option>صباحية</option><option>مسائية</option><option>ليلية</option><option>غير محدد</option></select></div><div><label>رقم الوردية</label><input id="c_shift_number" placeholder="مثال: 1 / 2 / 3"></div><div><label>الفرع *</label><select id="c_branch"><option value="">اختر الفرع</option></select></div><div><label>اسم العميل</label><input id="c_customer"></div><div><label>رقم العميل</label><input id="c_phone"></div><div class="full"><label>سبب الإلغاء *</label><select id="c_reason"><option value="">اختر سبب الإلغاء</option><option>العميل غيّر رأيه</option><option>عدم رغبة العميل في استكمال الطلب</option><option>تأخير في التوصيل</option><option>عدم توفر صنف</option><option>خطأ في الطلب</option><option>السعر غير مناسب</option><option>العميل لم يرد للتأكيد</option><option>طلب مكرر</option><option>أخرى</option></select></div><div class="full"><label>ملاحظات</label><textarea id="c_notes" rows="3"></textarea></div></div><div class="actions"><button class="btn green" onclick="save()">حفظ</button><button class="btn gray" onclick="closeForm()">إغلاق</button></div></div></div><div id="toast" class="toast"></div><script>let last=null,branches=[];function qs(o){let p=new URLSearchParams();Object.keys(o||{}).forEach(k=>{let v=o[k];if(v!==undefined&&v!==null&&v!==''&&v!=='All')p.append(k,v)});return p.toString()}async function api(m,args){let q=qs(args||{});let r=await fetch('/api/method/'+m+(q?'?'+q:''),{method:'GET',credentials:'same-origin',cache:'no-store'});let j=await r.json();if(j.exc)throw j;return j.message||j}function today(){return new Date().toISOString().slice(0,10)}function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function toast(x){let t=document.getElementById('toast');t.textContent=x;t.style.display='block';setTimeout(()=>t.style.display='none',3500)}async function loadBranches(){let r=await api('restaurant_ops.api.upper_management_email_api.list_cancellation_branches');branches=(r&&r.branches)||[];let opts='<option value="">كل الفروع</option>'+branches.map(b=>'<option value="'+esc(b.value)+'">'+esc(b.label)+'</option>').join('');branchFilter.innerHTML=opts;c_branch.innerHTML='<option value="">اختر الفرع</option>'+branches.map(b=>'<option value="'+esc(b.value)+'">'+esc(b.label)+'</option>').join('')}async function load(){last=await api('restaurant_ops.api.upper_management_email_api.list_order_cancellations',{date_from:df.value,date_to:dt.value,branch:branchFilter.value,shift:shiftFilter.value,search:search.value});total.textContent=last.count||0;periodTxt.textContent='الفترة: '+df.value+' إلى '+dt.value;topBranch.textContent=(last.by_branch&&last.by_branch[0])?last.by_branch[0].branch:'--';topReason.textContent=(last.by_reason&&last.by_reason[0])?last.by_reason[0].reason:'--';let rs=last.rows||[];rows.innerHTML=rs.length?rs.map(r=>'<tr><td>'+esc(r.cancellation_time)+'</td><td>'+esc(r.order_no)+'</td><td>'+esc(r.shift)+'</td><td>'+esc(r.shift_number||'')+'</td><td>'+esc(r.branch)+'</td><td>'+esc(r.customer_name)+'</td><td>'+esc(r.customer_phone)+'</td><td>'+esc(r.reason)+'</td><td>'+esc(r.notes)+'</td><td>'+esc(r.logged_by)+'</td></tr>').join(''):'<tr><td colspan="10" style="text-align:center;color:#64748b;background:#f8fafc">لا توجد إلغاءات</td></tr>'}function openForm(){modalBack.style.display='flex'}function closeForm(){modalBack.style.display='none'}modalBack.onclick=e=>{if(e.target.id==='modalBack')closeForm()};async function save(){let args={order_no:c_order.value.trim(),shift:c_shift.value,shift_number:c_shift_number.value.trim(),branch:c_branch.value,customer_name:c_customer.value.trim(),customer_phone:c_phone.value.trim(),reason:c_reason.value,notes:c_notes.value.trim()};if(!args.order_no||!args.branch||!args.reason){toast('رقم الطلب والفرع وسبب الإلغاء مطلوبين');return}let r=await api('restaurant_ops.api.upper_management_email_api.create_order_cancellation',args);if(r&&r.success){toast('تم تسجيل الإلغاء');closeForm();load()}else toast('فشل التسجيل')}function csv(){if(!last)return;let header=['وقت التسجيل','رقم الطلب','الوردية','رقم الوردية','الفرع','اسم العميل','رقم العميل','سبب الإلغاء','ملاحظات','سجلها'];let lines=[header.join(',')].concat((last.rows||[]).map(r=>[r.cancellation_time,r.order_no,r.shift,r.shift_number||'',r.branch,r.customer_name,r.customer_phone,r.reason,r.notes,r.logged_by].map(x=>'"'+String(x||'').replace(/"/g,'""')+'"').join(',')));let blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'});let a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='order-cancellations.csv';a.click()}df.value=today();dt.value=today();loadBranches().then(load);</script></body></html>
+HTML
+
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+if [[ -n "$APP_OWNER" ]]; then
+  chown "$APP_OWNER" "$UPPER_API" "$ADMIN_HTML" "$CANCEL_HTML" 2>/dev/null || true
+fi
+
+echo "🧹 Step 6: Clear cache + restart app services"
+bench_exec clear-cache || true
+"${COMPOSE[@]}" restart backend frontend websocket queue-short queue-long scheduler >/dev/null
+sleep 8
+bench_exec clear-cache || true
+
+echo "🧪 Step 7: Page smoke checks"
+set +e
+for p in admin-desk order-cancellations-report email-report-customizer call-report break-admin my-break agent-desk; do
+  code="$(curl -k -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$p" 2>/dev/null || echo 000)"
+  echo "$p => $code" | tee -a "$BACKUP_DIR/page_smoke_checks_v17.txt"
+done
+set -e
+
+if ! grep -q "order-cancellations-report => 200" "$BACKUP_DIR/page_smoke_checks_v17.txt" || ! grep -q "admin-desk => 200" "$BACKUP_DIR/page_smoke_checks_v17.txt"; then
+  echo "❌ Critical page failed. Restore from: $BACKUP_DIR"
+  exit 1
+fi
+
+echo "🧪 Step 8: Backend validation"
+set +e
+bench_exec execute restaurant_ops.api.upper_management_email_api.debug_employee_missed_rows | tee "$BACKUP_DIR/debug_employee_missed_rows_v17.txt"
+V1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.upper_management_email_api.verify_cancellations_in_upper_email | tee "$BACKUP_DIR/email_verify_v17.txt"
+V2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.upper_management_email_api.list_order_cancellations | tee "$BACKUP_DIR/cancellations_v17.txt"
+V3=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.upper_management_email_api.debug_email_send_config | tee "$BACKUP_DIR/email_debug_v17.txt"
+V4=${PIPESTATUS[0]}
+set -e
+
+if [[ $V1 -ne 0 || $V2 -ne 0 || $V3 -ne 0 || $V4 -ne 0 ]]; then
+  echo "❌ Backend validation failed. راجع: $BACKUP_DIR"
+  exit 1
+fi
+
+echo "🏥 Step 9: Health Check - Elastix/CDR/AMI + Queue + Call Report"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$BACKUP_DIR/health_asterisk_bridge.txt"
+H1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status | tee "$BACKUP_DIR/health_queue_status.txt"
+H2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' | tee "$BACKUP_DIR/health_call_report.txt"
+H3=${PIPESTATUS[0]}
+set -e
+
+if [[ $H1 -ne 0 || $H2 -ne 0 || $H3 -ne 0 ]]; then
+  echo "⚠️ Health returned non-zero. راجع: $BACKUP_DIR"
+else
+  echo "✅ Health checks OK"
+fi
+
+echo "============================================================"
+echo "✅ DONE FINAL V17"
+echo "📦 Backup folder: $BACKUP_DIR"
+echo "👤 Upper email now uses same missed-attempt source as Center report"
+echo "📊 Upper email wording/order polished and technical Busy/Declined note removed"
+echo "↩️ Cancellation shift_number added everywhere"
+echo "🛡️ report_api.py / Elastix / CDR / AMI untouched"
+echo "============================================================"

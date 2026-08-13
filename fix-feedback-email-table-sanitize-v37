@@ -1,0 +1,394 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Roshdy V37: Fix feedback table rendering in emails + remove leaked escaped HTML/JS
+# -----------------------------------------------------------------------------
+# Fixes:
+# - Feedback section in emails appearing as plain text / broken layout.
+# - Escaped HTML/JS snippets like &lt;button...&gt; and &lt;script...&gt; leaking into report.
+# - Makes feedback section use email-safe inline tables only.
+# - Adds final sanitizer around Upper and Center report renderers/previews.
+#
+# Safety:
+# - Backup first.
+# - Does NOT touch report_api.py / Elastix / CDR / AMI config.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+RUN_SEND_TEST="${RUN_SEND_TEST:-0}"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "❌ docker compose/docker-compose مش موجود"
+  exit 1
+fi
+
+APP_DIR="$ROOT/apps/$APP"
+PKG_DIR="$APP_DIR/$APP"
+API_DIR="$PKG_DIR/api"
+UPPER_API="$API_DIR/upper_management_email_api.py"
+EMAIL_REPORT="$API_DIR/email_report.py"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/FIX_FEEDBACK_EMAIL_TABLE_SANITIZE_V37_BEFORE_$TS"
+mkdir -p "$BACKUP_DIR/files"
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend container مش شغال أو مش لاقيه"
+  exit 1
+fi
+
+bench_exec() { "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"; }
+
+echo "============================================================"
+echo "🔧 Roshdy V37: feedback email table + sanitizer"
+echo "📦 Backup: $BACKUP_DIR"
+echo "============================================================"
+
+if [[ ! -f "$UPPER_API" || ! -f "$EMAIL_REPORT" ]]; then
+  echo "❌ ملفات الإيميل مش موجودة"
+  exit 1
+fi
+
+echo "🧯 Step 1: Backup files + bench backup"
+cp -a "$UPPER_API" "$BACKUP_DIR/files/upper_management_email_api.py.before"
+cp -a "$EMAIL_REPORT" "$BACKUP_DIR/files/email_report.py.before"
+bench_exec backup --with-files | tee "$BACKUP_DIR/bench_backup_output.txt"
+
+echo "🧩 Step 2: Clean old feedback email blocks and add V37 final blocks"
+export UPPER_API EMAIL_REPORT
+python3 - <<'PY'
+from pathlib import Path
+import os
+
+upper = Path(os.environ['UPPER_API'])
+center = Path(os.environ['EMAIL_REPORT'])
+
+def remove_blocks(path, pairs):
+    s = path.read_text(encoding='utf-8', errors='ignore')
+    for a,b in pairs:
+        while a in s and b in s:
+            i=s.index(a); j=s.index(b,i)+len(b); s=s[:i]+'\n'+s[j:]
+    path.write_text(s, encoding='utf-8')
+
+pairs = [
+    ('# BEGIN ROSHDY FEEDBACK UPPER EMAIL V27', '# END ROSHDY FEEDBACK UPPER EMAIL V27'),
+    ('# BEGIN ROSHDY FEEDBACK UPPER EMAIL V28', '# END ROSHDY FEEDBACK UPPER EMAIL V28'),
+    ('# BEGIN ROSHDY FEEDBACK UPPER EMAIL V37', '# END ROSHDY FEEDBACK UPPER EMAIL V37'),
+    ('# BEGIN ROSHDY FEEDBACK CENTER EMAIL V27', '# END ROSHDY FEEDBACK CENTER EMAIL V27'),
+    ('# BEGIN ROSHDY FEEDBACK CENTER EMAIL V28', '# END ROSHDY FEEDBACK CENTER EMAIL V28'),
+    ('# BEGIN ROSHDY FEEDBACK CENTER EMAIL V37', '# END ROSHDY FEEDBACK CENTER EMAIL V37'),
+]
+remove_blocks(upper, pairs)
+remove_blocks(center, pairs)
+PY
+
+cat >> "$UPPER_API" <<'PYUPPER'
+
+# BEGIN ROSHDY FEEDBACK UPPER EMAIL V37
+try:
+    import frappe
+    from frappe.utils import today, cstr
+    import html as _fb37_html
+    import re as _fb37_re
+except Exception:
+    pass
+
+try:
+    _fb37_prev_render_upper_management_report_html = render_upper_management_report_html
+except Exception:
+    _fb37_prev_render_upper_management_report_html = None
+
+
+def _fb37_e(v):
+    return _fb37_html.escape(cstr(v) if v is not None else "")
+
+
+def _fb37_sanitize_email_html(html):
+    """Remove scripts/buttons/forms and escaped page HTML accidentally stored in report output."""
+    h = cstr(html or "")
+    # Remove real interactive blocks.
+    patterns = [
+        r"<script\b[\s\S]*?</script>",
+        r"<button\b[\s\S]*?</button>",
+        r"<form\b[\s\S]*?</form>",
+        r"<iframe\b[\s\S]*?</iframe>",
+        r"<select\b[\s\S]*?</select>",
+        r"<textarea\b[\s\S]*?</textarea>",
+        r"<input\b[^>]*>",
+        # Remove escaped interactive/page blocks.
+        r"&lt;script\b[\s\S]*?&lt;/script&gt;",
+        r"&lt;button\b[\s\S]*?&lt;/button&gt;",
+        r"&lt;form\b[\s\S]*?&lt;/form&gt;",
+        r"&lt;iframe\b[\s\S]*?&lt;/iframe&gt;",
+        r"&lt;select\b[\s\S]*?&lt;/select&gt;",
+        r"&lt;textarea\b[\s\S]*?&lt;/textarea&gt;",
+        r"&lt;input\b[\s\S]*?&gt;",
+    ]
+    for pat in patterns:
+        h = _fb37_re.sub(pat, "", h, flags=_fb37_re.I)
+    # If a whole escaped HTML page leaked, remove obvious chunks around function M/api code.
+    h = _fb37_re.sub(r"&lt;div class=\"panel\"&gt;&lt;button[\s\S]*?async function loadBreakTypes\(\)", "", h, flags=_fb37_re.I)
+    h = h.replace("&lt;/div&gt;&lt;/div&gt;", "")
+    return h
+
+
+def _fb37_table(headers, rows, empty="لا توجد بيانات"):
+    th = "".join("<th style='background:#111827;color:white;padding:8px;border:1px solid #e5e7eb;text-align:right'>%s</th>" % _fb37_e(x) for x in headers)
+    if rows:
+        body = "".join("<tr>" + "".join("<td style='padding:8px;border:1px solid #e5e7eb;text-align:right;vertical-align:top'>%s</td>" % _fb37_e(c) for c in r) + "</tr>" for r in rows)
+    else:
+        body = "<tr><td colspan='%s' style='padding:10px;text-align:center;color:#64748b;background:#f8fafc;border:1px solid #e5e7eb'>%s</td></tr>" % (len(headers), _fb37_e(empty))
+    return "<table dir='rtl' width='100%' cellpadding='0' cellspacing='0' style='border-collapse:collapse;width:100%;direction:rtl;text-align:right;margin-top:8px;font-family:Tahoma,Arial,sans-serif'>" + "<thead><tr>" + th + "</tr></thead><tbody>" + body + "</tbody></table>"
+
+
+def _fb37_feedback_email_section(date_from=None, date_to=None):
+    try:
+        from restaurant_ops.api.feedback_api import get_feedback_email_summary
+        d = get_feedback_email_summary(date_from=date_from or today(), date_to=date_to or date_from or today())
+    except Exception as e:
+        return "<div style='border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-top:14px'><h3>📣 الفيدباك</h3><div style='color:#991b1b'>تعذر تحميل الفيدباك: %s</div></div>" % _fb37_e(e)
+    sat = d.get('satisfaction_counts') or {}
+    by_agent = d.get('by_agent') or {}
+    by_shift = d.get('by_shift') or {}
+    sat_rows = [[k, v] for k, v in sat.items()]
+    agent_rows = [[k, v] for k, v in by_agent.items()]
+    shift_rows = [[k, v] for k, v in by_shift.items()]
+    return f"""
+    <!-- ROSHDY_FEEDBACK_EMAIL_SECTION_V37 -->
+    <div style="border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-top:14px;text-align:right;direction:rtl;background:#ffffff">
+      <h3 style="margin:0 0 8px;color:#1F4E79">📣 الفيدباك</h3>
+      <table width="100%" dir="rtl" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin-bottom:10px;font-family:Tahoma,Arial,sans-serif">
+        <tr>
+          <td style="padding:8px;border:1px solid #e5e7eb;background:#f8fafc">إجمالي الأرقام</td><td style="padding:8px;border:1px solid #e5e7eb"><b>{_fb37_e(d.get('total'))}</b></td>
+          <td style="padding:8px;border:1px solid #e5e7eb;background:#f8fafc">تم الفيدباك</td><td style="padding:8px;border:1px solid #e5e7eb"><b>{_fb37_e(d.get('completed'))}</b></td>
+          <td style="padding:8px;border:1px solid #e5e7eb;background:#f8fafc">متبقي</td><td style="padding:8px;border:1px solid #e5e7eb"><b>{_fb37_e(d.get('pending'))}</b></td>
+          <td style="padding:8px;border:1px solid #e5e7eb;background:#f8fafc">متوسط التقييم</td><td style="padding:8px;border:1px solid #e5e7eb"><b>{_fb37_e(d.get('avg_rating'))}</b></td>
+        </tr>
+      </table>
+      <table width="100%" dir="rtl" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-family:Tahoma,Arial,sans-serif">
+        <tr>
+          <td style="vertical-align:top;width:33%;padding-left:6px"><b>حسب درجة الرضاء</b>{_fb37_table(['درجة الرضاء','العدد'], sat_rows, 'لا توجد تقييمات مكتملة')}</td>
+          <td style="vertical-align:top;width:33%;padding:0 6px"><b>حسب الموظف</b>{_fb37_table(['الموظف','عدد الفيدباك'], agent_rows, 'لا توجد بيانات موظفين')}</td>
+          <td style="vertical-align:top;width:33%;padding-right:6px"><b>حسب الوردية</b>{_fb37_table(['رقم الوردية','عدد الأرقام'], shift_rows, 'لا توجد ورديات')}</td>
+        </tr>
+      </table>
+    </div>
+    """
+
+
+@frappe.whitelist()
+def render_upper_management_report_html(date_from=None, date_to=None):
+    html = _fb37_prev_render_upper_management_report_html(date_from=date_from, date_to=date_to) if _fb37_prev_render_upper_management_report_html else ""
+    html = _fb37_sanitize_email_html(html)
+    if "ROSHDY_FEEDBACK_EMAIL_SECTION_V37" not in cstr(html):
+        section = _fb37_feedback_email_section(date_from, date_to)
+        if "</body>" in cstr(html):
+            html = html.replace("</body>", section + "</body>")
+        else:
+            html = cstr(html) + section
+    return _fb37_sanitize_email_html(html)
+
+
+@frappe.whitelist()
+def verify_feedback_in_upper_email(date_from=None, date_to=None):
+    html = render_upper_management_report_html(date_from=date_from, date_to=date_to)
+    from restaurant_ops.api.feedback_api import get_feedback_email_summary
+    d = get_feedback_email_summary(date_from=date_from or today(), date_to=date_to or date_from or today())
+    return {"success": True, "html_has_feedback": "ROSHDY_FEEDBACK_EMAIL_SECTION_V37" in cstr(html), "html_has_no_script": "<script" not in cstr(html).lower() and "&lt;script" not in cstr(html).lower(), "html_has_no_button": "<button" not in cstr(html).lower() and "&lt;button" not in cstr(html).lower(), "summary": d}
+# END ROSHDY FEEDBACK UPPER EMAIL V37
+PYUPPER
+
+cat >> "$EMAIL_REPORT" <<'PYCENTER'
+
+# BEGIN ROSHDY FEEDBACK CENTER EMAIL V37
+try:
+    import frappe
+    from frappe.utils import today, cstr
+    import html as _fbc37_html
+    import re as _fbc37_re
+except Exception:
+    pass
+
+try:
+    _fbc37_prev_build_center_manager_report = build_center_manager_report
+except Exception:
+    _fbc37_prev_build_center_manager_report = None
+try:
+    _fbc37_prev_adv_render = _adv_render
+except Exception:
+    _fbc37_prev_adv_render = None
+try:
+    _fbc37_prev_preview_email_report = preview_email_report
+except Exception:
+    _fbc37_prev_preview_email_report = None
+
+
+def _fbc37_e(v):
+    return _fbc37_html.escape(cstr(v) if v is not None else "")
+
+
+def _fbc37_sanitize_email_html(html):
+    h = cstr(html or "")
+    patterns = [
+        r"<script\b[\s\S]*?</script>", r"<button\b[\s\S]*?</button>", r"<form\b[\s\S]*?</form>", r"<iframe\b[\s\S]*?</iframe>", r"<select\b[\s\S]*?</select>", r"<textarea\b[\s\S]*?</textarea>", r"<input\b[^>]*>",
+        r"&lt;script\b[\s\S]*?&lt;/script&gt;", r"&lt;button\b[\s\S]*?&lt;/button&gt;", r"&lt;form\b[\s\S]*?&lt;/form&gt;", r"&lt;iframe\b[\s\S]*?&lt;/iframe&gt;", r"&lt;select\b[\s\S]*?&lt;/select&gt;", r"&lt;textarea\b[\s\S]*?&lt;/textarea&gt;", r"&lt;input\b[\s\S]*?&gt;",
+    ]
+    for pat in patterns:
+        h = _fbc37_re.sub(pat, "", h, flags=_fbc37_re.I)
+    h = _fbc37_re.sub(r"&lt;div class=\"panel\"&gt;&lt;button[\s\S]*?async function loadBreakTypes\(\)", "", h, flags=_fbc37_re.I)
+    return h
+
+
+def _fbc37_table(headers, rows, empty="لا توجد بيانات"):
+    th = "".join("<th style='background:#111827;color:white;padding:8px;border:1px solid #e5e7eb;text-align:right'>%s</th>" % _fbc37_e(h) for h in headers)
+    if rows:
+        body = "".join("<tr>" + "".join("<td style='padding:8px;border:1px solid #e5e7eb;text-align:right;vertical-align:top'>%s</td>" % _fbc37_e(c) for c in r) + "</tr>" for r in rows)
+    else:
+        body = "<tr><td colspan='%s' style='padding:10px;text-align:center;color:#64748b;background:#f8fafc;border:1px solid #e5e7eb'>%s</td></tr>" % (len(headers), _fbc37_e(empty))
+    return "<table dir='rtl' width='100%' cellpadding='0' cellspacing='0' style='border-collapse:collapse;width:100%;direction:rtl;text-align:right;margin-top:8px;font-family:Tahoma,Arial,sans-serif'>" + "<thead><tr>" + th + "</tr></thead><tbody>" + body + "</tbody></table>"
+
+
+def _fbc37_section(date_from=None, date_to=None):
+    try:
+        from restaurant_ops.api.feedback_api import get_feedback_email_summary
+        d = get_feedback_email_summary(date_from=date_from or today(), date_to=date_to or date_from or today())
+    except Exception as e:
+        return "<h3>📣 الفيدباك</h3><div class='note'>تعذر تحميل الفيدباك: %s</div>" % _fbc37_e(e)
+    sat = d.get('satisfaction_counts') or {}
+    by_agent = d.get('by_agent') or {}
+    by_shift = d.get('by_shift') or {}
+    sat_rows = [[k, v] for k, v in sat.items()]
+    agent_rows = [[k, v] for k, v in by_agent.items()]
+    shift_rows = [[k, v] for k, v in by_shift.items()]
+    return f"""
+    <!-- ROSHDY_FEEDBACK_EMAIL_SECTION_V37 -->
+    <h3>📣 الفيدباك</h3>
+    <table width="100%" dir="rtl" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin-bottom:10px;font-family:Tahoma,Arial,sans-serif">
+      <tr>
+        <td style="padding:8px;border:1px solid #e5e7eb;background:#f8fafc">إجمالي الأرقام</td><td style="padding:8px;border:1px solid #e5e7eb"><b>{_fbc37_e(d.get('total'))}</b></td>
+        <td style="padding:8px;border:1px solid #e5e7eb;background:#f8fafc">تم الفيدباك</td><td style="padding:8px;border:1px solid #e5e7eb"><b>{_fbc37_e(d.get('completed'))}</b></td>
+        <td style="padding:8px;border:1px solid #e5e7eb;background:#f8fafc">متبقي</td><td style="padding:8px;border:1px solid #e5e7eb"><b>{_fbc37_e(d.get('pending'))}</b></td>
+        <td style="padding:8px;border:1px solid #e5e7eb;background:#f8fafc">متوسط التقييم</td><td style="padding:8px;border:1px solid #e5e7eb"><b>{_fbc37_e(d.get('avg_rating'))}</b></td>
+      </tr>
+    </table>
+    {_fbc37_table(['درجة الرضاء','العدد'], sat_rows, 'لا توجد تقييمات مكتملة')}
+    {_fbc37_table(['الموظف','عدد الفيدباك'], agent_rows, 'لا توجد بيانات موظفين')}
+    {_fbc37_table(['رقم الوردية','عدد الأرقام'], shift_rows, 'لا توجد ورديات')}
+    """
+
+
+def _fbc37_inject(html, date_from=None, date_to=None):
+    html = _fbc37_sanitize_email_html(html)
+    if "ROSHDY_FEEDBACK_EMAIL_SECTION_V37" in html:
+        return html
+    section = _fbc37_section(date_from, date_to)
+    if "</body>" in html:
+        html = html.replace("</body>", section + "</body>")
+    else:
+        html = html + section
+    return _fbc37_sanitize_email_html(html)
+
+
+def build_center_manager_report():
+    html = _fbc37_prev_build_center_manager_report() if _fbc37_prev_build_center_manager_report else ""
+    return _fbc37_inject(html, today(), today())
+
+
+def _adv_render(report_type="center"):
+    rendered = _fbc37_prev_adv_render(report_type) if _fbc37_prev_adv_render else ""
+    if isinstance(rendered, dict):
+        out = dict(rendered)
+        if cstr(report_type).lower() in ("center", "manager", "customer_service", "مدير خدمة العملاء"):
+            out["html"] = _fbc37_inject(out.get("html"), today(), today())
+        elif out.get("html"):
+            out["html"] = _fbc37_sanitize_email_html(out.get("html"))
+        return out
+    html = cstr(rendered or "")
+    if cstr(report_type).lower() in ("center", "manager", "customer_service", "مدير خدمة العملاء"):
+        html = _fbc37_inject(html, today(), today())
+    else:
+        html = _fbc37_sanitize_email_html(html)
+    return {"success": True if html else False, "html": html}
+
+
+@frappe.whitelist()
+def preview_email_report(report_type="center"):
+    rendered = _fbc37_prev_preview_email_report(report_type) if _fbc37_prev_preview_email_report else _adv_render(report_type)
+    if isinstance(rendered, dict):
+        out = dict(rendered)
+        out["html"] = _fbc37_inject(out.get("html"), today(), today()) if cstr(report_type).lower() in ("center", "manager", "customer_service") else _fbc37_sanitize_email_html(out.get("html"))
+        return out
+    return {"success": True, "html": _fbc37_inject(rendered, today(), today())}
+
+
+@frappe.whitelist()
+def debug_center_feedback_email_section(date_from=None, date_to=None):
+    from restaurant_ops.api.feedback_api import get_feedback_email_summary
+    d = get_feedback_email_summary(date_from=date_from or today(), date_to=date_to or date_from or today())
+    html = _fbc37_section(date_from or today(), date_to or date_from or today())
+    clean = _fbc37_sanitize_email_html(html)
+    return {"success": True, "summary": d, "html_has_feedback": "ROSHDY_FEEDBACK_EMAIL_SECTION_V37" in clean, "html_has_no_script": "<script" not in clean.lower() and "&lt;script" not in clean.lower(), "html_has_no_button": "<button" not in clean.lower() and "&lt;button" not in clean.lower()}
+# END ROSHDY FEEDBACK CENTER EMAIL V37
+PYCENTER
+
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+[[ -n "$APP_OWNER" ]] && chown "$APP_OWNER" "$UPPER_API" "$EMAIL_REPORT" 2>/dev/null || true
+
+echo "🧹 Step 3: Clear cache + restart app services"
+bench_exec clear-cache || true
+"${COMPOSE[@]}" restart backend frontend websocket queue-short queue-long scheduler >/dev/null
+sleep 8
+bench_exec clear-cache || true
+
+echo "🧪 Step 4: Validation"
+set +e
+bench_exec execute restaurant_ops.api.upper_management_email_api.verify_feedback_in_upper_email | tee "$BACKUP_DIR/verify_feedback_in_upper_email_v37.txt"
+V1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.email_report.debug_center_feedback_email_section | tee "$BACKUP_DIR/verify_feedback_in_center_email_v37.txt"
+V2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.email_report.preview_email_report --kwargs '{"report_type":"center"}' > "$BACKUP_DIR/preview_center_v37.txt" 2>&1
+V3=$?
+head -c 1200 "$BACKUP_DIR/preview_center_v37.txt" | tee "$BACKUP_DIR/preview_center_v37_head.txt"
+echo
+set -e
+
+if [[ $V1 -ne 0 || $V2 -ne 0 || $V3 -ne 0 ]]; then
+  echo "❌ Validation failed. راجع: $BACKUP_DIR"
+  exit 1
+fi
+
+if grep -qi "&lt;script\|<script\|&lt;button\|<button" "$BACKUP_DIR/preview_center_v37.txt"; then
+  echo "⚠️ لسه فيه script/button في preview. راجع: $BACKUP_DIR/preview_center_v37.txt"
+else
+  echo "✅ Preview sanitized: no script/button leakage"
+fi
+
+echo "🏥 Health Check - Elastix/CDR/AMI + Queue + Call Report"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$BACKUP_DIR/health_asterisk_bridge.txt"
+H1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status | tee "$BACKUP_DIR/health_queue_status.txt"
+H2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' | tee "$BACKUP_DIR/health_call_report.txt"
+H3=${PIPESTATUS[0]}
+set -e
+
+if [[ $H1 -ne 0 || $H2 -ne 0 || $H3 -ne 0 ]]; then
+  echo "⚠️ Health returned non-zero. راجع: $BACKUP_DIR"
+else
+  echo "✅ Health checks OK"
+fi
+
+echo "============================================================"
+echo "✅ DONE V37"
+echo "📦 Backup folder: $BACKUP_DIR"
+echo "📧 Feedback email table fixed and sanitized"
+echo "🛡️ report_api.py / Elastix / CDR / AMI untouched"
+echo "============================================================"

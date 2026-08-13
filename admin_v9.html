@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>لوحة إدارة الكول سنتر | مطعم رشدي</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;font-family:'Segoe UI',Tahoma,Arial,sans-serif}
+:root{--blue:#1F4E79;--dark:#24292e;--side:#2b3137;--bg:#f4f7f6;--border:#e1e4e8;--green:#16a34a;--red:#dc3545;--orange:#fd7e14;--purple:#6f42c1}
+body{background:var(--bg);color:#222;min-height:100vh;direction:rtl;overflow-x:hidden}.app-header{height:64px;background:var(--dark);color:#fff;padding:0 22px;display:flex;justify-content:space-between;align-items:center;border-bottom:3.5px solid var(--blue);box-shadow:0 2px 8px rgba(0,0,0,.16);position:sticky;top:0;z-index:50}.logo{font-size:20px;font-weight:900;display:flex;align-items:center;gap:10px}.user-info{display:flex;align-items:center;gap:12px;font-size:14px}.badge-admin{background:#d29922;color:white;padding:5px 12px;border-radius:20px;font-size:13px;font-weight:900}.btn-logout,.head-btn{background:transparent;border:1.5px solid rgba(255,255,255,.62);color:white;padding:7px 12px;border-radius:8px;cursor:pointer;font-size:13px;font-weight:900}.head-btn{background:#111827;border-color:#394150}.admin-layout{display:grid;grid-template-columns:240px 1fr;min-height:calc(100vh - 64px);transition:.22s}.admin-layout.side-collapsed{grid-template-columns:62px 1fr}.admin-sidebar{background:var(--side);color:white;padding:18px 13px;min-height:calc(100vh - 64px);transition:.22s;overflow:hidden}.admin-layout.side-collapsed .admin-sidebar a span,.admin-layout.side-collapsed .admin-sidebar h5{display:none}.admin-layout.side-collapsed .admin-sidebar a{text-align:center;padding:13px 6px;font-size:0}.admin-layout.side-collapsed .admin-sidebar a b{font-size:18px}.admin-sidebar h5{color:#8b949e;font-size:12px;text-transform:uppercase;margin:18px 0 10px;letter-spacing:.5px}.admin-sidebar a{display:block;padding:12px 14px;color:#c9d1d9;text-decoration:none;border-radius:8px;font-size:14px;margin-bottom:5px;transition:.16s;white-space:nowrap}.admin-sidebar a:hover{background:rgba(255,255,255,.1);color:white}.admin-sidebar a.active{background:var(--blue);color:white;font-weight:900}.main-content{padding:28px;min-width:0}.page-title{font-size:25px;font-weight:900;color:var(--blue);margin-bottom:22px;text-align:center}.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:18px;margin-bottom:28px}.stat-card{background:white;border-radius:13px;padding:20px 17px;box-shadow:0 4px 13px rgba(0,0,0,.055);border-right:5px solid;text-align:right;min-height:108px}.stat-card.blue{border-color:var(--blue)}.stat-card.green{border-color:var(--green)}.stat-card.red{border-color:var(--red)}.stat-card.orange{border-color:var(--orange)}.stat-card.purple{border-color:var(--purple)}.stat-card .label{color:#666;font-size:14px;margin-bottom:8px;font-weight:700}.stat-card .value{font-size:31px;font-weight:900;color:var(--blue)}.cards-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(215px,1fr));gap:20px}.mod-card{background:white;border:2px solid var(--border);border-radius:14px;padding:28px 14px;text-align:center;cursor:pointer;transition:.22s;text-decoration:none;color:inherit;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:146px}.mod-card:hover{transform:translateY(-4px);box-shadow:0 12px 28px rgba(31,78,121,.15);border-color:var(--blue)}.mod-card .icon{font-size:43px;margin-bottom:12px}.mod-card .lbl{font-weight:900;font-size:16px;color:#222}.mod-card .desc{font-size:12px;color:#777;margin-top:6px}.mod-card.warn{border-color:#fde68a}.mod-card.green{border-color:#bbf7d0}.mod-card .mini-badge{position:absolute;background:#0f4c81;color:#fff;border-radius:999px;min-width:24px;height:24px;display:inline-flex;align-items:center;justify-content:center;font-size:12px;font-weight:900;margin-top:-116px;margin-right:145px}#global-queue-widget{position:fixed;left:22px;bottom:22px;z-index:90;background:#14532d;color:#fff;border:2px solid rgba(255,255,255,.92);border-radius:16px;box-shadow:0 12px 34px rgba(0,0,0,.35);padding:13px 15px;min-width:255px;direction:rtl;display:flex;align-items:center;gap:12px;transition:.2s}#global-queue-widget .gq-ico{font-size:31px}#global-queue-widget .gq-title{font-size:14px;font-weight:900;margin-bottom:3px}#global-queue-widget .gq-line{font-size:13px;opacity:.96}#global-queue-widget b{font-family:Consolas,monospace;background:rgba(255,255,255,.16);padding:1px 7px;border-radius:7px;margin:0 2px}#global-queue-widget.alert{background:#c0392b}@keyframes gqShake{0%{transform:translate(1px,1px) rotate(0)}20%{transform:translate(-2px,0) rotate(1deg)}40%{transform:translate(1px,-1px) rotate(1deg)}60%{transform:translate(-2px,1px) rotate(0)}80%{transform:translate(-1px,-1px) rotate(1deg)}100%{transform:translate(1px,-2px) rotate(-1deg)}}#global-queue-widget.shake{animation:gqShake .62s infinite}.bell-wrap{position:relative}.bell-btn{background:#111827;color:white;border:2px solid #fd7e14;border-radius:999px;padding:9px 13px;box-shadow:0 8px 22px rgba(0,0,0,.25);cursor:pointer;font-weight:900}.bell-btn .count{background:#dc3545;border-radius:999px;padding:2px 7px;margin-inline-start:6px}.bell-menu{display:none;position:absolute;top:48px;left:0;width:390px;max-width:calc(100vw - 28px);background:#fff;color:#111827;border:1px solid #dbe2ea;border-radius:16px;box-shadow:0 18px 55px rgba(15,23,42,.25);overflow:hidden;text-align:right;z-index:200}.bell-menu.open{display:block}.bell-head{background:#111827;color:white;padding:12px 14px;font-weight:900;display:flex;justify-content:space-between}.bell-body{max-height:420px;overflow:auto;padding:10px}.note-item{border:1px solid #e5e7eb;border-radius:12px;padding:10px;margin-bottom:8px;background:#f8fafc}.note-item.overdue{background:#fef2f2;border-color:#fecaca}.small{font-size:12px;color:#64748b}.btn{border:0;border-radius:9px;padding:8px 11px;cursor:pointer;font-weight:900}.btn.red{background:#dc2626;color:#fff}.btn.green{background:#16a34a;color:#fff}.btn.blue{background:#0f4c81;color:#fff}.btn.gray{background:#e5e7eb;color:#111827}.modal-back{position:fixed;inset:0;background:rgba(15,23,42,.62);z-index:250;display:none;align-items:center;justify-content:center;padding:16px}.modal{width:760px;max-width:100%;max-height:90vh;background:#fff;border-radius:18px;overflow:hidden;box-shadow:0 35px 90px rgba(0,0,0,.35);direction:rtl;text-align:right}.modal h3{margin:0;background:#111827;color:#fff;padding:14px 16px}.form{padding:14px;display:grid;grid-template-columns:1fr 1fr;gap:10px}.field{display:flex;flex-direction:column;gap:5px}.field.full{grid-column:1/-1}.field label{font-size:12px;color:#334155;font-weight:900}.field input,.field select,.field textarea{border:1px solid #cbd5e1;border-radius:10px;padding:10px}.actions{display:flex;gap:8px;padding:12px 14px;border-top:1px solid #e5e7eb}.table-wrap{overflow:auto;padding:14px}.data-table{width:100%;min-width:760px;border-collapse:collapse;font-size:13px}.data-table th{background:#111827;color:#fff;padding:9px;border:1px solid #e5e7eb;text-align:right}.data-table td{padding:8px;border:1px solid #e5e7eb;text-align:right}.overdue-row{background:#fef2f2}.toast{position:fixed;right:18px;bottom:18px;z-index:300;background:#111827;color:#fff;border-radius:12px;padding:12px 14px;display:none;max-width:390px;box-shadow:0 12px 35px rgba(0,0,0,.25);direction:rtl;text-align:right}@media(max-width:900px){.app-header{height:auto;min-height:64px;gap:10px;flex-wrap:wrap}.admin-layout{grid-template-columns:1fr}.admin-sidebar{position:fixed;right:0;top:64px;width:245px;z-index:120;transform:translateX(0);box-shadow:-10px 0 24px rgba(0,0,0,.18)}.admin-layout.side-collapsed .admin-sidebar{transform:translateX(105%)}.main-content{padding:18px}.cards-grid{grid-template-columns:repeat(auto-fit,minmax(165px,1fr))}.form{grid-template-columns:1fr}.bell-menu{left:-8px;top:46px}#global-queue-widget{left:10px;right:10px;bottom:12px;min-width:0}}
+</style>
+</head>
+<body>
+<header class="app-header">
+  <div class="logo"><button class="head-btn" id="sideToggle">☰</button><span>🍔</span> مطعم رشدي — لوحة إدارة الكول سنتر</div>
+  <div class="user-info">
+    <div class="bell-wrap">
+      <button class="bell-btn" id="bellBtn">🔔 <span class="count" id="bellCount">0</span></button>
+      <div class="bell-menu" id="bellMenu"><div class="bell-head"><span>إشعارات الإدارة</span><button class="btn gray" onclick="closeBell()">×</button></div><div class="bell-body" id="bellBody">جاري التحميل...</div></div>
+    </div>
+    <span id="ad-name">جاري التحميل...</span>
+    <span class="badge-admin">👑 Call Center Admin</span>
+    <button class="btn-logout" onclick="doLogout()">خروج</button>
+  </div>
+</header>
+
+<div class="admin-layout" id="layout">
+  <aside class="admin-sidebar">
+    <h5>الأنظمة اليومية</h5>
+    <a href="/admin-desk" class="active"><b>🏠</b> <span>لوحة التحكم</span></a>
+    <a href="/app/call-center-complaint"><b>📋</b> <span>كل الشكاوى</span></a>
+    <a href="/break-admin"><b>⏱️</b> <span>تقرير البريكات</span></a>
+    <a href="/call-report"><b>📞</b> <span>تقرير المكالمات</span></a>
+    <a href="/user-management"><b>👥</b> <span>إدارة الموظفين</span></a>
+    <a href="/sales-report"><b>💰</b> <span>تقرير المبيعات</span></a>
+    <a href="javascript:void(0)" onclick="openCancelReport()"><b>↩️</b> <span>تقرير الإلغاءات</span></a>
+    <h5>إعدادات النظام</h5>
+    <a href="/settings"><b>⚙️</b> <span>إعدادات الشيفت والإيميل</span></a>
+    <a href="/agent-notices"><b>📢</b> <span>تنبيهات الإيجنت</span></a>
+    <a href="/app"><b>🔧</b> <span>لوحة ERPNext الشاملة</span></a>
+  </aside>
+
+  <main class="main-content">
+    <div class="page-title" id="ad-welcome">🏠 نظرة عامة على أداء اليوم — أهلاً جاري التحميل... 👋</div>
+    <section class="stats-grid">
+      <div class="stat-card blue"><div class="label">بريكات نشطة الآن</div><div class="value" id="s-active-brk">0</div></div>
+      <div class="stat-card green"><div class="label">مكالمات في الانتظار</div><div class="value" id="s-waiting">0</div></div>
+      <div class="stat-card red"><div class="label">شكاوى مفتوحة</div><div class="value" id="s-comp-open">0</div></div>
+      <div class="stat-card orange"><div class="label">شكاوى محلولة اليوم</div><div class="value" id="s-comp-today">0</div></div>
+      <div class="stat-card purple"><div class="label">مكالمات اليوم</div><div class="value" id="s-calls">0</div></div>
+      <div class="stat-card blue"><div class="label">إلغاءات مسجلة اليوم</div><div class="value" id="s-cancels">0</div></div>
+    </section>
+
+    <section class="cards-grid">
+      <a href="/app/call-center-complaint/new?call_center_complaint=new-1" class="mod-card"><div class="icon">➕</div><div class="lbl">شكوى جديدة</div><div class="desc">إضافة شكوى فوراً</div></a>
+      <a href="/app/call-center-complaint" class="mod-card"><div class="icon">📋</div><div class="lbl">كل الشكاوى</div><div class="desc">إدارة ومتابعة الحالات</div></a>
+      <a href="/call-report" class="mod-card"><div class="icon">📞</div><div class="lbl">تقرير المكالمات</div><div class="desc">عرض وتحليل وتشغيل الصوت</div></a>
+      <a href="/break-admin" class="mod-card warn"><div class="icon">⏱️</div><div class="lbl">تقرير البريكات</div><div class="desc">البريكات النشطة والإنهاء عن بعد</div></a>
+      <a href="/user-management" class="mod-card"><div class="icon">👥</div><div class="lbl">إدارة اليوزرات</div><div class="desc">إضافة وتعديل وصلاحيات</div></a>
+      <a href="/agent-notices" class="mod-card"><div class="icon">📢</div><div class="lbl">تنبيهات الإيجنت</div><div class="desc">Lost items وتعليمات</div></a>
+      <a href="javascript:void(0)" onclick="openCancelForm()" class="mod-card green"><div class="icon">↩️</div><div class="lbl">تسجيل إلغاء طلب</div><div class="desc">إضافة إلغاء يدوي للتقرير</div></a>
+      <a href="javascript:void(0)" onclick="openCancelReport()" class="mod-card"><div class="icon">📄</div><div class="lbl">تقرير الإلغاءات</div><div class="desc">إلغاءات اليوم المسجلة يدوياً</div><span class="mini-badge" id="cancelBadge">0</span></a>
+      <a href="/hr-ops" class="mod-card"><div class="icon">🧾</div><div class="lbl">HR Ops</div><div class="desc">أذونات وتحميلات ومرتبات</div></a>
+      <a href="/sales-report" class="mod-card"><div class="icon">💰</div><div class="lbl">تقرير المبيعات</div><div class="desc">أداء المبيعات لكل موظف</div></a>
+      <a href="/settings" class="mod-card"><div class="icon">⚙️</div><div class="lbl">الإعدادات</div><div class="desc">إعدادات الشيفت والإيميل</div></a>
+      <a href="/app" class="mod-card"><div class="icon">🔧</div><div class="lbl">ERPNext كامل</div><div class="desc">الوصول للنظام الشامل</div></a>
+    </section>
+  </main>
+</div>
+
+<div id="global-queue-widget"><div class="gq-ico">📞</div><div><div class="gq-title">عداد انتظار المكالمات Live</div><div class="gq-line">أوردرات: <b id="gq-orders">0</b> | شكاوى: <b id="gq-complaints">0</b> | الإجمالي: <b id="gq-total">0</b></div></div></div>
+
+<div class="modal-back" id="modalBack"><div class="modal"><h3 id="modalTitle">Modal</h3><div id="modalContent"></div></div></div>
+<div class="toast" id="toast"></div>
+
+<script>
+function qs(o){var p=new URLSearchParams();Object.keys(o||{}).forEach(function(k){var v=o[k];if(v!==undefined&&v!==null&&v!=="")p.append(k,v)});return p.toString()}
+async function api(method,args){try{var q=qs(args||{});var r=await fetch('/api/method/'+method+(q?'?'+q:''),{method:'GET',credentials:'same-origin',cache:'no-store',headers:{'Accept':'application/json'}});var j=await r.json();if(j.exc)throw j;return j.message||j}catch(e){console.error(method,e);return null}}
+function esc(s){return String(s||'').replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
+function toast(msg){var t=document.getElementById('toast');t.textContent=msg;t.style.display='block';setTimeout(function(){t.style.display='none'},4200)}
+function closeModal(){document.getElementById('modalBack').style.display='none'}
+function showModal(title,html){document.getElementById('modalTitle').textContent=title;document.getElementById('modalContent').innerHTML=html;document.getElementById('modalBack').style.display='flex'}
+function closeBell(){document.getElementById('bellMenu').classList.remove('open')}
+async function doLogout(){try{await fetch('/api/method/logout',{method:'GET',credentials:'same-origin',cache:'no-store'})}catch(e){}window.location.href='/login'}
+
+document.getElementById('sideToggle').onclick=function(){document.getElementById('layout').classList.toggle('side-collapsed')};
+document.getElementById('bellBtn').onclick=function(e){e.stopPropagation();document.getElementById('bellMenu').classList.toggle('open');refreshNotifications()};
+document.addEventListener('click',function(e){var b=document.getElementById('bellMenu');if(b.classList.contains('open')&&!b.contains(e.target)&&e.target.id!=='bellBtn')closeBell()});
+document.getElementById('modalBack').addEventListener('click',function(e){if(e.target.id==='modalBack')closeModal()});
+
+async function refreshStats(){
+  var d=await api('restaurant_ops.api.admin_api.get_admin_dashboard_stats');
+  if(d&&d.employee_name){document.getElementById('ad-name').textContent=d.employee_name;document.getElementById('ad-welcome').textContent='🏠 نظرة عامة على أداء اليوم — أهلاً '+d.employee_name+' 👋'}
+  if(d){document.getElementById('s-comp-open').textContent=d.open_complaints||0;document.getElementById('s-comp-today').textContent=d.today_complaints||0;document.getElementById('s-calls').textContent=d.today_calls||0}
+}
+async function refreshQueue(){var d=await api('restaurant_ops.api.queue_api.get_queue_status')||{orders:0,complaints:0,total:0};document.getElementById('gq-orders').textContent=d.orders||0;document.getElementById('gq-complaints').textContent=d.complaints||0;document.getElementById('gq-total').textContent=d.total||0;document.getElementById('s-waiting').textContent=d.total||0;var w=document.getElementById('global-queue-widget');if((d.total||0)>0)w.classList.add('alert','shake');else w.classList.remove('alert','shake')}
+async function getActiveBreaks(){return await api('restaurant_ops.api.break_api.get_active_breaks')||{active_count:0,overdue_count:0,rows:[]}}
+async function refreshBreakCount(){var d=await getActiveBreaks();document.getElementById('s-active-brk').textContent=d.active_count||0;document.getElementById('bellCount').textContent=(d.active_count||0);return d}
+async function getExtraRequests(){var m=['restaurant','_ops.api.hr_ops','_api.list_extra_break_requests'].join('');return await api(m,{status:'Pending'})||[]}
+async function refreshNotifications(){var br=await refreshBreakCount();var reqs=await getExtraRequests();var total=(br.active_count||0)+(reqs.length||0);document.getElementById('bellCount').textContent=total;var html='';if((br.rows||[]).length){html+=(br.rows||[]).map(function(r){return '<div class="note-item '+(r.overdue?'overdue':'')+'"><b>'+(r.overdue?'⚠️ ':'⏱️ ')+esc(r.employee_name||r.employee)+'</b><div>داخل بريك '+esc(r.break_type)+' من '+esc(r.duration_minutes)+' دقيقة</div>'+(r.overdue?'<div style="color:#b91c1c;font-weight:900">عدى الحد بـ '+esc(r.overdue_minutes)+' دقيقة</div>':'')+'<div class="small">بدأ: '+esc(r.start_time)+'</div><button class="btn red" style="margin-top:7px" onclick="endBreak(\''+esc(r.name)+'\')">إنهاء البريك</button></div>'}).join('')}
+if(reqs.length){html+=reqs.map(function(x){return '<div class="note-item"><b>➕ طلب بريك إضافي</b><div>'+esc(x.employee_name||x.employee||'موظف')+'</div><div class="small">راجع HR Ops للموافقة</div><button class="btn blue" style="margin-top:7px" onclick="location.href=\'/hr-ops\'">فتح HR Ops</button></div>'}).join('')}
+if(!html)html='<div class="small">لا توجد إشعارات حالياً</div>';document.getElementById('bellBody').innerHTML=html}
+async function endBreak(name){if(!confirm('تأكيد إنهاء البريك؟'))return;var r=await api('restaurant_ops.api.break_api.admin_end_break',{break_log:name});if(r&&r.success){toast(r.message||'تم إنهاء البريك');refreshAll()}else toast((r&&r.message)||'فشل إنهاء البريك')}
+async function refreshCancels(){var r=await api('restaurant_ops.api.upper_management_email_api.list_order_cancellations')||{count:0,rows:[]};document.getElementById('s-cancels').textContent=r.count||0;document.getElementById('cancelBadge').textContent=r.count||0;return r}
+function openCancelForm(){showModal('↩️ تسجيل إلغاء طلب','<div class="form"><div class="field"><label>رقم الطلب *</label><input id="c-order"></div><div class="field"><label>الوردية *</label><select id="c-shift"><option>صباحية</option><option>مسائية</option><option>ليلية</option><option>غير محدد</option></select></div><div class="field"><label>الفرع *</label><input id="c-branch"></div><div class="field"><label>اسم العميل</label><input id="c-customer"></div><div class="field"><label>رقم العميل</label><input id="c-phone"></div><div class="field"><label>سبب الإلغاء *</label><input id="c-reason"></div><div class="field full"><label>ملاحظات</label><textarea id="c-notes" rows="3"></textarea></div></div><div class="actions"><button class="btn green" onclick="saveCancel()">حفظ الإلغاء</button><button class="btn gray" onclick="closeModal()">إغلاق</button></div>')}
+async function saveCancel(){var args={order_no:document.getElementById('c-order').value.trim(),shift:document.getElementById('c-shift').value,branch:document.getElementById('c-branch').value.trim(),customer_name:document.getElementById('c-customer').value.trim(),customer_phone:document.getElementById('c-phone').value.trim(),reason:document.getElementById('c-reason').value.trim(),notes:document.getElementById('c-notes').value.trim()};if(!args.order_no||!args.branch||!args.reason){toast('رقم الطلب والفرع وسبب الإلغاء مطلوبين');return}var r=await api('restaurant_ops.api.upper_management_email_api.create_order_cancellation',args);if(r&&r.success){toast('تم تسجيل الإلغاء بنجاح');openCancelReport()}else toast((r&&r.message)||'فشل تسجيل الإلغاء')}
+async function openCancelReport(){var r=await refreshCancels();var rows=r.rows||[];var html='<div class="table-wrap">';if(!rows.length)html+='<div style="padding:15px;background:#f8fafc;border-radius:10px;color:#64748b;text-align:center">لا توجد إلغاءات مسجلة اليوم</div>';else html+='<table class="data-table"><thead><tr><th>وقت التسجيل</th><th>رقم الطلب</th><th>الوردية</th><th>الفرع</th><th>العميل</th><th>السبب</th><th>سجلها</th></tr></thead><tbody>'+rows.map(function(r){return '<tr><td>'+esc(r.cancellation_time)+'</td><td>'+esc(r.order_no)+'</td><td>'+esc(r.shift)+'</td><td>'+esc(r.branch)+'</td><td>'+esc(r.customer_name)+'</td><td>'+esc(r.reason)+'</td><td>'+esc(r.logged_by)+'</td></tr>'}).join('')+'</tbody></table>';html+='</div><div class="actions"><button class="btn green" onclick="openCancelForm()">تسجيل إلغاء جديد</button><button class="btn gray" onclick="closeModal()">إغلاق</button></div>';showModal('📄 تقرير الإلغاءات اليوم',html)}
+async function refreshAll(){refreshStats();refreshQueue();refreshBreakCount();refreshCancels();}
+refreshAll();refreshNotifications();setInterval(refreshStats,8000);setInterval(refreshQueue,3000);setInterval(refreshBreakCount,8000);setInterval(refreshCancels,20000);setInterval(refreshNotifications,15000);
+</script>
+</body>
+</html>

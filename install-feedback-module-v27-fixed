@@ -1,0 +1,865 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Roshdy V27 FIXED: Feedback module end-to-end
+# Fixed after missing ADMIN_HTML/AGENT_HTML export in Step 4.
+# ----------------------------------------------------------------------
+# Adds:
+# - Feedback DocType/API
+# - Admin page: /feedback-admin (upload/manual/bulk/report/export/close shift)
+# - Agent/Admin task page: /feedback (submit feedback)
+# - Cards in admin-desk and agent-desk
+# - Feedback sections in Upper Management and Customer Service Manager emails
+#
+# Safety:
+# - Backup first.
+# - Does NOT touch report_api.py / Elastix / CDR / AMI config.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "❌ docker compose/docker-compose مش موجود"
+  exit 1
+fi
+
+APP_DIR="$ROOT/apps/$APP"
+PKG_DIR="$APP_DIR/$APP"
+API_DIR="$PKG_DIR/api"
+WWW_DIR="$PKG_DIR/www"
+FEEDBACK_API="$API_DIR/feedback_api.py"
+UPPER_API="$API_DIR/upper_management_email_api.py"
+EMAIL_REPORT="$API_DIR/email_report.py"
+ADMIN_HTML="$WWW_DIR/admin-desk.html"
+AGENT_HTML="$WWW_DIR/agent-desk.html"
+FEEDBACK_HTML="$WWW_DIR/feedback.html"
+FEEDBACK_PY="$WWW_DIR/feedback.py"
+FEEDBACK_ADMIN_HTML="$WWW_DIR/feedback-admin.html"
+FEEDBACK_ADMIN_PY="$WWW_DIR/feedback-admin.py"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/INSTALL_FEEDBACK_MODULE_V27_BEFORE_$TS"
+mkdir -p "$BACKUP_DIR"
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend container مش شغال أو مش لاقيه"
+  exit 1
+fi
+
+bench_exec() {
+  "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"
+}
+
+echo "============================================================"
+echo "🚀 Roshdy V27: Feedback module"
+echo "📦 Backup: $BACKUP_DIR"
+echo "============================================================"
+
+echo "🧯 Step 1: Backup files + bench backup"
+for f in "$FEEDBACK_API" "$UPPER_API" "$EMAIL_REPORT" "$ADMIN_HTML" "$AGENT_HTML" "$FEEDBACK_HTML" "$FEEDBACK_PY" "$FEEDBACK_ADMIN_HTML" "$FEEDBACK_ADMIN_PY"; do
+  [[ -e "$f" ]] && cp -a "$f" "$BACKUP_DIR/$(basename "$f").before" || true
+done
+bench_exec backup --with-files | tee "$BACKUP_DIR/bench_backup_output.txt"
+
+echo "🧩 Step 2: Install feedback API"
+cat > "$FEEDBACK_API" <<'PYAPI'
+# -*- coding: utf-8 -*-
+"""Roshdy Feedback API.
+Admin uploads/creates customer feedback tasks by shift number.
+Agents/admins complete feedback; admin reports/export; email summaries.
+"""
+
+import csv
+import io
+import json
+import re
+from collections import Counter, defaultdict
+
+import frappe
+from frappe.utils import today, now_datetime, getdate, get_datetime, cstr, cint, flt
+
+FEEDBACK_DT = "Call Center Feedback"
+SATISFACTION_OPTIONS = ["ممتاز", "جيد جدا", "جيد", "مقبول"]
+
+
+def _module_name():
+    for name in ("Restaurant Ops", "Restaurant", "Core"):
+        try:
+            if frappe.db.exists("Module Def", name):
+                return name
+        except Exception:
+            pass
+    return "Core"
+
+
+def _is_admin():
+    try:
+        if frappe.session.user == "Administrator":
+            return True
+        roles = set(frappe.get_roles(frappe.session.user))
+        return bool(roles.intersection({"System Manager", "Call Center Admin", "Restaurant Manager"}))
+    except Exception:
+        return False
+
+
+def _can_feedback():
+    try:
+        if _is_admin():
+            return True
+        roles = set(frappe.get_roles(frappe.session.user))
+        return "Restaurant Agent" in roles
+    except Exception:
+        return False
+
+
+def _employee_for_user(user=None):
+    user = user or frappe.session.user
+    try:
+        if frappe.db.exists("DocType", "Employee"):
+            rows = frappe.get_all("Employee", filters={"user_id": user}, fields=["name", "employee_name"], limit_page_length=1)
+            if rows:
+                return rows[0].get("name"), rows[0].get("employee_name") or rows[0].get("name")
+    except Exception:
+        pass
+    try:
+        return "", frappe.db.get_value("User", user, "full_name") or user
+    except Exception:
+        return "", user
+
+
+def _has_field(dt, fn):
+    try:
+        return frappe.get_meta(dt).has_field(fn)
+    except Exception:
+        return False
+
+
+@frappe.whitelist()
+def ensure_feedback_doctype():
+    if frappe.db.exists("DocType", FEEDBACK_DT):
+        return {"success": True, "doctype": FEEDBACK_DT, "created": False}
+
+    perms = []
+    for role in ("System Manager", "Call Center Admin", "Restaurant Manager"):
+        if frappe.db.exists("Role", role):
+            perms.append({"role": role, "read": 1, "write": 1, "create": 1, "delete": 1, "report": 1, "export": 1, "print": 1, "email": 1})
+    if frappe.db.exists("Role", "Restaurant Agent"):
+        perms.append({"role": "Restaurant Agent", "read": 1, "write": 1, "create": 0, "delete": 0, "report": 0, "export": 0, "print": 0, "email": 0})
+    if not perms:
+        perms = [{"role": "System Manager", "read": 1, "write": 1, "create": 1, "delete": 1}]
+
+    doc = frappe.get_doc({
+        "doctype": "DocType",
+        "name": FEEDBACK_DT,
+        "module": _module_name(),
+        "custom": 1,
+        "istable": 0,
+        "autoname": "format:FDBK-{YYYY}-{MM}-{#####}",
+        "track_changes": 1,
+        "fields": [
+            {"fieldname": "feedback_date", "label": "تاريخ الفيدباك", "fieldtype": "Date", "reqd": 1, "in_list_view": 1},
+            {"fieldname": "shift_number", "label": "رقم الوردية", "fieldtype": "Data", "reqd": 1, "in_list_view": 1},
+            {"fieldname": "customer_name", "label": "اسم العميل", "fieldtype": "Data", "in_list_view": 1},
+            {"fieldname": "customer_phone", "label": "رقم العميل", "fieldtype": "Data", "reqd": 1, "in_list_view": 1},
+            {"fieldname": "status", "label": "الحالة", "fieldtype": "Select", "options": "Pending\nCompleted\nClosed", "default": "Pending", "in_list_view": 1},
+            {"fieldname": "is_active", "label": "متاح للموظفين", "fieldtype": "Check", "default": "1", "in_list_view": 1},
+            {"fieldname": "rating", "label": "التقييم من 10", "fieldtype": "Int", "in_list_view": 1},
+            {"fieldname": "satisfaction", "label": "درجة الرضاء", "fieldtype": "Select", "options": "\nممتاز\nجيد جدا\nجيد\nمقبول", "in_list_view": 1},
+            {"fieldname": "details", "label": "التفاصيل", "fieldtype": "Small Text"},
+            {"fieldname": "notes", "label": "ملاحظات", "fieldtype": "Small Text"},
+            {"fieldname": "agent_user", "label": "الموظف الذي أجرى الفيدباك", "fieldtype": "Data", "read_only": 1, "in_list_view": 1},
+            {"fieldname": "agent_employee", "label": "Employee", "fieldtype": "Link", "options": "Employee"},
+            {"fieldname": "agent_employee_name", "label": "اسم الموظف", "fieldtype": "Data", "read_only": 1},
+            {"fieldname": "completed_at", "label": "وقت الإكمال", "fieldtype": "Datetime", "read_only": 1},
+            {"fieldname": "source", "label": "المصدر", "fieldtype": "Select", "options": "manual\nbulk\nexcel", "default": "manual"},
+            {"fieldname": "import_batch", "label": "دفعة الاستيراد", "fieldtype": "Data"},
+            {"fieldname": "closed_by", "label": "أغلق الوردية بواسطة", "fieldtype": "Data"},
+            {"fieldname": "closed_at", "label": "وقت إغلاق الوردية", "fieldtype": "Datetime"},
+            {"fieldname": "raw_payload", "label": "Raw Payload", "fieldtype": "Small Text"},
+        ],
+        "permissions": perms,
+    })
+    doc.insert(ignore_permissions=True)
+    frappe.db.commit()
+    frappe.clear_cache(doctype=FEEDBACK_DT)
+    return {"success": True, "doctype": FEEDBACK_DT, "created": True}
+
+
+def _norm_phone(phone):
+    phone = cstr(phone or "").strip()
+    phone = phone.replace(" ", "").replace("-", "")
+    return phone
+
+
+def _looks_phone(s):
+    s = cstr(s or "").strip()
+    digits = re.sub(r"\D+", "", s)
+    return len(digits) >= 7
+
+
+def _duplicate_exists(phone, feedback_date, shift_number):
+    try:
+        return frappe.db.exists(FEEDBACK_DT, {"customer_phone": phone, "feedback_date": feedback_date, "shift_number": shift_number})
+    except Exception:
+        return None
+
+
+def _insert_item(customer_name, customer_phone, feedback_date=None, shift_number=None, source="manual", import_batch=None, active=1, raw_payload=None, ignore_duplicate=True):
+    ensure_feedback_doctype()
+    if not _is_admin():
+        frappe.throw("غير مسموح: إضافة أرقام الفيدباك للأدمن فقط")
+    feedback_date = cstr(feedback_date or today())[:10]
+    shift_number = cstr(shift_number or "").strip()
+    phone = _norm_phone(customer_phone)
+    name = cstr(customer_name or "").strip()
+    if not shift_number:
+        frappe.throw("رقم الوردية مطلوب")
+    if not phone:
+        frappe.throw("رقم العميل مطلوب")
+    if ignore_duplicate and _duplicate_exists(phone, feedback_date, shift_number):
+        return {"success": True, "skipped_duplicate": True, "phone": phone}
+    doc = frappe.get_doc({
+        "doctype": FEEDBACK_DT,
+        "feedback_date": feedback_date,
+        "shift_number": shift_number,
+        "customer_name": name,
+        "customer_phone": phone,
+        "status": "Pending",
+        "is_active": 1 if cint(active) else 0,
+        "source": source,
+        "import_batch": import_batch or "",
+        "raw_payload": raw_payload or "",
+    })
+    doc.insert(ignore_permissions=True)
+    return {"success": True, "name": doc.name, "phone": phone}
+
+
+@frappe.whitelist()
+def add_feedback_manual(customer_name=None, customer_phone=None, feedback_date=None, shift_number=None):
+    res = _insert_item(customer_name, customer_phone, feedback_date, shift_number, source="manual")
+    frappe.db.commit()
+    return res
+
+
+def _parse_bulk_text(text):
+    rows = []
+    for line in cstr(text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Supports: name,phone  OR phone,name OR name: phone1, phone2 OR only comma-separated phones
+        if ":" in line:
+            name_part, rest = line.split(":", 1)
+            tokens = [x.strip() for x in re.split(r"[,;\t]+", rest) if x.strip()]
+            for t in tokens:
+                if _looks_phone(t):
+                    rows.append({"customer_name": name_part.strip(), "customer_phone": t})
+            continue
+        tokens = [x.strip() for x in re.split(r"[,;\t]+", line) if x.strip()]
+        phones = [t for t in tokens if _looks_phone(t)]
+        names = [t for t in tokens if not _looks_phone(t)]
+        if not phones and _looks_phone(line):
+            phones = [line]
+        for idx, ph in enumerate(phones):
+            nm = names[0] if names else ""
+            rows.append({"customer_name": nm, "customer_phone": ph})
+    return rows
+
+
+@frappe.whitelist()
+def add_feedback_bulk(text=None, feedback_date=None, shift_number=None):
+    ensure_feedback_doctype()
+    if not _is_admin():
+        frappe.throw("غير مسموح")
+    batch = "BULK-" + now_datetime().strftime("%Y%m%d%H%M%S")
+    rows = _parse_bulk_text(text)
+    created = skipped = 0
+    errors = []
+    for r in rows:
+        try:
+            res = _insert_item(r.get("customer_name"), r.get("customer_phone"), feedback_date, shift_number, source="bulk", import_batch=batch, raw_payload=json.dumps(r, ensure_ascii=False))
+            if res.get("skipped_duplicate"):
+                skipped += 1
+            else:
+                created += 1
+        except Exception as e:
+            errors.append(str(e))
+    frappe.db.commit()
+    return {"success": True, "batch": batch, "parsed": len(rows), "created": created, "skipped_duplicates": skipped, "errors": errors[:20]}
+
+
+def _find_header_map(headers):
+    hmap = {}
+    for i, h in enumerate(headers):
+        key = cstr(h or "").strip().lower()
+        if not key:
+            continue
+        if any(x in key for x in ("phone", "mobile", "tel", "رقم", "موبايل", "تليفون", "هاتف")):
+            hmap.setdefault("phone", i)
+        elif any(x in key for x in ("name", "customer", "client", "اسم", "عميل")):
+            hmap.setdefault("name", i)
+    return hmap
+
+
+def _parse_excel_bytes(content):
+    rows = []
+    # xlsx first
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(filename=io.BytesIO(content), read_only=True, data_only=True)
+        ws = wb.active
+        all_rows = list(ws.iter_rows(values_only=True))
+        if not all_rows:
+            return []
+        headers = list(all_rows[0])
+        hmap = _find_header_map(headers)
+        data_rows = all_rows[1:] if hmap.get("phone") is not None else all_rows
+        for row in data_rows:
+            vals = list(row or [])
+            if hmap.get("phone") is not None:
+                phone = vals[hmap["phone"]] if hmap["phone"] < len(vals) else ""
+                name = vals[hmap.get("name")] if hmap.get("name") is not None and hmap.get("name") < len(vals) else ""
+            else:
+                # no header: pick first phone-like cell and first non-phone as name
+                phone = ""; name = ""
+                for v in vals:
+                    if _looks_phone(v) and not phone:
+                        phone = v
+                    elif cstr(v).strip() and not name:
+                        name = v
+            if _looks_phone(phone):
+                rows.append({"customer_name": cstr(name or ""), "customer_phone": cstr(phone)})
+        return rows
+    except Exception:
+        pass
+    # csv fallback
+    try:
+        text = content.decode("utf-8-sig", errors="ignore")
+        reader = csv.reader(io.StringIO(text))
+        all_rows = list(reader)
+        if not all_rows:
+            return []
+        hmap = _find_header_map(all_rows[0])
+        data_rows = all_rows[1:] if hmap.get("phone") is not None else all_rows
+        for row in data_rows:
+            if hmap.get("phone") is not None:
+                phone = row[hmap["phone"]] if hmap["phone"] < len(row) else ""
+                name = row[hmap.get("name")] if hmap.get("name") is not None and hmap.get("name") < len(row) else ""
+            else:
+                phone = ""; name = ""
+                for v in row:
+                    if _looks_phone(v) and not phone:
+                        phone = v
+                    elif cstr(v).strip() and not name:
+                        name = v
+            if _looks_phone(phone):
+                rows.append({"customer_name": cstr(name or ""), "customer_phone": cstr(phone)})
+    except Exception:
+        pass
+    return rows
+
+
+@frappe.whitelist()
+def upload_feedback_excel(feedback_date=None, shift_number=None):
+    ensure_feedback_doctype()
+    if not _is_admin():
+        frappe.throw("غير مسموح")
+    f = None
+    try:
+        if frappe.request and frappe.request.files:
+            f = frappe.request.files.get("file") or next(iter(frappe.request.files.values()))
+    except Exception:
+        f = None
+    if not f:
+        frappe.throw("ملف Excel مطلوب")
+    content = f.read()
+    rows = _parse_excel_bytes(content)
+    batch = "EXCEL-" + now_datetime().strftime("%Y%m%d%H%M%S")
+    created = skipped = 0
+    errors = []
+    for r in rows:
+        try:
+            res = _insert_item(r.get("customer_name"), r.get("customer_phone"), feedback_date, shift_number, source="excel", import_batch=batch, raw_payload=json.dumps(r, ensure_ascii=False))
+            if res.get("skipped_duplicate"):
+                skipped += 1
+            else:
+                created += 1
+        except Exception as e:
+            errors.append(str(e))
+    frappe.db.commit()
+    return {"success": True, "batch": batch, "parsed": len(rows), "created": created, "skipped_duplicates": skipped, "errors": errors[:20]}
+
+
+@frappe.whitelist()
+def list_feedback_tasks(feedback_date=None, shift_number=None, include_completed_by_me=1):
+    ensure_feedback_doctype()
+    if not _can_feedback():
+        frappe.throw("غير مسموح")
+    feedback_date = cstr(feedback_date or today())[:10]
+    filters = {"feedback_date": feedback_date, "is_active": 1, "status": "Pending"}
+    if shift_number:
+        filters["shift_number"] = cstr(shift_number).strip()
+    rows = frappe.get_all(FEEDBACK_DT, filters=filters, fields=["name", "customer_name", "customer_phone", "feedback_date", "shift_number", "status"], order_by="creation asc", limit_page_length=500)
+    done = []
+    if cint(include_completed_by_me or 0):
+        done_filters = {"feedback_date": feedback_date, "status": "Completed", "agent_user": frappe.session.user}
+        if shift_number:
+            done_filters["shift_number"] = cstr(shift_number).strip()
+        done = frappe.get_all(FEEDBACK_DT, filters=done_filters, fields=["name", "customer_name", "customer_phone", "feedback_date", "shift_number", "status", "rating", "satisfaction", "details", "notes", "completed_at"], order_by="completed_at desc", limit_page_length=100)
+    return {"success": True, "pending": rows, "completed_by_me": done, "count": len(rows)}
+
+
+@frappe.whitelist()
+def submit_feedback(feedback_id=None, rating=None, satisfaction=None, details=None, notes=None):
+    ensure_feedback_doctype()
+    if not _can_feedback():
+        frappe.throw("غير مسموح")
+    if not feedback_id:
+        frappe.throw("feedback_id مطلوب")
+    if not frappe.db.exists(FEEDBACK_DT, feedback_id):
+        frappe.throw("سجل الفيدباك غير موجود")
+    rating = cint(rating)
+    if rating < 1 or rating > 10:
+        frappe.throw("التقييم يجب أن يكون من 1 إلى 10")
+    satisfaction = cstr(satisfaction or "").strip()
+    if satisfaction not in SATISFACTION_OPTIONS:
+        frappe.throw("درجة الرضاء غير صحيحة")
+    doc = frappe.get_doc(FEEDBACK_DT, feedback_id)
+    if doc.status == "Completed":
+        return {"success": False, "message": "تم تسجيل الفيدباك لهذا العميل بالفعل"}
+    if not cint(doc.is_active or 0):
+        return {"success": False, "message": "هذه الوردية غير متاحة للفيدباك حاليًا"}
+    emp, emp_name = _employee_for_user()
+    doc.rating = rating
+    doc.satisfaction = satisfaction
+    doc.details = cstr(details or "").strip()
+    doc.notes = cstr(notes or "").strip()
+    doc.agent_user = frappe.session.user
+    doc.agent_employee = emp
+    doc.agent_employee_name = emp_name
+    doc.completed_at = now_datetime()
+    doc.status = "Completed"
+    doc.save(ignore_permissions=True)
+    frappe.db.commit()
+    return {"success": True, "message": "تم حفظ الفيدباك", "name": doc.name}
+
+
+@frappe.whitelist()
+def close_feedback_shift(feedback_date=None, shift_number=None):
+    ensure_feedback_doctype()
+    if not _is_admin():
+        frappe.throw("غير مسموح")
+    feedback_date = cstr(feedback_date or today())[:10]
+    shift_number = cstr(shift_number or "").strip()
+    if not shift_number:
+        frappe.throw("رقم الوردية مطلوب")
+    rows = frappe.get_all(FEEDBACK_DT, filters={"feedback_date": feedback_date, "shift_number": shift_number, "is_active": 1}, pluck="name", limit_page_length=5000)
+    for name in rows:
+        doc = frappe.get_doc(FEEDBACK_DT, name)
+        doc.is_active = 0
+        if doc.status == "Pending":
+            doc.status = "Closed"
+        doc.closed_by = frappe.session.user
+        doc.closed_at = now_datetime()
+        doc.save(ignore_permissions=True)
+    frappe.db.commit()
+    return {"success": True, "message": "تم إغلاق وردية الفيدباك وإخفاؤها من الموظفين", "updated": len(rows)}
+
+
+@frappe.whitelist()
+def reopen_feedback_shift(feedback_date=None, shift_number=None):
+    ensure_feedback_doctype()
+    if not _is_admin():
+        frappe.throw("غير مسموح")
+    feedback_date = cstr(feedback_date or today())[:10]
+    shift_number = cstr(shift_number or "").strip()
+    rows = frappe.get_all(FEEDBACK_DT, filters={"feedback_date": feedback_date, "shift_number": shift_number}, pluck="name", limit_page_length=5000)
+    for name in rows:
+        doc = frappe.get_doc(FEEDBACK_DT, name)
+        doc.is_active = 1
+        if doc.status == "Closed":
+            doc.status = "Pending"
+        doc.save(ignore_permissions=True)
+    frappe.db.commit()
+    return {"success": True, "message": "تم إعادة إتاحة وردية الفيدباك", "updated": len(rows)}
+
+
+def _base_filters(date_from=None, date_to=None, shift_number=None, status=None, agent_user=None):
+    date_from = cstr(date_from or today())[:10]
+    date_to = cstr(date_to or date_from)[:10]
+    filters = {"feedback_date": ["between", [date_from, date_to]]}
+    if shift_number:
+        filters["shift_number"] = cstr(shift_number).strip()
+    if status and status not in ("All", "الكل"):
+        filters["status"] = status
+    if agent_user:
+        filters["agent_user"] = agent_user
+    return filters, date_from, date_to
+
+
+@frappe.whitelist()
+def get_feedback_admin_report(date_from=None, date_to=None, shift_number=None, status=None, agent_user=None, limit=1000):
+    ensure_feedback_doctype()
+    if not _is_admin():
+        frappe.throw("غير مسموح")
+    filters, df, dt = _base_filters(date_from, date_to, shift_number, status, agent_user)
+    fields = ["name", "feedback_date", "shift_number", "customer_name", "customer_phone", "status", "is_active", "rating", "satisfaction", "details", "notes", "agent_user", "agent_employee_name", "completed_at", "source", "import_batch", "closed_by", "closed_at"]
+    rows = frappe.get_all(FEEDBACK_DT, filters=filters, fields=fields, order_by="feedback_date desc, shift_number asc, creation asc", limit_page_length=cint(limit or 1000))
+    total = len(rows)
+    completed = [r for r in rows if r.get("status") == "Completed"]
+    pending = [r for r in rows if r.get("status") == "Pending" and cint(r.get("is_active") or 0)]
+    closed = [r for r in rows if r.get("status") == "Closed" or not cint(r.get("is_active") or 0)]
+    ratings = [flt(r.get("rating") or 0) for r in completed if flt(r.get("rating") or 0) > 0]
+    avg_rating = round(sum(ratings) / len(ratings), 2) if ratings else 0
+    sat_counts = Counter([r.get("satisfaction") or "غير محدد" for r in completed])
+    agent_counts = defaultdict(lambda: {"agent": "", "count": 0, "avg_rating": 0, "_ratings": []})
+    for r in completed:
+        ag = r.get("agent_employee_name") or r.get("agent_user") or "غير محدد"
+        row = agent_counts[ag]
+        row["agent"] = ag
+        row["count"] += 1
+        if flt(r.get("rating") or 0) > 0:
+            row["_ratings"].append(flt(r.get("rating")))
+    by_agent = []
+    for row in agent_counts.values():
+        rs = row.pop("_ratings")
+        row["avg_rating"] = round(sum(rs) / len(rs), 2) if rs else 0
+        by_agent.append(row)
+    by_agent.sort(key=lambda x: x["count"], reverse=True)
+    return {"success": True, "period": {"from": df, "to": dt}, "summary": {"total": total, "completed": len(completed), "pending": len(pending), "closed": len(closed), "avg_rating": avg_rating, "satisfaction_counts": dict(sat_counts)}, "by_agent": by_agent, "rows": rows}
+
+
+@frappe.whitelist()
+def get_feedback_email_summary(date_from=None, date_to=None):
+    ensure_feedback_doctype()
+    # Email summary can be called by scheduler/system; do not require admin here.
+    filters, df, dt = _base_filters(date_from, date_to)
+    rows = frappe.get_all(FEEDBACK_DT, filters=filters, fields=["status", "is_active", "rating", "satisfaction", "agent_user", "agent_employee_name", "shift_number"], limit_page_length=5000)
+    completed = [r for r in rows if r.get("status") == "Completed"]
+    pending = [r for r in rows if r.get("status") == "Pending" and cint(r.get("is_active") or 0)]
+    ratings = [flt(r.get("rating") or 0) for r in completed if flt(r.get("rating") or 0) > 0]
+    avg = round(sum(ratings) / len(ratings), 2) if ratings else 0
+    sat = Counter([r.get("satisfaction") or "غير محدد" for r in completed])
+    by_agent = Counter([r.get("agent_employee_name") or r.get("agent_user") or "غير محدد" for r in completed])
+    by_shift = Counter([r.get("shift_number") or "غير محدد" for r in rows])
+    return {"success": True, "period": {"from": df, "to": dt}, "total": len(rows), "completed": len(completed), "pending": len(pending), "avg_rating": avg, "satisfaction_counts": dict(sat), "by_agent": dict(by_agent), "by_shift": dict(by_shift)}
+
+
+@frappe.whitelist()
+def debug_feedback_status():
+    ensure_feedback_doctype()
+    try:
+        count = frappe.db.count(FEEDBACK_DT)
+    except Exception:
+        count = 0
+    return {"success": True, "doctype": FEEDBACK_DT, "count": count, "admin": _is_admin(), "can_feedback": _can_feedback()}
+PYAPI
+
+# -----------------------------------------------------------------------------
+# 3) Pages
+# -----------------------------------------------------------------------------
+echo "🧩 Step 3: Install feedback pages"
+cat > "$FEEDBACK_ADMIN_PY" <<'PYPAGE'
+import frappe
+from restaurant_ops.www._context import protect, ADMIN_ROLES
+no_cache = 1
+
+def get_context(context):
+    protect(context, allowed_roles=ADMIN_ROLES)
+PYPAGE
+
+cat > "$FEEDBACK_PY" <<'PYPAGE'
+import frappe
+from restaurant_ops.www._context import protect, ADMIN_ROLES
+no_cache = 1
+
+def get_context(context):
+    protect(context, allowed_roles=ADMIN_ROLES, agent_allowed=True)
+PYPAGE
+
+cat > "$FEEDBACK_ADMIN_HTML" <<'HTML'
+<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>متابعة الفيدباك</title><style>*{box-sizing:border-box;font-family:Tahoma,Arial}body{margin:0;background:#eef2f7;direction:rtl;color:#111827}.top{background:#20262d;color:white;padding:14px 22px;border-bottom:4px solid #1F4E79;display:flex;justify-content:space-between;align-items:center}.top a{color:#fff;text-decoration:none;border:1px solid #64748b;border-radius:10px;padding:8px 12px}.wrap{padding:22px;max-width:1600px;margin:auto}.panel{background:#fff;border:1px solid #d8dee9;border-radius:16px;box-shadow:0 10px 28px #0001;margin-bottom:16px;overflow:hidden}.head{padding:14px 16px;border-bottom:1px solid #e5e7eb;display:flex;justify-content:space-between;gap:10px;align-items:center}.body{padding:16px}.grid{display:grid;grid-template-columns:repeat(6,1fr);gap:10px}label{font-weight:800;color:#475569;font-size:12px}input,select,textarea{width:100%;border:1px solid #d1d5db;border-radius:10px;padding:9px}.btn{border:0;border-radius:10px;padding:10px 13px;background:#1F4E79;color:#fff;font-weight:800;cursor:pointer;margin:3px}.green{background:#16a34a}.orange{background:#f97316}.red{background:#dc2626}.gray{background:#e5e7eb;color:#111827}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}.card{background:#fff;border:1px solid #ddd;border-right:5px solid #1F4E79;border-radius:12px;padding:12px}.num{font-size:28px;color:#1F4E79;font-weight:bold}.table{width:100%;border-collapse:collapse;min-width:1200px}.table th{background:#111827;color:#fff;padding:9px}.table td{border:1px solid #e5e7eb;padding:8px}.scroll{overflow:auto}.muted{color:#64748b;font-size:13px}.toast{position:fixed;right:18px;bottom:18px;background:#111827;color:#fff;padding:12px 14px;border-radius:12px;display:none;z-index:99}@media(max-width:900px){.grid{grid-template-columns:1fr 1fr}.wrap{padding:12px}.table{min-width:900px}}</style></head><body><div class="top"><b>📣 متابعة الفيدباك</b><div><a href="/admin-desk">Admin Desk</a> <a href="/feedback">عمل فيدباك</a></div></div><div class="wrap"><div class="panel"><div class="head"><b>إضافة أرقام الفيدباك</b></div><div class="body"><div class="grid"><div><label>التاريخ</label><input type="date" id="add_date"></div><div><label>رقم الوردية *</label><input id="add_shift" placeholder="مثال: 1"></div><div><label>اسم العميل</label><input id="m_name"></div><div><label>رقم العميل</label><input id="m_phone"></div><div style="align-self:end"><button class="btn green" onclick="manualAdd()">إضافة يدوي</button></div></div><br><label>إضافة Bulk</label><textarea id="bulk" rows="4" placeholder="مثال: محمد,01000000000&#10;أحمد:0101,0102&#10;0103,0104"></textarea><button class="btn green" onclick="bulkAdd()">إضافة المجموعة</button><hr style="margin:15px 0"><div class="grid"><div><label>رفع Excel/CSV</label><input type="file" id="file"></div><div style="align-self:end"><button class="btn" onclick="uploadExcel()">رفع الملف</button></div><div class="muted" style="grid-column:span 4;align-self:end">الأعمدة المقبولة: name/customer/اسم و phone/mobile/رقم. لو مفيش headers هيتعرف تلقائيًا.</div></div></div></div><div class="panel"><div class="head"><b>الفلاتر</b><div><button class="btn red" onclick="closeShift()">إغلاق الوردية وإخفاؤها من الموظفين</button><button class="btn gray" onclick="reopenShift()">إعادة إتاحة الوردية</button></div></div><div class="body"><div class="grid"><div><label>من تاريخ</label><input type="date" id="df"></div><div><label>إلى تاريخ</label><input type="date" id="dt"></div><div><label>رقم الوردية</label><input id="shift"></div><div><label>الحالة</label><select id="status"><option>All</option><option>Pending</option><option>Completed</option><option>Closed</option></select></div><div style="align-self:end"><button class="btn green" onclick="load()">تحديث</button><button class="btn orange" onclick="window.print()">PDF/طباعة</button><button class="btn" onclick="csvExport()">CSV</button></div></div></div></div><div class="cards"><div class="card">الإجمالي<div class="num" id="total">0</div></div><div class="card">تم الفيدباك<div class="num" id="completed">0</div></div><div class="card">متبقي<div class="num" id="pending">0</div></div><div class="card">متوسط التقييم<div class="num" id="avg">0</div></div></div><br><div class="panel"><div class="head"><b>حسب الموظف</b></div><div class="body scroll"><table class="table"><thead><tr><th>الموظف</th><th>عدد الفيدباك</th><th>متوسط التقييم</th></tr></thead><tbody id="byagent"></tbody></table></div></div><div class="panel"><div class="head"><b>التفاصيل</b></div><div class="body scroll"><table class="table"><thead><tr><th>التاريخ</th><th>رقم الوردية</th><th>العميل</th><th>الرقم</th><th>الحالة</th><th>متاح</th><th>التقييم</th><th>الرضاء</th><th>الموظف</th><th>التفاصيل</th><th>ملاحظات</th></tr></thead><tbody id="rows"></tbody></table></div></div></div><div class="toast" id="toast"></div><script>let last=null;function today(){return new Date().toISOString().slice(0,10)}function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function qs(o){let p=new URLSearchParams();Object.keys(o||{}).forEach(k=>{let v=o[k];if(v!==undefined&&v!==null&&v!==''&&v!=='All')p.append(k,v)});return p.toString()}async function api(m,args){let q=qs(args||{});let r=await fetch('/api/method/'+m+(q?'?'+q:''),{method:'GET',credentials:'same-origin',cache:'no-store'});let j=await r.json();if(j.exc)throw j;return j.message||j}function toast(x){let t=document.getElementById('toast');t.textContent=x;t.style.display='block';setTimeout(()=>t.style.display='none',3500)}async function manualAdd(){let r=await api('restaurant_ops.api.feedback_api.add_feedback_manual',{feedback_date:add_date.value,shift_number:add_shift.value,customer_name:m_name.value,customer_phone:m_phone.value});toast((r&&r.message)||'تم');load()}async function bulkAdd(){let r=await api('restaurant_ops.api.feedback_api.add_feedback_bulk',{feedback_date:add_date.value,shift_number:add_shift.value,text:bulk.value});toast('تم إضافة '+(r.created||0)+' وتجاهل مكرر '+(r.skipped_duplicates||0));load()}async function uploadExcel(){let f=document.getElementById('file').files[0];if(!f){toast('اختار ملف');return}let fd=new FormData();fd.append('file',f);fd.append('feedback_date',add_date.value);fd.append('shift_number',add_shift.value);let r=await fetch('/api/method/restaurant_ops.api.feedback_api.upload_feedback_excel',{method:'POST',body:fd,credentials:'same-origin'});let j=await r.json();let m=j.message||{};toast('تم رفع '+(m.created||0)+' وتجاهل مكرر '+(m.skipped_duplicates||0));load()}async function closeShift(){if(!shift.value){toast('اكتب رقم الوردية في الفلتر');return}let r=await api('restaurant_ops.api.feedback_api.close_feedback_shift',{feedback_date:df.value,shift_number:shift.value});toast((r&&r.message)||'تم');load()}async function reopenShift(){if(!shift.value){toast('اكتب رقم الوردية في الفلتر');return}let r=await api('restaurant_ops.api.feedback_api.reopen_feedback_shift',{feedback_date:df.value,shift_number:shift.value});toast((r&&r.message)||'تم');load()}async function load(){last=await api('restaurant_ops.api.feedback_api.get_feedback_admin_report',{date_from:df.value,date_to:dt.value,shift_number:shift.value,status:status.value});let s=last.summary||{};total.textContent=s.total||0;completed.textContent=s.completed||0;pending.textContent=s.pending||0;avg.textContent=s.avg_rating||0;byagent.innerHTML=(last.by_agent||[]).map(x=>'<tr><td>'+esc(x.agent)+'</td><td>'+x.count+'</td><td>'+x.avg_rating+'</td></tr>').join('')||'<tr><td colspan="3" style="text-align:center">لا توجد بيانات</td></tr>';rows.innerHTML=(last.rows||[]).map(r=>'<tr><td>'+esc(r.feedback_date)+'</td><td>'+esc(r.shift_number)+'</td><td>'+esc(r.customer_name)+'</td><td>'+esc(r.customer_phone)+'</td><td>'+esc(r.status)+'</td><td>'+(r.is_active?'نعم':'لا')+'</td><td>'+esc(r.rating||'')+'</td><td>'+esc(r.satisfaction||'')+'</td><td>'+esc(r.agent_employee_name||r.agent_user||'')+'</td><td>'+esc(r.details||'')+'</td><td>'+esc(r.notes||'')+'</td></tr>').join('')||'<tr><td colspan="11" style="text-align:center">لا توجد بيانات</td></tr>'}function csvExport(){if(!last)return;let headers=['date','shift','customer','phone','status','active','rating','satisfaction','agent','details','notes'];let lines=[headers.join(',')].concat((last.rows||[]).map(r=>[r.feedback_date,r.shift_number,r.customer_name,r.customer_phone,r.status,r.is_active,r.rating||'',r.satisfaction||'',r.agent_employee_name||r.agent_user||'',r.details||'',r.notes||''].map(x=>'"'+String(x||'').replace(/"/g,'""')+'"').join(',')));let blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'});let a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='feedback-report.csv';a.click()}df.value=today();dt.value=today();add_date.value=today();load();</script></body></html>
+HTML
+
+cat > "$FEEDBACK_HTML" <<'HTML'
+<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>الفيدباك</title><style>*{box-sizing:border-box;font-family:Tahoma,Arial}body{margin:0;background:#eef2f7;direction:rtl;color:#111827}.top{background:#20262d;color:white;padding:14px 22px;border-bottom:4px solid #1F4E79;display:flex;justify-content:space-between;align-items:center}.top a{color:#fff;text-decoration:none;border:1px solid #64748b;border-radius:10px;padding:8px 12px}.wrap{padding:22px;max-width:1400px;margin:auto}.panel{background:#fff;border:1px solid #d8dee9;border-radius:16px;box-shadow:0 10px 28px #0001;margin-bottom:16px;overflow:hidden}.head{padding:14px 16px;border-bottom:1px solid #e5e7eb}.body{padding:16px}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}input,select,textarea{width:100%;border:1px solid #d1d5db;border-radius:10px;padding:8px}.btn{border:0;border-radius:10px;padding:9px 12px;background:#1F4E79;color:#fff;font-weight:800;cursor:pointer;margin:2px}.green{background:#16a34a}.table{width:100%;border-collapse:collapse;min-width:1000px}.table th{background:#111827;color:#fff;padding:9px}.table td{border:1px solid #e5e7eb;padding:8px}.scroll{overflow:auto}.toast{position:fixed;right:18px;bottom:18px;background:#111827;color:#fff;padding:12px 14px;border-radius:12px;display:none;z-index:99}@media(max-width:900px){.grid{grid-template-columns:1fr}.wrap{padding:12px}.table{min-width:850px}}</style></head><body><div class="top"><b>📣 الفيدباك</b><div><a href="/agent-desk">Agent Desk</a> <a href="/admin-desk">Admin Desk</a></div></div><div class="wrap"><div class="panel"><div class="head"><b>الفلاتر</b></div><div class="body"><div class="grid"><div><label>التاريخ</label><input type="date" id="df"></div><div><label>رقم الوردية</label><input id="shift"></div><div style="align-self:end"><button class="btn green" onclick="load()">تحديث</button></div><div style="align-self:end"><span id="count"></span></div></div></div></div><div class="panel"><div class="head"><b>عملاء مطلوب عمل فيدباك لهم</b></div><div class="body scroll"><table class="table"><thead><tr><th>اسم العميل</th><th>رقم العميل</th><th>رقم الوردية</th><th>التقييم من 10</th><th>درجة الرضاء</th><th>التفاصيل</th><th>ملاحظات</th><th>حفظ</th></tr></thead><tbody id="rows"></tbody></table></div></div><div class="panel"><div class="head"><b>تم بواسطتي</b></div><div class="body scroll"><table class="table"><thead><tr><th>العميل</th><th>الرقم</th><th>التقييم</th><th>الرضاء</th><th>التفاصيل</th><th>ملاحظات</th></tr></thead><tbody id="done"></tbody></table></div></div></div><div class="toast" id="toast"></div><script>function today(){return new Date().toISOString().slice(0,10)}function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function qs(o){let p=new URLSearchParams();Object.keys(o||{}).forEach(k=>{let v=o[k];if(v!==undefined&&v!==null&&v!=='')p.append(k,v)});return p.toString()}async function api(m,args){let q=qs(args||{});let r=await fetch('/api/method/'+m+(q?'?'+q:''),{method:'GET',credentials:'same-origin',cache:'no-store'});let j=await r.json();if(j.exc)throw j;return j.message||j}function toast(x){let t=document.getElementById('toast');t.textContent=x;t.style.display='block';setTimeout(()=>t.style.display='none',3000)}async function load(){let d=await api('restaurant_ops.api.feedback_api.list_feedback_tasks',{feedback_date:df.value,shift_number:shift.value,include_completed_by_me:1});count.textContent='المتبقي: '+(d.count||0);rows.innerHTML=(d.pending||[]).map(r=>'<tr><td>'+esc(r.customer_name)+'</td><td>'+esc(r.customer_phone)+'</td><td>'+esc(r.shift_number)+'</td><td><select id="rate_'+r.name+'">'+[1,2,3,4,5,6,7,8,9,10].map(x=>'<option>'+x+'</option>').join('')+'</select></td><td><select id="sat_'+r.name+'"><option>ممتاز</option><option>جيد جدا</option><option>جيد</option><option>مقبول</option></select></td><td><textarea id="det_'+r.name+'" rows="2"></textarea></td><td><textarea id="note_'+r.name+'" rows="2"></textarea></td><td><button class="btn green" onclick="save(\''+r.name+'\')">حفظ</button></td></tr>').join('')||'<tr><td colspan="8" style="text-align:center">لا توجد أرقام متاحة للفيدباك حاليًا</td></tr>';done.innerHTML=(d.completed_by_me||[]).map(r=>'<tr><td>'+esc(r.customer_name)+'</td><td>'+esc(r.customer_phone)+'</td><td>'+esc(r.rating)+'</td><td>'+esc(r.satisfaction)+'</td><td>'+esc(r.details)+'</td><td>'+esc(r.notes)+'</td></tr>').join('')||'<tr><td colspan="6" style="text-align:center">لا توجد بيانات</td></tr>'}async function save(id){let r=await api('restaurant_ops.api.feedback_api.submit_feedback',{feedback_id:id,rating:document.getElementById('rate_'+id).value,satisfaction:document.getElementById('sat_'+id).value,details:document.getElementById('det_'+id).value,notes:document.getElementById('note_'+id).value});toast((r&&r.message)||'تم');load()}df.value=today();load();</script></body></html>
+HTML
+
+# -----------------------------------------------------------------------------
+# 4) Patch cards in admin and agent desks
+# -----------------------------------------------------------------------------
+echo "🧩 Step 4: Add cards to admin/agent desks"
+export ADMIN_HTML AGENT_HTML
+python3 - <<'PY'
+from pathlib import Path
+import os
+admin=Path(os.environ['ADMIN_HTML']); agent=Path(os.environ['AGENT_HTML'])
+if admin.exists():
+    s=admin.read_text(encoding='utf-8',errors='ignore')
+    if '/feedback-admin' not in s:
+        card='<a href="/feedback-admin" class="mod-card"><div class="icon">📣</div><div class="lbl">متابعة الفيدباك</div><div class="desc">رفع الأرقام ومتابعة النتائج</div></a>\n      <a href="/feedback" class="mod-card"><div class="icon">☎️</div><div class="lbl">عمل فيدباك</div><div class="desc">تنفيذ مكالمات الفيدباك</div></a>\n      '
+        marker='</section>\n  </main>'
+        if marker in s: s=s.replace(marker, card+marker,1)
+        else: s=s.replace('</body>', card+'</body>')
+        # sidebar link
+        if 'متابعة الفيدباك' not in s.split('<aside',1)[-1].split('</aside>',1)[0]:
+            s=s.replace('<a href="/order-cancellations-report"><b>↩️</b> <span>تقرير الإلغاءات</span></a>', '<a href="/order-cancellations-report"><b>↩️</b> <span>تقرير الإلغاءات</span></a>\n    <a href="/feedback-admin"><b>📣</b> <span>متابعة الفيدباك</span></a>')
+    admin.write_text(s,encoding='utf-8')
+if agent.exists():
+    s=agent.read_text(encoding='utf-8',errors='ignore')
+    if 'href="/feedback"' not in s:
+        card='<a href="/feedback" class="card"><div class="icon">📣</div><div class="lbl">الفيدباك</div><div>تقييمات العملاء</div></a>'
+        # Insert inside the first cards container before its closing div, using a known existing card marker.
+        if '<a href="/sales-entry"' in s:
+            idx=s.find('<a href="/sales-entry"')
+            end=s.find('</a>', idx)
+            if end!=-1:
+                end+=4
+                s=s[:end]+card+s[end:]
+            else:
+                s=s.replace('</body>', card+'</body>')
+        else:
+            s=s.replace('</body>', card+'</body>')
+    agent.write_text(s,encoding='utf-8')
+PY
+
+# -----------------------------------------------------------------------------
+# 5) Patch emails with feedback section
+# -----------------------------------------------------------------------------
+echo "🧩 Step 5: Patch emails with feedback section"
+# Remove previous V27 feedback email blocks if this script is re-run.
+python3 - <<'PYCLEAN'
+from pathlib import Path
+import os
+for env, a, b in [
+    ('UPPER_API', '# BEGIN ROSHDY FEEDBACK UPPER EMAIL V27', '# END ROSHDY FEEDBACK UPPER EMAIL V27'),
+    ('EMAIL_REPORT', '# BEGIN ROSHDY FEEDBACK CENTER EMAIL V27', '# END ROSHDY FEEDBACK CENTER EMAIL V27'),
+]:
+    p=Path(os.environ[env])
+    if not p.exists():
+        continue
+    s=p.read_text(encoding='utf-8', errors='ignore')
+    while a in s and b in s:
+        i=s.index(a); j=s.index(b,i)+len(b); s=s[:i]+'\n'+s[j:]
+    p.write_text(s, encoding='utf-8')
+
+PYCLEAN
+cat >> "$UPPER_API" <<'PYUPPER'
+
+# BEGIN ROSHDY FEEDBACK UPPER EMAIL V27
+try:
+    import frappe
+    from frappe.utils import today, cstr
+    import html as _fb27_html
+except Exception:
+    pass
+
+try:
+    _fb27_prev_render_upper_management_report_html = render_upper_management_report_html
+except Exception:
+    _fb27_prev_render_upper_management_report_html = None
+
+
+def _fb27_e(v):
+    return _fb27_html.escape(cstr(v) if v is not None else "")
+
+
+def _fb27_feedback_email_section(date_from=None, date_to=None, audience="upper"):
+    try:
+        from restaurant_ops.api.feedback_api import get_feedback_email_summary
+        d = get_feedback_email_summary(date_from=date_from or today(), date_to=date_to or date_from or today())
+    except Exception as e:
+        return "<div style='border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-top:14px'><h3>📣 الفيدباك</h3><div style='color:#991b1b'>تعذر تحميل الفيدباك: %s</div></div>" % _fb27_e(e)
+    sat = d.get("satisfaction_counts") or {}
+    by_agent = d.get("by_agent") or {}
+    sat_rows = "".join("<tr><td style='padding:8px;border:1px solid #e5e7eb'>%s</td><td style='padding:8px;border:1px solid #e5e7eb'><b>%s</b></td></tr>" % (_fb27_e(k), _fb27_e(v)) for k,v in sat.items()) or "<tr><td colspan='2' style='padding:10px;text-align:center;color:#64748b'>لا توجد تقييمات مكتملة</td></tr>"
+    agent_rows = "".join("<tr><td style='padding:8px;border:1px solid #e5e7eb'>%s</td><td style='padding:8px;border:1px solid #e5e7eb'><b>%s</b></td></tr>" % (_fb27_e(k), _fb27_e(v)) for k,v in by_agent.items()) or "<tr><td colspan='2' style='padding:10px;text-align:center;color:#64748b'>لا توجد بيانات موظفين</td></tr>"
+    return f"""
+    <!-- ROSHDY_FEEDBACK_EMAIL_SECTION_V27 -->
+    <div style="border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-top:14px;text-align:right;direction:rtl">
+      <h3 style="margin:0 0 8px">📣 الفيدباك</h3>
+      <table width="100%" dir="rtl" style="border-collapse:collapse;margin-bottom:10px"><tr>
+        <td style="padding:8px;border:1px solid #e5e7eb;background:#f8fafc">إجمالي الأرقام</td><td style="padding:8px;border:1px solid #e5e7eb"><b>{_fb27_e(d.get('total'))}</b></td>
+        <td style="padding:8px;border:1px solid #e5e7eb;background:#f8fafc">تم الفيدباك</td><td style="padding:8px;border:1px solid #e5e7eb"><b>{_fb27_e(d.get('completed'))}</b></td>
+        <td style="padding:8px;border:1px solid #e5e7eb;background:#f8fafc">متبقي</td><td style="padding:8px;border:1px solid #e5e7eb"><b>{_fb27_e(d.get('pending'))}</b></td>
+        <td style="padding:8px;border:1px solid #e5e7eb;background:#f8fafc">متوسط التقييم</td><td style="padding:8px;border:1px solid #e5e7eb"><b>{_fb27_e(d.get('avg_rating'))}</b></td>
+      </tr></table>
+      <table width="100%" dir="rtl" style="border-collapse:collapse"><tr><td style="vertical-align:top;width:50%"><b>حسب درجة الرضاء</b><table width="100%" style="border-collapse:collapse;margin-top:6px">{sat_rows}</table></td><td style="vertical-align:top;width:50%"><b>حسب الموظف</b><table width="100%" style="border-collapse:collapse;margin-top:6px">{agent_rows}</table></td></tr></table>
+    </div>
+    """
+
+
+@frappe.whitelist()
+def render_upper_management_report_html(date_from=None, date_to=None):
+    html = _fb27_prev_render_upper_management_report_html(date_from=date_from, date_to=date_to) if _fb27_prev_render_upper_management_report_html else ""
+    if "ROSHDY_FEEDBACK_EMAIL_SECTION_V27" in cstr(html):
+        return html
+    section = _fb27_feedback_email_section(date_from, date_to, "upper")
+    if "</body>" in cstr(html):
+        return html.replace("</body>", section + "</body>")
+    return cstr(html) + section
+
+
+@frappe.whitelist()
+def verify_feedback_in_upper_email(date_from=None, date_to=None):
+    html = render_upper_management_report_html(date_from=date_from, date_to=date_to)
+    from restaurant_ops.api.feedback_api import get_feedback_email_summary
+    d = get_feedback_email_summary(date_from=date_from or today(), date_to=date_to or date_from or today())
+    return {"success": True, "html_has_feedback": "ROSHDY_FEEDBACK_EMAIL_SECTION_V27" in cstr(html), "summary": d}
+# END ROSHDY FEEDBACK UPPER EMAIL V27
+PYUPPER
+
+cat >> "$EMAIL_REPORT" <<'PYCENTER'
+
+# BEGIN ROSHDY FEEDBACK CENTER EMAIL V27
+try:
+    import frappe
+    from frappe.utils import today, cstr
+    import html as _fbc27_html
+except Exception:
+    pass
+
+try:
+    _fbc27_prev_build_center_manager_report = build_center_manager_report
+except Exception:
+    _fbc27_prev_build_center_manager_report = None
+try:
+    _fbc27_prev_adv_render = _adv_render
+except Exception:
+    _fbc27_prev_adv_render = None
+
+
+def _fbc27_e(v):
+    return _fbc27_html.escape(cstr(v) if v is not None else "")
+
+
+def _fbc27_section(date_from=None, date_to=None):
+    try:
+        from restaurant_ops.api.feedback_api import get_feedback_email_summary
+        d = get_feedback_email_summary(date_from=date_from or today(), date_to=date_to or date_from or today())
+    except Exception as e:
+        return "<h3>📣 الفيدباك</h3><div class='note'>تعذر تحميل الفيدباك: %s</div>" % _fbc27_e(e)
+    sat = d.get("satisfaction_counts") or {}
+    by_agent = d.get("by_agent") or {}
+    sat_rows = [[k, v] for k, v in sat.items()]
+    agent_rows = [[k, v] for k, v in by_agent.items()]
+    def table(headers, rows):
+        try:
+            return _er_table(headers, rows)
+        except Exception:
+            th="".join("<th>%s</th>" % _fbc27_e(h) for h in headers)
+            body="".join("<tr>"+"".join("<td>%s</td>" % _fbc27_e(c) for c in r)+"</tr>" for r in rows) or "<tr><td colspan='%s'>لا توجد بيانات</td></tr>" % len(headers)
+            return "<table><thead><tr>"+th+"</tr></thead><tbody>"+body+"</tbody></table>"
+    return """
+    <!-- ROSHDY_FEEDBACK_EMAIL_SECTION_V27 -->
+    <h3>📣 الفيدباك</h3>
+    <div class="cards">
+      <div class="card"><div class="label">إجمالي الأرقام</div><div class="value">%s</div></div>
+      <div class="card green"><div class="label">تم الفيدباك</div><div class="value">%s</div></div>
+      <div class="card orange"><div class="label">متبقي</div><div class="value">%s</div></div>
+      <div class="card"><div class="label">متوسط التقييم</div><div class="value">%s</div></div>
+    </div>
+    %s
+    %s
+    """ % (_fbc27_e(d.get('total')), _fbc27_e(d.get('completed')), _fbc27_e(d.get('pending')), _fbc27_e(d.get('avg_rating')), table(["درجة الرضاء", "العدد"], sat_rows), table(["الموظف", "عدد الفيدباك"], agent_rows))
+
+
+def _fbc27_inject(html, date_from=None, date_to=None):
+    html = cstr(html or "")
+    if "ROSHDY_FEEDBACK_EMAIL_SECTION_V27" in html:
+        return html
+    section = _fbc27_section(date_from, date_to)
+    if "</body>" in html:
+        return html.replace("</body>", section + "</body>")
+    return html + section
+
+
+def build_center_manager_report():
+    html = _fbc27_prev_build_center_manager_report() if _fbc27_prev_build_center_manager_report else ""
+    return _fbc27_inject(html, today(), today())
+
+
+def _adv_render(report_type="center"):
+    html = _fbc27_prev_adv_render(report_type) if _fbc27_prev_adv_render else ""
+    # inject into center report only; upper has its own module injection
+    if cstr(report_type).lower() in ("center", "manager", "customer_service", "مدير خدمة العملاء"):
+        return _fbc27_inject(html, today(), today())
+    return html
+
+
+@frappe.whitelist()
+def debug_center_feedback_email_section(date_from=None, date_to=None):
+    from restaurant_ops.api.feedback_api import get_feedback_email_summary
+    d = get_feedback_email_summary(date_from=date_from or today(), date_to=date_to or date_from or today())
+    html = _fbc27_section(date_from or today(), date_to or date_from or today())
+    return {"success": True, "summary": d, "html_has_feedback": "ROSHDY_FEEDBACK_EMAIL_SECTION_V27" in html}
+# END ROSHDY FEEDBACK CENTER EMAIL V27
+PYCENTER
+
+# -----------------------------------------------------------------------------
+# 6) Ownership, doctype creation, cache/restart, validation
+# -----------------------------------------------------------------------------
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+[[ -n "$APP_OWNER" ]] && chown "$APP_OWNER" "$FEEDBACK_API" "$UPPER_API" "$EMAIL_REPORT" "$FEEDBACK_HTML" "$FEEDBACK_PY" "$FEEDBACK_ADMIN_HTML" "$FEEDBACK_ADMIN_PY" "$ADMIN_HTML" "$AGENT_HTML" 2>/dev/null || true
+
+echo "🧱 Step 6: Create/ensure Feedback DocType"
+bench_exec execute restaurant_ops.api.feedback_api.ensure_feedback_doctype | tee "$BACKUP_DIR/ensure_feedback_doctype.txt"
+
+echo "🧹 Step 7: Clear cache + restart app services"
+bench_exec clear-cache || true
+"${COMPOSE[@]}" restart backend frontend websocket queue-short queue-long scheduler >/dev/null
+sleep 8
+bench_exec clear-cache || true
+
+echo "🧪 Step 8: Validation"
+set +e
+for p in feedback feedback-admin admin-desk agent-desk email-report-customizer; do
+  code="$(curl -k -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$p" 2>/dev/null || echo 000)"
+  echo "$p => $code" | tee -a "$BACKUP_DIR/page_smoke_checks_v27.txt"
+done
+bench_exec execute restaurant_ops.api.feedback_api.debug_feedback_status | tee "$BACKUP_DIR/debug_feedback_status.txt"
+V1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.feedback_api.get_feedback_email_summary | tee "$BACKUP_DIR/feedback_email_summary.txt"
+V2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.upper_management_email_api.verify_feedback_in_upper_email | tee "$BACKUP_DIR/verify_feedback_in_upper_email.txt"
+V3=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.email_report.debug_center_feedback_email_section | tee "$BACKUP_DIR/verify_feedback_in_center_email.txt"
+V4=${PIPESTATUS[0]}
+set -e
+
+if [[ $V1 -ne 0 || $V2 -ne 0 || $V3 -ne 0 || $V4 -ne 0 ]]; then
+  echo "❌ Feedback validation failed. راجع: $BACKUP_DIR"
+  exit 1
+fi
+
+echo "🏥 Step 9: Health Check - Elastix/CDR/AMI + Queue + Call Report"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$BACKUP_DIR/health_asterisk_bridge.txt"
+H1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status | tee "$BACKUP_DIR/health_queue_status.txt"
+H2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' | tee "$BACKUP_DIR/health_call_report.txt"
+H3=${PIPESTATUS[0]}
+set -e
+
+if [[ $H1 -ne 0 || $H2 -ne 0 || $H3 -ne 0 ]]; then
+  echo "⚠️ Health returned non-zero. راجع: $BACKUP_DIR"
+else
+  echo "✅ Health checks OK"
+fi
+
+echo "============================================================"
+echo "✅ DONE V27 Feedback module"
+echo "📦 Backup folder: $BACKUP_DIR"
+echo "🌐 Admin: /feedback-admin"
+echo "🌐 Agent/Admin work page: /feedback"
+echo "📧 Feedback linked to Upper + Center emails"
+echo "🛡️ report_api.py / Elastix / CDR / AMI untouched"
+echo "============================================================"

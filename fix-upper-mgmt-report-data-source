@@ -1,0 +1,354 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Fix Upper Management report data source:
+# - Stop the new report from trying to connect directly to CDR with a wrongly detected host/email.
+# - Read complaint queue count and employee missed count from the already-working Call Report API.
+# - Does NOT touch restaurant_ops.api.report_api.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "❌ docker compose/docker-compose مش موجود"
+  exit 1
+fi
+
+APP_DIR="$ROOT/apps/$APP"
+PKG_DIR="$APP_DIR/$APP"
+API_FILE="$PKG_DIR/api/upper_management_email_api.py"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/FIX_UPPER_MGMT_DATA_SOURCE_BEFORE_$TS"
+mkdir -p "$BACKUP_DIR"
+
+if [[ ! -f "$API_FILE" ]]; then
+  echo "❌ الملف مش موجود: $API_FILE"
+  exit 1
+fi
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend container مش شغال أو مش لاقيه"
+  exit 1
+fi
+
+bench_exec() {
+  "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"
+}
+
+echo "============================================================"
+echo "🔧 Fix Upper Management data source"
+echo "📦 Backup: $BACKUP_DIR"
+echo "============================================================"
+
+echo "🧯 Backup current upper_management_email_api.py"
+cp -a "$API_FILE" "$BACKUP_DIR/upper_management_email_api.py.before"
+
+export API_FILE
+python3 - <<'PY'
+# -*- coding: utf-8 -*-
+from pathlib import Path
+import os
+
+p = Path(os.environ["API_FILE"])
+s = p.read_text(encoding="utf-8", errors="ignore")
+
+start = "# BEGIN ROSHDY UPPER MGMT REPORT_API DATA SOURCE FIX"
+end = "# END ROSHDY UPPER MGMT REPORT_API DATA SOURCE FIX"
+block = r'''
+# BEGIN ROSHDY UPPER MGMT REPORT_API DATA SOURCE FIX
+# This override intentionally avoids any direct CDR/MySQL connection here.
+# The existing Call Report API is already validated and healthy, so the Upper Management report reads from it.
+# report_api.py itself is NOT edited.
+
+
+def _roshdy_conf_queue(kind="complaint"):
+    """Small safe queue resolver without scanning unrelated email/settings fields."""
+    try:
+        conf = getattr(frappe.local, "conf", {}) or {}
+        if kind == "complaint":
+            for k in ("complaint_queue", "complaints_queue", "complaint_queue_number", "complaints_queue_number"):
+                if conf.get(k):
+                    return cstr(conf.get(k))
+            return DEFAULT_COMPLAINT_QUEUE
+        for k in ("order_queue", "orders_queue", "order_queue_number", "orders_queue_number"):
+            if conf.get(k):
+                return cstr(conf.get(k))
+        return DEFAULT_ORDER_QUEUE
+    except Exception:
+        return DEFAULT_COMPLAINT_QUEUE if kind == "complaint" else DEFAULT_ORDER_QUEUE
+
+
+def _roshdy_call_report_api_page(date_from=None, date_to=None, page=1, page_size=5000):
+    """Call existing report_api safely. No direct CDR credentials used."""
+    try:
+        from restaurant_ops.api import report_api
+    except Exception as e:
+        return {"success": False, "error": f"cannot import report_api: {e}"}
+
+    base = {"page": page, "page_size": page_size, "view_mode": "admin"}
+    variants = [
+        {"date_from": cstr(date_from), "date_to": cstr(date_to)},
+        {"from_date": cstr(date_from), "to_date": cstr(date_to)},
+        {"start_date": cstr(date_from), "end_date": cstr(date_to)},
+        {"date": cstr(date_from)},
+        {},
+    ]
+    last_error = None
+    for dv in variants:
+        kwargs = dict(base)
+        kwargs.update(dv)
+        try:
+            return _unwrap_result(report_api.get_calls_report(**kwargs))
+        except TypeError as e:
+            last_error = cstr(e)
+            continue
+        except Exception as e:
+            last_error = cstr(e)
+            continue
+    return {"success": False, "error": last_error or "unknown report_api error"}
+
+
+def _roshdy_report_rows_summary(date_from=None, date_to=None):
+    """Fetch enough rows from Call Report for daily admin calculations."""
+    first = _roshdy_call_report_api_page(date_from, date_to, page=1, page_size=5000)
+    rows = list(_find_rows(first) or [])
+    summary = first.get("summary") if isinstance(first, dict) and isinstance(first.get("summary"), dict) else {}
+    pagination = first.get("pagination") if isinstance(first, dict) and isinstance(first.get("pagination"), dict) else {}
+
+    try:
+        total_pages = cint(pagination.get("total_pages") or 1)
+    except Exception:
+        total_pages = 1
+    # Safety cap: 10 pages x 5000 = 50k rows, enough for daily report without hanging email preview.
+    max_pages = min(max(total_pages, 1), 10)
+    for page in range(2, max_pages + 1):
+        res = _roshdy_call_report_api_page(date_from, date_to, page=page, page_size=5000)
+        rows.extend(_find_rows(res) or [])
+
+    return {"first": first, "rows": rows, "summary": summary, "pagination": pagination}
+
+
+def _roshdy_row_queue_match(row, queues):
+    queues = [cstr(q).strip() for q in _as_list(queues) if cstr(q).strip()]
+    if not queues or not isinstance(row, dict):
+        return False
+    dst = cstr(row.get("dst") or "").strip()
+    lastdata = cstr(row.get("lastdata") or "")
+    recording = cstr(row.get("recordingfile") or row.get("recording_url") or "")
+    actual_ext = cstr(row.get("actual_ext") or "").strip()
+    agent_name = cstr(row.get("agent_name") or "")
+    blob = " ".join([dst, lastdata, recording, actual_ext, agent_name])
+    for q in queues:
+        if dst == q:
+            return True
+        if actual_ext == q and "طابور" in agent_name:
+            return True
+        if lastdata.startswith(q + ",") or lastdata.startswith(q + "|"):
+            return True
+        if f"q-{q}-" in recording:
+            return True
+        if f"Queue({q}" in blob:
+            return True
+    return False
+
+
+def _roshdy_is_employee_missed_row(row):
+    if not isinstance(row, dict):
+        return False
+    smart = cstr(row.get("smart_category") or row.get("category") or "").lower()
+    label = cstr(row.get("category_label") or row.get("status_label") or "").lower()
+    disposition = cstr(row.get("disposition") or "").upper()
+    actual_ext = cstr(row.get("actual_ext") or row.get("extension") or "").strip()
+    dstchannel = cstr(row.get("dstchannel") or "")
+    agent_name = cstr(row.get("agent_name") or row.get("employee_name") or row.get("employee") or "")
+
+    # Must have a real employee/extension target, not just the queue itself.
+    has_agent_target = bool(actual_ext or dstchannel or agent_name)
+    if actual_ext in (DEFAULT_COMPLAINT_QUEUE, DEFAULT_ORDER_QUEUE, "123", "1234") and "طابور" in agent_name:
+        has_agent_target = False
+    if not has_agent_target:
+        return False
+
+    if smart in ("staff_missed", "employee_missed", "agent_missed", "missed_by_employee"):
+        return True
+    if any(x in label for x in ("فائتة من الموظف", "فاتت من موظف", "لم يرد الموظف", "موظف")) and any(x in label for x in ("فائت", "لم يتم الرد", "رفض", "كنسل")):
+        return True
+    if disposition in ("NO ANSWER", "BUSY", "FAILED") and actual_ext and actual_ext not in ("123", "1234"):
+        return True
+    return False
+
+
+def _roshdy_missed_reason(row):
+    smart = cstr(row.get("smart_category") or "").lower()
+    label = cstr(row.get("category_label") or "").lower()
+    disposition = cstr(row.get("disposition") or "").upper()
+    if smart in ("declined", "rejected") or disposition in ("BUSY", "FAILED") or any(x in label for x in ("رفض", "كنسل", "مرفوض")):
+        return "تم رفض/كنسلة المكالمة"
+    return "سابها ترن حتى انتهت"
+
+
+def _roshdy_employee_label(row):
+    for k in ("agent_name", "employee_name", "employee", "agent", "answered_by"):
+        if row.get(k):
+            return cstr(row.get(k))
+    ext = cstr(row.get("actual_ext") or row.get("extension") or "").strip()
+    return _employee_name_from_extension(ext) or ext or "غير محدد"
+
+
+def _roshdy_missed_rows(rows):
+    out = []
+    seen = set()
+    for r in rows or []:
+        if not _roshdy_is_employee_missed_row(r):
+            continue
+        uid = cstr(r.get("uniqueid") or r.get("name") or "")
+        if uid and uid in seen:
+            continue
+        if uid:
+            seen.add(uid)
+        ext = cstr(r.get("actual_ext") or r.get("extension") or "").strip()
+        if not ext:
+            ext = _extract_extension(" ".join([cstr(r.get("dstchannel") or ""), cstr(r.get("channel") or "")]))
+        out.append({
+            "time": cstr(r.get("calldate") or r.get("call_time") or r.get("time") or r.get("creation") or ""),
+            "employee": _roshdy_employee_label(r),
+            "extension": ext,
+            "caller": cstr(r.get("src") or r.get("caller") or r.get("caller_id") or r.get("cnum") or ""),
+            "reason": _roshdy_missed_reason(r),
+            "ring_seconds": cstr(r.get("duration") or r.get("ring_seconds") or r.get("ringtime") or ""),
+            "source": "report_api",
+        })
+    return out
+
+
+def _count_complaint_queue_calls(start_dt, end_dt):
+    """Override: complaint queue count from existing Call Report rows, not direct CDR."""
+    q = _roshdy_conf_queue("complaint") or DEFAULT_COMPLAINT_QUEUE
+    start_date = getdate(start_dt)
+    end_date = getdate(end_dt)
+    data = _roshdy_report_rows_summary(start_date, end_date)
+    first = data.get("first") or {}
+    if isinstance(first, dict) and first.get("success") is False and first.get("error"):
+        return {"count": None, "queue": q, "source": "report_api_unavailable", "error": first.get("error")}
+    rows = data.get("rows") or []
+    count = sum(1 for r in rows if _roshdy_row_queue_match(r, q))
+    return {"count": count, "queue": q, "source": "report_api"}
+
+
+def _get_call_stats(start_date, end_date, start_dt, end_dt):
+    """Override: all main call stats and employee missed rows from existing Call Report API."""
+    data = _roshdy_report_rows_summary(start_date, end_date)
+    first = data.get("first") or {}
+    rows = data.get("rows") or []
+    summary = data.get("summary") or {}
+    pagination = data.get("pagination") or {}
+
+    total = summary.get("total")
+    if total is None:
+        total = pagination.get("total_records")
+    if total is None:
+        total = len(rows)
+
+    answered = summary.get("answered")
+    if answered is None:
+        answered = 0
+        for r in rows:
+            smart = cstr(r.get("smart_category") or "").lower()
+            disp = cstr(r.get("disposition") or "").upper()
+            label = cstr(r.get("category_label") or "")
+            if smart == "answered" or disp == "ANSWERED" or "تم الرد" in label:
+                answered += 1
+
+    missed_rows = _roshdy_missed_rows(rows)
+    missed = summary.get("staff_missed")
+    if missed is None:
+        missed = summary.get("employee_missed")
+    if missed is None:
+        missed = len(missed_rows)
+
+    return {
+        "total": cint(total or 0),
+        "answered": cint(answered or 0),
+        "employee_missed_count": cint(missed or 0),
+        "employee_missed_rows": missed_rows,
+        "source": "report_api",
+        "report_api_error": first.get("error") if isinstance(first, dict) else None,
+        "missed_source": "report_api",
+        "missed_error": None,
+    }
+# END ROSHDY UPPER MGMT REPORT_API DATA SOURCE FIX
+'''
+
+if start in s and end in s:
+    a = s.index(start)
+    b = s.index(end, a) + len(end)
+    s = s[:a] + block.strip() + s[b:]
+else:
+    s = s.rstrip() + "\n\n" + block.strip() + "\n"
+
+# quick syntax compile before writing
+compile(s, str(p), "exec")
+p.write_text(s, encoding="utf-8")
+PY
+
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+if [[ -n "$APP_OWNER" ]]; then
+  chown "$APP_OWNER" "$API_FILE" 2>/dev/null || true
+fi
+
+echo "🧹 Clear cache + restart backend/frontend/queues"
+bench_exec clear-cache || true
+"${COMPOSE[@]}" restart backend frontend websocket queue-short queue-long scheduler >/dev/null
+sleep 8
+bench_exec clear-cache || true
+
+echo "🧪 Validation: Upper Management data must not show cdr_unavailable/email host"
+set +e
+bench_exec execute restaurant_ops.api.upper_management_email_api.get_upper_management_report_data | tee "$BACKUP_DIR/upper_data_after_fix.txt"
+V1=${PIPESTATUS[0]}
+set -e
+
+if grep -q "cdr_unavailable\|Name or service not known\|gmail.com\|mailto" "$BACKUP_DIR/upper_data_after_fix.txt"; then
+  echo "❌ لسه في أثر للـ CDR المباشر/الإيميل في نتيجة تقرير الإدارة العليا. ابعتلي الملف: $BACKUP_DIR/upper_data_after_fix.txt"
+  exit 1
+fi
+
+if [[ $V1 -ne 0 ]]; then
+  echo "❌ Validation failed. ابعتلي: $BACKUP_DIR/upper_data_after_fix.txt"
+  exit 1
+fi
+
+echo "🧪 Validate preview + active breaks"
+bench_exec execute restaurant_ops.api.upper_management_email_api.preview_upper_management_report > "$BACKUP_DIR/upper_preview_after_fix.txt" 2>&1
+bench_exec execute restaurant_ops.api.break_api.get_active_breaks | tee "$BACKUP_DIR/active_breaks_after_fix.txt"
+
+echo "🏥 Health Check - Elastix/CDR/AMI + Queue + Call Report"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$BACKUP_DIR/health_asterisk_bridge.txt"
+H1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status | tee "$BACKUP_DIR/health_queue_status.txt"
+H2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' | tee "$BACKUP_DIR/health_call_report.txt"
+H3=${PIPESTATUS[0]}
+set -e
+
+if [[ $H1 -ne 0 || $H2 -ne 0 || $H3 -ne 0 ]]; then
+  echo "⚠️ الهيلث رجع non-zero، راجع: $BACKUP_DIR"
+else
+  echo "✅ Health checks OK"
+fi
+
+echo "============================================================"
+echo "✅ DONE"
+echo "📦 Backup folder: $BACKUP_DIR"
+echo "🛡️ report_api.py لم يتم لمسه"
+echo "📊 تقرير الإدارة العليا بقى يقرأ Queue الشكاوى وفوت الموظفين من Call Report API الشغال"
+echo "============================================================"

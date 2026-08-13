@@ -1,0 +1,356 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Roshdy V46 DIAGNOSTIC ONLY - Employee Performance + Watchdog readiness
+# READ ONLY: no edits to app code, no restarts, no delete/compress/rotate, no Elastix writes.
+# It writes only a diagnostic output folder under /opt/frappe_crm/backups and a temporary script under site private files, then removes it.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+else
+  COMPOSE=(docker-compose)
+fi
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend مش شغال"
+  exit 1
+fi
+
+bench_exec(){ "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"; }
+
+TS="$(date +%Y%m%d_%H%M%S)"
+OUT_DIR="$ROOT/backups/DIAG_V46_EMPLOYEE_PERF_WATCHDOG_$TS"
+mkdir -p "$OUT_DIR/files" "$OUT_DIR/health" "$OUT_DIR/cache" "$OUT_DIR/pages"
+
+APP_DIR="$ROOT/apps/$APP"
+PKG_DIR="$APP_DIR/$APP"
+API_DIR="$PKG_DIR/api"
+WWW_DIR="$PKG_DIR/www"
+QJ_DIR="$ROOT/sites/$SITE/private/files/queue_journey"
+
+cat <<EOF | tee "$OUT_DIR/00_README.txt"
+============================================================
+Roshdy V46 Diagnostic - Employee Performance + Watchdog
+Generated: $TS
+Root: $ROOT
+Site: $SITE
+READ ONLY: no app-code edits, no restarts, no delete/compress/rotate, no Elastix writes.
+============================================================
+EOF
+
+echo "🧭 Inventory" | tee -a "$OUT_DIR/00_README.txt"
+{
+  date
+  hostname -f 2>/dev/null || hostname
+  df -h
+  echo "--- docker compose ps ---"
+  "${COMPOSE[@]}" ps
+  echo "--- app files ---"
+  ls -lah "$API_DIR" "$WWW_DIR" 2>/dev/null || true
+  echo "--- queue_journey cache dir ---"
+  ls -lah "$QJ_DIR" 2>/dev/null || true
+  echo "--- existing scripts ---"
+  ls -lah "$ROOT/scripts" 2>/dev/null || true
+} > "$OUT_DIR/01_inventory.txt" 2>&1 || true
+
+# Copy only relevant code files. Avoid site_config/secrets.
+for f in \
+  "$API_DIR/queue_journey_api.py" \
+  "$API_DIR/admin_api.py" \
+  "$API_DIR/security_api.py" \
+  "$API_DIR/asterisk_bridge.py" \
+  "$API_DIR/queue_api.py" \
+  "$PKG_DIR/hooks.py" \
+  "$WWW_DIR/admin-desk.html" \
+  "$WWW_DIR/queue-journey-report.html"; do
+  if [[ -f "$f" ]]; then
+    cp -a "$f" "$OUT_DIR/files/$(basename "$f")"
+  fi
+done
+
+# Save safe snippets of existing shell watchdog/fetch scripts without password files.
+for f in "$ROOT/scripts/roshdy_queue_journey_fetch_parse" "$ROOT/scripts/roshdy_elastix_watchdog"; do
+  if [[ -f "$f" ]]; then
+    bn="$(basename "$f")"
+    {
+      echo "FILE=$f"
+      echo "SIZE=$(stat -c '%s' "$f" 2>/dev/null || echo 0)"
+      echo "--- first 220 lines, password-like lines redacted ---"
+      sed -n '1,220p' "$f" | sed -E 's/(pass(word)?|secret|token|key)[^[:space:]]*[=:\\][^[:space:]]+/REDACTED/Ig'
+    } > "$OUT_DIR/files/${bn}.safe_head.txt" 2>&1 || true
+  fi
+done
+
+# Page smoke checks only.
+{
+  for p in admin-desk queue-journey-report call-report settings; do
+    code="$(curl -k -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$p" 2>/dev/null || echo 000)"
+    echo "$p => $code"
+  done
+} > "$OUT_DIR/pages/page_smoke_checks.txt" 2>&1 || true
+
+# Deep Frappe diagnostic, read-only.
+cat > "$OUT_DIR/v46_diag.py" <<'PY'
+# -*- coding: utf-8 -*-
+import os, json, re, glob
+from datetime import datetime
+
+import frappe
+from frappe.utils import now_datetime, cstr
+
+SITE = os.environ.get('FRAPPE_SITE') or os.environ.get('SITE') or 'crm.local'
+try:
+    if not getattr(frappe.local, 'site', None):
+        frappe.init(site=SITE)
+        frappe.connect()
+except Exception:
+    # Let the actual diagnostic show the import/connect error if any.
+    pass
+
+
+def safe_count(doctype, filters=None):
+    try:
+        if frappe.db.exists('DocType', doctype):
+            return frappe.db.count(doctype, filters or {})
+    except Exception as e:
+        return {'error': cstr(e)}
+    return None
+
+
+def table_columns(table):
+    try:
+        return [r.get('Field') for r in frappe.db.sql('describe `%s`' % table, as_dict=True)]
+    except Exception as e:
+        return {'error': cstr(e)}
+
+
+def meta_fields(doctype):
+    try:
+        if not frappe.db.exists('DocType', doctype):
+            return None
+        return [{'fieldname': df.fieldname, 'fieldtype': df.fieldtype, 'label': df.label} for df in frappe.get_meta(doctype).fields]
+    except Exception as e:
+        return {'error': cstr(e)}
+
+
+def sample_extension_sessions():
+    out = {'exists': bool(frappe.db.exists('DocType', 'Extension Session')), 'rows': [], 'count': None, 'columns': None}
+    if not out['exists']:
+        return out
+    out['columns'] = table_columns('tabExtension Session')
+    try:
+        out['count'] = frappe.db.count('Extension Session')
+    except Exception as e:
+        out['count'] = {'error': cstr(e)}
+    try:
+        cols = out['columns'] if isinstance(out['columns'], list) else []
+        fields = [x for x in ['name','employee','user','extension','started_at','released_at','status','creation','modified'] if x in cols]
+        if fields:
+            out['rows'] = frappe.get_all('Extension Session', fields=fields, order_by='modified desc', limit_page_length=50)
+    except Exception as e:
+        out['rows_error'] = cstr(e)
+    return out
+
+
+def employee_extension_map_sample():
+    out = {'employee_exists': bool(frappe.db.exists('DocType','Employee')), 'employee_extension_columns': [], 'sample': []}
+    if not out['employee_exists']:
+        return out
+    cols = table_columns('tabEmployee')
+    if not isinstance(cols, list):
+        out['columns_error'] = cols
+        return out
+    ext_cols = [c for c in cols if c and any(x in c.lower() for x in ('extension','ext','sip'))]
+    out['employee_extension_columns'] = ext_cols
+    name_col = 'employee_name' if 'employee_name' in cols else 'name'
+    user_col = 'user_id' if 'user_id' in cols else 'name'
+    for col in ext_cols[:8]:
+        try:
+            rows = frappe.db.sql('select name, `%s` as extension, `%s` as employee_name, `%s` as user_id from `tabEmployee` where `%s` is not null and `%s` != "" limit 20' % (col, name_col, user_col, col, col), as_dict=True)
+            out['sample'].append({'column': col, 'rows': rows})
+        except Exception as e:
+            out['sample'].append({'column': col, 'error': cstr(e)})
+    return out
+
+
+def queue_journey_cache_shape():
+    site_path = frappe.get_site_path('private','files','queue_journey')
+    out = {'dir': site_path, 'exists': os.path.isdir(site_path), 'files': [], 'selected': None, 'json_shape': None}
+    if not out['exists']:
+        return out
+    try:
+        files = []
+        for p in glob.glob(os.path.join(site_path, '*.json')):
+            files.append({'name': os.path.basename(p), 'size': os.path.getsize(p), 'mtime': datetime.fromtimestamp(os.path.getmtime(p)).isoformat(sep=' ')})
+        out['files'] = sorted(files, key=lambda x: x['mtime'], reverse=True)[:80]
+        candidates = [os.path.join(site_path,'latest.json')] + [os.path.join(site_path,f['name']) for f in out['files']]
+        seen = set()
+        for p in candidates:
+            if p in seen:
+                continue
+            seen.add(p)
+            if os.path.exists(p):
+                out['selected'] = {'path': p, 'name': os.path.basename(p), 'size': os.path.getsize(p)}
+                with open(p, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                shape = {'top_keys': sorted(list(data.keys())), 'generated_at': data.get('generated_at')}
+                for key in ['events','attempts','attempt_rows_sample','event_counts','queue_counts','summary']:
+                    v = data.get(key)
+                    if isinstance(v, list):
+                        shape[key] = {'type': 'list', 'len': len(v), 'sample': v[:3]}
+                    elif isinstance(v, dict):
+                        shape[key] = {'type': 'dict', 'len': len(v), 'sample': dict(list(v.items())[:10])}
+                    else:
+                        shape[key] = {'type': type(v).__name__, 'value': v}
+                out['json_shape'] = shape
+                break
+    except Exception as e:
+        out['error'] = cstr(e)
+    return out
+
+
+def settings_snapshot():
+    out = {}
+    for f in ['shift_start_hour','shift_end_hour','asterisk_host','asterisk_ami_port','asterisk_recording_web_base','daily_report_enabled']:
+        try:
+            out[f] = frappe.db.get_single_value('Call Center Settings', f)
+        except Exception as e:
+            out[f] = {'error': cstr(e)}
+    return out
+
+
+def scheduled_jobs():
+    try:
+        return frappe.get_all('Scheduled Job Type', filters={'method':['like','restaurant_ops.%']}, fields=['name','method','frequency','cron_format','stopped'], limit_page_length=500)
+    except Exception as e:
+        return {'error': cstr(e)}
+
+
+def recording_related():
+    out = {'call_report_safe_probe': None}
+    try:
+        # Do not inspect credentials. Only see if report API returns recording-like fields on a tiny read-only call.
+        from restaurant_ops.api import report_api
+        d = report_api.get_calls_report(page=1, page_size=3, view_mode='admin')
+        rows = []
+        if isinstance(d, dict):
+            rows = d.get('rows') or d.get('data') or []
+        out['call_report_safe_probe'] = {'keys': sorted(list(rows[0].keys())) if rows else [], 'sample': rows[:1]}
+    except Exception as e:
+        out['call_report_safe_probe'] = {'error': cstr(e)}
+    return out
+
+
+def normalize_phone(phone):
+    s = re.sub(r'\D+', '', cstr(phone or ''))
+    if s.startswith('00'):
+        s = s[2:]
+    if s.startswith('20') and len(s) >= 11:
+        s = '0' + s[2:]
+    if len(s) == 10 and s[:2] in ('10','11','12','15'):
+        s = '0' + s
+    if len(s) == 9 and s[:2] in ('50','55','57','48','45','40','47','46'):
+        s = '0' + s
+    return s
+
+
+out = {
+    'generated_at': cstr(now_datetime()),
+    'site': getattr(frappe.local, 'site', SITE),
+    'settings': settings_snapshot(),
+    'extension_session': sample_extension_sessions(),
+    'employee_extension_map': employee_extension_map_sample(),
+    'queue_journey_cache': queue_journey_cache_shape(),
+    'scheduled_jobs_restaurant_ops': scheduled_jobs(),
+    'doctype_counts': {
+        'Employee': safe_count('Employee'),
+        'Extension Session': safe_count('Extension Session'),
+        'Call Center Complaint': safe_count('Call Center Complaint'),
+        'Call Center Feedback': safe_count('Call Center Feedback'),
+    },
+    'doctype_fields': {
+        'Extension Session': meta_fields('Extension Session'),
+        'Employee': meta_fields('Employee'),
+    },
+    'recording_related': recording_related(),
+    'phone_normalization_examples': {x: normalize_phone(x) for x in ['01028567017','+201028567017','201028567017','0502727789','+20502727789','20502727789','1014434368','+201014434368']},
+}
+
+print(json.dumps(out, ensure_ascii=False, default=str, indent=2))
+
+try:
+    frappe.destroy()
+except Exception:
+    pass
+PY
+
+TMP_SITE_SCRIPT="$ROOT/sites/$SITE/private/files/v46_diag_$TS.py"
+cp "$OUT_DIR/v46_diag.py" "$TMP_SITE_SCRIPT"
+"${COMPOSE[@]}" exec -T -e FRAPPE_SITE="$SITE" backend bash -lc "cd /home/frappe/frappe-bench && python /home/frappe/frappe-bench/sites/$SITE/private/files/v46_diag_$TS.py" > "$OUT_DIR/diagnostic_result.json" 2> "$OUT_DIR/diagnostic_python_stderr.txt" || true
+rm -f "$TMP_SITE_SCRIPT" 2>/dev/null || true
+
+if ! grep -q 'generated_at' "$OUT_DIR/diagnostic_result.json" 2>/dev/null; then
+  cat > "$OUT_DIR/diagnostic_result.json" <<EOF
+{"success": false, "note": "Direct frappe python diagnostic did not run. See diagnostic_python_stderr.txt. Send this folder to assistant."}
+EOF
+fi
+
+# Existing watchdog status/caches, read only.
+for f in \
+  "$ROOT/logs/elastix_watchdog_status.json" \
+  "$ROOT/logs/elastix_watchdog.log" \
+  "$QJ_DIR/latest_summary.txt" \
+  "$QJ_DIR/latest.json"; do
+  if [[ -f "$f" ]]; then
+    bn="$(basename "$f")"
+    if [[ "$bn" == "latest.json" ]]; then
+      python3 - <<PY > "$OUT_DIR/cache/latest_json_keys.txt" 2>&1 || true
+import json
+p='$f'
+with open(p,encoding='utf-8') as fh: d=json.load(fh)
+print('path',p)
+print('keys',sorted(d.keys()))
+for k in ['generated_at','event_counts','queue_counts','summary']:
+ print(k, d.get(k))
+for k in ['events','attempts','attempt_rows_sample']:
+ v=d.get(k)
+ print(k, type(v).__name__, len(v) if isinstance(v,list) else '')
+ print((v or [])[:2] if isinstance(v,list) else '')
+PY
+    else
+      tail -n 400 "$f" > "$OUT_DIR/cache/${bn}.tail.txt" 2>&1 || true
+    fi
+  fi
+done
+
+# Health checks requested historically. Read-only.
+echo "🏥 Health checks" | tee -a "$OUT_DIR/00_README.txt"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics > "$OUT_DIR/health/asterisk_bridge.json" 2>&1
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status > "$OUT_DIR/health/queue_status.json" 2>&1
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' > "$OUT_DIR/health/call_report.json" 2>&1
+bench_exec execute restaurant_ops.api.queue_journey_api.debug_queue_journey_status > "$OUT_DIR/health/queue_journey_status.json" 2>&1
+set -e
+
+cat > "$OUT_DIR/99_SUMMARY.txt" <<EOF
+DONE - V46 DIAGNOSTIC READ ONLY
+Output folder: $OUT_DIR
+Zip file: $ROOT/backups/DIAG_V46_EMPLOYEE_PERF_WATCHDOG_$TS.zip
+
+No app code was edited, no services restarted, no Elastix writes.
+EOF
+
+(
+  cd "$ROOT/backups"
+  zip -qr "DIAG_V46_EMPLOYEE_PERF_WATCHDOG_$TS.zip" "DIAG_V46_EMPLOYEE_PERF_WATCHDOG_$TS"
+) || true
+
+cat "$OUT_DIR/99_SUMMARY.txt"
+ls -lh "$OUT_DIR" "$ROOT/backups/DIAG_V46_EMPLOYEE_PERF_WATCHDOG_$TS.zip" 2>/dev/null || true

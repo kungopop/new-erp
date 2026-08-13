@@ -1,0 +1,406 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Roshdy V32: Repair Elastix watchdog/fetch after password-save script stopped
+# -------------------------------------------------------------------------
+# Context:
+# - Password file was saved already.
+# - RSA key access already tested OK.
+# - Previous script failed while patching fetch script due to a quote syntax issue.
+#
+# This script safely rewrites:
+# - /opt/frappe_crm/scripts/roshdy_queue_journey_fetch_parse
+# - /opt/frappe_crm/scripts/roshdy_elastix_watchdog
+# - /etc/cron.d/roshdy_elastix_watchdog
+#
+# It then runs fetch once, runs watchdog once, validates ERP API/page, and health checks.
+# It DOES NOT edit report_api.py or Elastix/Asterisk configs.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+ELASTIX_HOST="${ELASTIX_HOST:-10.11.1.253}"
+ELASTIX_SSH="${ELASTIX_SSH:-root@10.11.1.253}"
+QUEUE_LOG="${QUEUE_LOG:-/var/log/asterisk/queue_log}"
+SSH_KEY="${SSH_KEY:-/root/.ssh/id_rsa_roshdy_queue_journey}"
+PASSWORD_FILE="${PASSWORD_FILE:-/root/.roshdy_elastix_root.pass}"
+QUEUES="${QUEUES:-1234,123}"
+THRESHOLD="${THRESHOLD:-15}"
+MAX_LINES="${MAX_LINES:-500000}"
+CRON_MINUTES="${CRON_MINUTES:-5}"
+TS="$(date +%Y%m%d_%H%M%S)"
+
+cd "$ROOT"
+
+if [[ $EUID -ne 0 ]]; then
+  echo "❌ لازم يتشغل كـ root: sudo -i"
+  exit 1
+fi
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "❌ docker compose/docker-compose مش موجود"
+  exit 1
+fi
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend container مش شغال أو مش لاقيه"
+  exit 1
+fi
+
+bench_exec() { "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"; }
+
+SCRIPTS_DIR="$ROOT/scripts"
+LOG_DIR="$ROOT/logs"
+FETCH_SCRIPT="$SCRIPTS_DIR/roshdy_queue_journey_fetch_parse"
+WATCHDOG="$SCRIPTS_DIR/roshdy_elastix_watchdog"
+QCONF="$ROOT/queue_journey.conf"
+WCONF="$ROOT/elastix_watchdog.conf"
+HOST_JOURNEY_DIR="$ROOT/sites/$SITE/private/files/queue_journey"
+CONTAINER_JOURNEY_DIR="/home/frappe/frappe-bench/sites/$SITE/private/files/queue_journey"
+BACKUP_DIR="$ROOT/backups/REPAIR_ELASTIX_WATCHDOG_FETCH_V32_BEFORE_$TS"
+mkdir -p "$BACKUP_DIR" "$SCRIPTS_DIR" "$LOG_DIR" "$HOST_JOURNEY_DIR"
+
+echo "============================================================"
+echo "🔧 Roshdy V32: repair Elastix watchdog + queue journey fetch"
+echo "📦 Backup: $BACKUP_DIR"
+echo "🔐 Elastix SSH: $ELASTIX_SSH"
+echo "📄 Queue log: $QUEUE_LOG"
+echo "============================================================"
+
+for f in "$FETCH_SCRIPT" "$WATCHDOG" "$QCONF" "$WCONF" /etc/cron.d/roshdy_elastix_watchdog; do
+  [[ -e "$f" ]] && cp -a "$f" "$BACKUP_DIR/$(basename "$f").before" || true
+done
+
+# Ensure password and sshpass state.
+if [[ -f "$PASSWORD_FILE" ]]; then
+  chmod 600 "$PASSWORD_FILE"
+  echo "✅ Password file exists and is root-only: $PASSWORD_FILE"
+else
+  echo "⚠️ Password file not found: $PASSWORD_FILE"
+  echo "   SSH key may still work. If not, run save-elastix-root-password-watchdog-v2 again."
+fi
+
+if [[ -f "$SSH_KEY" ]]; then
+  chmod 600 "$SSH_KEY"
+  [[ -f "$SSH_KEY.pub" ]] && chmod 644 "$SSH_KEY.pub" || true
+else
+  echo "⚠️ SSH key not found, creating RSA key: $SSH_KEY"
+  mkdir -p /root/.ssh
+  chmod 700 /root/.ssh
+  ssh-keygen -t rsa -b 4096 -f "$SSH_KEY" -N "" -C "roshdy-erp-queue-journey-rsa"
+fi
+
+if [[ -f "$PASSWORD_FILE" ]] && ! command -v sshpass >/dev/null 2>&1; then
+  echo "📦 sshpass missing, installing..."
+  apt-get update && apt-get install -y sshpass
+fi
+
+cat > "$QCONF" <<EOF
+ROOT="$ROOT"
+SITE="$SITE"
+ELASTIX_SSH="$ELASTIX_SSH"
+QUEUE_LOG="$QUEUE_LOG"
+QUEUES="$QUEUES"
+THRESHOLD="$THRESHOLD"
+MAX_LINES="$MAX_LINES"
+SSH_KEY="$SSH_KEY"
+PASSWORD_FILE="$PASSWORD_FILE"
+EOF
+chmod 600 "$QCONF"
+
+cat > "$WCONF" <<EOF
+ROOT="$ROOT"
+SITE="$SITE"
+ELASTIX_HOST="$ELASTIX_HOST"
+ELASTIX_SSH="$ELASTIX_SSH"
+QUEUE_LOG="$QUEUE_LOG"
+SSH_KEY="$SSH_KEY"
+PASSWORD_FILE="$PASSWORD_FILE"
+LOG_DIR="$LOG_DIR"
+QUEUE_JOURNEY_FETCH="$FETCH_SCRIPT"
+EOF
+chmod 600 "$WCONF"
+
+# -----------------------------------------------------------------------------
+# Rewrite fetch script fully
+# -----------------------------------------------------------------------------
+echo "🧩 Writing robust fetch parser: $FETCH_SCRIPT"
+cat > "$FETCH_SCRIPT" <<'FETCH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+CONF_FILE="${CONF_FILE:-/opt/frappe_crm/queue_journey.conf}"
+[[ -f "$CONF_FILE" ]] && source "$CONF_FILE"
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+ELASTIX_SSH="${ELASTIX_SSH:-root@10.11.1.253}"
+QUEUE_LOG="${QUEUE_LOG:-/var/log/asterisk/queue_log}"
+QUEUES="${QUEUES:-1234,123}"
+THRESHOLD="${THRESHOLD:-15}"
+MAX_LINES="${MAX_LINES:-500000}"
+SSH_KEY="${SSH_KEY:-/root/.ssh/id_rsa_roshdy_queue_journey}"
+PASSWORD_FILE="${PASSWORD_FILE:-/root/.roshdy_elastix_root.pass}"
+DATE_FROM="${DATE_FROM:-$(date +%F)}"
+DATE_TO="${DATE_TO:-$DATE_FROM}"
+HOST_OUT_BASE="$ROOT/sites/$SITE/private/files/queue_journey"
+CONTAINER_OUT_BASE="/home/frappe/frappe-bench/sites/$SITE/private/files/queue_journey"
+RUN_ID="$(date +%Y%m%d_%H%M%S)"
+RUN_DIR="$HOST_OUT_BASE/runs/$RUN_ID"
+TMP_LOG="$RUN_DIR/queue_log_tail.txt"
+mkdir -p "$RUN_DIR" "$HOST_OUT_BASE"
+
+cd "$ROOT"
+if docker compose version >/dev/null 2>&1; then COMPOSE=(docker compose); else COMPOSE=(docker-compose); fi
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then echo "backend container not found" >&2; exit 1; fi
+
+SSH_OPTS=(-o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/root/.ssh/known_hosts)
+if [[ -n "$SSH_KEY" && -f "$SSH_KEY" ]]; then
+  SSH_OPTS=(-i "$SSH_KEY" -o IdentitiesOnly=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/root/.ssh/known_hosts -o PubkeyAcceptedAlgorithms=+ssh-rsa -o HostkeyAlgorithms=+ssh-rsa)
+fi
+
+ssh_remote_to_stdout(){
+  local remote_cmd="$1"
+  if ssh "${SSH_OPTS[@]}" "$ELASTIX_SSH" "$remote_cmd"; then
+    return 0
+  fi
+  if [[ -n "$PASSWORD_FILE" && -f "$PASSWORD_FILE" ]] && command -v sshpass >/dev/null 2>&1; then
+    sshpass -f "$PASSWORD_FILE" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 "$ELASTIX_SSH" "$remote_cmd"
+    return $?
+  fi
+  return 1
+}
+
+echo "[$(date '+%F %T')] Fetching queue log from $ELASTIX_SSH date=$DATE_FROM..$DATE_TO queues=$QUEUES threshold=$THRESHOLD max_lines=$MAX_LINES"
+
+if [[ "$MAX_LINES" == "0" ]]; then
+  ssh_remote_to_stdout "cat '$QUEUE_LOG'" > "$TMP_LOG"
+else
+  ssh_remote_to_stdout "tail -n '$MAX_LINES' '$QUEUE_LOG'" > "$TMP_LOG"
+fi
+
+python3 - "$TMP_LOG" "$DATE_FROM" "$DATE_TO" "$QUEUES" "$THRESHOLD" "$RUN_DIR" <<'PY'
+import sys, os, re, json, csv, datetime, time
+from collections import defaultdict, Counter
+
+log_path, date_from, date_to, queues_s, threshold_s, run_dir = sys.argv[1:7]
+queues={q.strip() for q in queues_s.split(',') if q.strip()}
+threshold=float(threshold_s or 15)
+start=int(time.mktime(datetime.datetime.strptime(date_from+' 00:00:00','%Y-%m-%d %H:%M:%S').timetuple()))
+end=int(time.mktime(datetime.datetime.strptime(date_to+' 23:59:59','%Y-%m-%d %H:%M:%S').timetuple()))
+interesting={'DID','ENTERQUEUE','RINGNOANSWER','RINGCANCELED','AGENTDUMP','CONNECT','COMPLETECALLER','COMPLETEAGENT','ABANDON','EXITWITHTIMEOUT','EXITEMPTY','EXITWITHKEY','TRANSFER'}
+
+def ext_from_agent(agent):
+    agent=str(agent or '')
+    for pat in (r'(?:Local|SIP|PJSIP|Agent)/(\d{3,6})', r'^(\d{3,6})$', r'\b(\d{3,6})\b'):
+        m=re.search(pat,agent,re.I)
+        if m and m.group(1) not in ('123','1234'): return m.group(1)
+    return ''
+
+def ts_text(t): return datetime.datetime.fromtimestamp(int(t)).strftime('%Y-%m-%d %H:%M:%S')
+
+def caller_from(evs):
+    for e in evs:
+        if e['event']=='ENTERQUEUE':
+            for d in e.get('data') or []:
+                if re.search(r'\d{5,}', d or ''): return d
+    return ''
+
+rows=[]; counts=Counter(); by_queue=defaultdict(Counter)
+with open(log_path,'r',errors='ignore') as f:
+    for line in f:
+        line=line.rstrip('\n')
+        if not line: continue
+        parts=line.split('|')
+        if len(parts)<5: continue
+        try: t=int(float(parts[0]))
+        except Exception: continue
+        if not (start<=t<=end): continue
+        callid,queue,agent,event=parts[1],parts[2],parts[3],parts[4]
+        if queues and queue not in queues: continue
+        counts[event]+=1; by_queue[queue][event]+=1
+        if event not in interesting: continue
+        rows.append({'time_epoch':t,'time_text':ts_text(t),'callid':callid,'queue':queue,'agent':agent,'agent_ext':ext_from_agent(agent),'event':event,'data':parts[5:],'raw':line})
+
+by_call=defaultdict(list)
+for r in rows: by_call[r['callid']].append(r)
+for cid in by_call: by_call[cid].sort(key=lambda x:x['time_epoch'])
+attempts=[]; call_summaries=[]
+for cid,evs in by_call.items():
+    caller=caller_from(evs)
+    connects=[e for e in evs if e['event']=='CONNECT']; abandons=[e for e in evs if e['event']=='ABANDON']; completes=[e for e in evs if e['event'] in ('COMPLETECALLER','COMPLETEAGENT')]
+    if connects: final='answered'; final_ext=connects[-1].get('agent_ext') or ''
+    elif abandons: final='customer_abandoned_before_answer'; final_ext=''
+    elif completes: final='completed_but_connect_missing'; final_ext=''
+    else: final='unknown_or_still_in_queue'; final_ext=''
+    call_summaries.append({'callid':cid,'caller':caller,'queue':evs[0]['queue'] if evs else '','events_count':len(evs),'events':[e['event'] for e in evs],'final_outcome':final,'final_extension':final_ext})
+    for i,e in enumerate(evs):
+        if e['event'] not in ('RINGNOANSWER','RINGCANCELED','AGENTDUMP'): continue
+        missed_ext=e.get('agent_ext') or ''
+        if not missed_ext: continue
+        raw=(e.get('data') or [''])[0] if e.get('data') else ''
+        try: ring_seconds=round(float(raw or 0)/1000.0,1)
+        except Exception: ring_seconds=0
+        if ring_seconds < threshold: continue
+        later=evs[i+1:]
+        conn=next((x for x in later if x['event']=='CONNECT'),None); aban=next((x for x in later if x['event']=='ABANDON'),None); comp=next((x for x in later if x['event'] in ('COMPLETECALLER','COMPLETEAGENT')),None); tout=next((x for x in later if x['event'] in ('EXITWITHTIMEOUT','EXITEMPTY','EXITWITHKEY')),None)
+        if conn:
+            ans_ext=conn.get('agent_ext') or ''; fate='answered_later_same_extension' if ans_ext==missed_ext else 'answered_later_other_extension'; fate_time=conn['time_text']
+        elif aban: ans_ext=''; fate='customer_abandoned_after_attempt'; fate_time=aban['time_text']
+        elif comp: ans_ext=''; fate='completed_after_attempt_connect_missing'; fate_time=comp['time_text']
+        elif tout: ans_ext=''; fate='timeout_after_attempt_no_final_connect_seen'; fate_time=tout['time_text']
+        else: ans_ext=''; fate='unknown_after_attempt'; fate_time=''
+        attempts.append({'attempt_time':e['time_text'],'callid':cid,'queue':e['queue'],'caller':caller,'missed_extension':missed_ext,'missed_event':e['event'],'ring_seconds':ring_seconds,'fate':fate,'fate_time':fate_time,'answered_extension':ans_ext,'final_outcome_for_call':final,'raw_data':e.get('data') or []})
+by_ext=defaultdict(lambda:{'extension':'','attempts':0,'answered_later_same_extension':0,'answered_later_other_extension':0,'customer_abandoned_after_attempt':0,'timeout_no_final_connect':0,'unknown':0})
+for a in attempts:
+    row=by_ext[a['missed_extension']]; row['extension']=a['missed_extension']; row['attempts']+=1
+    if a['fate'] in ('answered_later_same_extension','answered_later_other_extension'): row[a['fate']]+=1
+    elif a['fate']=='customer_abandoned_after_attempt': row['customer_abandoned_after_attempt']+=1
+    elif a['fate']=='timeout_after_attempt_no_final_connect_seen': row['timeout_no_final_connect']+=1
+    else: row['unknown']+=1
+attempts_by_fate=dict(Counter(a['fate'] for a in attempts)); answered_later=sum(v for k,v in attempts_by_fate.items() if k.startswith('answered_later'))
+summary={'success':True,'generated_at':datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),'date_from':date_from,'date_to':date_to,'queues':sorted(queues),'threshold_seconds':threshold,'events_loaded':len(rows),'event_counts':dict(counts),'event_counts_by_queue':{q:dict(c) for q,c in by_queue.items()},'calls_seen':len(by_call),'attempts_total':len(attempts),'answered_later_total':answered_later,'customer_abandoned_after_attempt':attempts_by_fate.get('customer_abandoned_after_attempt',0),'unknown_or_timeout':attempts_by_fate.get('unknown_after_attempt',0)+attempts_by_fate.get('timeout_after_attempt_no_final_connect_seen',0)+attempts_by_fate.get('completed_after_attempt_connect_missing',0),'attempts_by_fate':attempts_by_fate,'attempts_by_missed_extension':sorted(by_ext.values(),key=lambda x:x['attempts'],reverse=True),'attempts':attempts,'call_journey_samples':call_summaries[:300],'can_determine_journey':True}
+json_path=os.path.join(run_dir,'queue_journey_result.json'); open(json_path,'w',encoding='utf-8').write(json.dumps(summary,ensure_ascii=False,indent=2))
+with open(os.path.join(run_dir,'queue_journey_attempts.csv'),'w',newline='',encoding='utf-8-sig') as f:
+    headers=['attempt_time','queue','caller','missed_extension','ring_seconds','fate','answered_extension','fate_time','callid','final_outcome_for_call']; w=csv.DictWriter(f,fieldnames=headers); w.writeheader(); [w.writerow({k:a.get(k,'') for k in headers}) for a in attempts]
+with open(os.path.join(run_dir,'queue_journey_summary.txt'),'w',encoding='utf-8') as f:
+    f.write('Date: %s to %s\nThreshold seconds: %s\nQueues: %s\nEvents loaded: %s\nEvent counts: %s\nCalls seen: %s\nAttempts total: %s\nAnswered later total: %s\nCustomer abandoned after attempt: %s\nUnknown/timeout: %s\nAttempts by fate: %s\n\nBy missed extension:\n' % (date_from,date_to,threshold,','.join(sorted(queues)),len(rows),dict(counts),len(by_call),len(attempts),answered_later,attempts_by_fate.get('customer_abandoned_after_attempt',0),summary['unknown_or_timeout'],attempts_by_fate))
+    for r in summary['attempts_by_missed_extension']: f.write(str(r)+'\n')
+print(json_path)
+PY
+
+EXACT="queue_journey_${DATE_FROM}_${DATE_TO}.json"
+cp "$RUN_DIR/queue_journey_result.json" "$HOST_OUT_BASE/$EXACT"
+cp "$RUN_DIR/queue_journey_result.json" "$HOST_OUT_BASE/latest.json"
+cp "$RUN_DIR/queue_journey_summary.txt" "$HOST_OUT_BASE/latest_summary.txt"
+chmod -R a+rX "$HOST_OUT_BASE" || true
+"${COMPOSE[@]}" exec -T backend mkdir -p "$CONTAINER_OUT_BASE"
+"${COMPOSE[@]}" cp "$HOST_OUT_BASE/$EXACT" "backend:$CONTAINER_OUT_BASE/$EXACT" 2>/dev/null || docker cp "$HOST_OUT_BASE/$EXACT" "$BACKEND:$CONTAINER_OUT_BASE/$EXACT"
+"${COMPOSE[@]}" cp "$HOST_OUT_BASE/latest.json" "backend:$CONTAINER_OUT_BASE/latest.json" 2>/dev/null || docker cp "$HOST_OUT_BASE/latest.json" "$BACKEND:$CONTAINER_OUT_BASE/latest.json"
+"${COMPOSE[@]}" cp "$HOST_OUT_BASE/latest_summary.txt" "backend:$CONTAINER_OUT_BASE/latest_summary.txt" 2>/dev/null || docker cp "$HOST_OUT_BASE/latest_summary.txt" "$BACKEND:$CONTAINER_OUT_BASE/latest_summary.txt"
+"${COMPOSE[@]}" exec -T backend chmod -R a+rX "$CONTAINER_OUT_BASE" || true
+
+echo "[$(date '+%F %T')] Done. Synced: $CONTAINER_OUT_BASE/$EXACT"
+cat "$HOST_OUT_BASE/latest_summary.txt"
+FETCH
+chmod +x "$FETCH_SCRIPT"
+
+# -----------------------------------------------------------------------------
+# Rewrite watchdog script
+# -----------------------------------------------------------------------------
+echo "🧩 Writing watchdog script: $WATCHDOG"
+cat > "$WATCHDOG" <<'WATCH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+CONF="${CONF:-/opt/frappe_crm/elastix_watchdog.conf}"
+[[ -f "$CONF" ]] && source "$CONF"
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+ELASTIX_HOST="${ELASTIX_HOST:-10.11.1.253}"
+ELASTIX_SSH="${ELASTIX_SSH:-root@10.11.1.253}"
+QUEUE_LOG="${QUEUE_LOG:-/var/log/asterisk/queue_log}"
+SSH_KEY="${SSH_KEY:-/root/.ssh/id_rsa_roshdy_queue_journey}"
+PASSWORD_FILE="${PASSWORD_FILE:-/root/.roshdy_elastix_root.pass}"
+LOG_DIR="${LOG_DIR:-/opt/frappe_crm/logs}"
+QUEUE_JOURNEY_FETCH="${QUEUE_JOURNEY_FETCH:-/opt/frappe_crm/scripts/roshdy_queue_journey_fetch_parse}"
+STATUS_JSON="$LOG_DIR/elastix_watchdog_status.json"
+LOG_FILE="$LOG_DIR/elastix_watchdog.log"
+mkdir -p "$LOG_DIR"
+cd "$ROOT"
+if docker compose version >/dev/null 2>&1; then COMPOSE=(docker compose); else COMPOSE=(docker-compose); fi
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+log(){ echo "[$(date '+%F %T')] $*" >> "$LOG_FILE"; }
+check_tcp(){ timeout 4 bash -c "</dev/tcp/$1/$2" >/dev/null 2>&1; }
+bench_exec(){ "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"; }
+SSH_OPTS=(-i "$SSH_KEY" -o IdentitiesOnly=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/root/.ssh/known_hosts -o PubkeyAcceptedAlgorithms=+ssh-rsa -o HostkeyAlgorithms=+ssh-rsa)
+ssh_test(){
+  ssh "${SSH_OPTS[@]}" -o BatchMode=yes "$ELASTIX_SSH" "test -r '$QUEUE_LOG' && tail -n 1 '$QUEUE_LOG'" >/tmp/roshdy_watchdog_ssh.out 2>&1 && return 0
+  if [[ -f "$PASSWORD_FILE" ]] && command -v sshpass >/dev/null 2>&1; then
+    sshpass -f "$PASSWORD_FILE" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=8 "$ELASTIX_SSH" "test -r '$QUEUE_LOG' && tail -n 1 '$QUEUE_LOG'" >/tmp/roshdy_watchdog_ssh_pass.out 2>&1 && return 0
+  fi
+  return 1
+}
+STATUS="OK"; DETAILS=()
+log "watchdog start"
+[[ -n "$BACKEND" ]] && DETAILS+=("backend ok") || { STATUS="FAIL"; DETAILS+=("backend missing"); }
+check_tcp "$ELASTIX_HOST" 3306 && DETAILS+=("tcp_3306 ok") || { STATUS="FAIL"; DETAILS+=("tcp_3306 fail"); }
+check_tcp "$ELASTIX_HOST" 5038 && DETAILS+=("tcp_5038 ok") || { STATUS="FAIL"; DETAILS+=("tcp_5038 fail"); }
+ssh_test && DETAILS+=("ssh_queue_log ok") || { STATUS="WARN"; DETAILS+=("ssh_queue_log fail"); }
+if [[ -n "$BACKEND" ]]; then
+  set +e
+  bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics >/tmp/roshdy_watchdog_diag.out 2>&1; D1=$?
+  bench_exec execute restaurant_ops.api.queue_api.get_queue_status >/tmp/roshdy_watchdog_queue.out 2>&1; D2=$?
+  bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":3,"view_mode":"admin"}' >/tmp/roshdy_watchdog_report.out 2>&1; D3=$?
+  set -e
+  [[ $D1 -eq 0 ]] && DETAILS+=("asterisk_diagnostics ok") || { STATUS="FAIL"; DETAILS+=("asterisk_diagnostics fail"); }
+  [[ $D2 -eq 0 ]] && DETAILS+=("queue_status ok") || { STATUS="FAIL"; DETAILS+=("queue_status fail"); }
+  [[ $D3 -eq 0 ]] && DETAILS+=("call_report ok") || { STATUS="FAIL"; DETAILS+=("call_report fail"); }
+fi
+if [[ -x "$QUEUE_JOURNEY_FETCH" ]]; then
+  set +e
+  DATE_FROM="$(date +%F)" DATE_TO="$(date +%F)" "$QUEUE_JOURNEY_FETCH" >/tmp/roshdy_watchdog_fetch.out 2>&1; FRC=$?
+  set -e
+  [[ $FRC -eq 0 ]] && DETAILS+=("queue_journey_fetch ok") || { STATUS="WARN"; DETAILS+=("queue_journey_fetch fail"); }
+fi
+python3 - "$STATUS_JSON" "$STATUS" "${DETAILS[@]}" <<'PY'
+import json, sys, datetime
+path=sys.argv[1]; status=sys.argv[2]; details=sys.argv[3:]
+open(path,'w').write(json.dumps({'timestamp':datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),'status':status,'details':details},ensure_ascii=False,indent=2))
+PY
+log "status=$STATUS details=${DETAILS[*]}"
+[[ "$STATUS" == "FAIL" ]] && exit 2 || exit 0
+WATCH
+chmod +x "$WATCHDOG"
+
+# -----------------------------------------------------------------------------
+# Cron
+# -----------------------------------------------------------------------------
+cat > /etc/cron.d/roshdy_elastix_watchdog <<EOF
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+*/$CRON_MINUTES * * * * root $WATCHDOG >/dev/null 2>&1
+EOF
+chmod 0644 /etc/cron.d/roshdy_elastix_watchdog
+
+echo "✅ Cron installed/repaired: /etc/cron.d/roshdy_elastix_watchdog"
+
+# -----------------------------------------------------------------------------
+# Run now
+# -----------------------------------------------------------------------------
+echo "▶️ Running fetch once..."
+set +e
+DATE_FROM="$(date +%F)" DATE_TO="$(date +%F)" "$FETCH_SCRIPT" | tee "$BACKUP_DIR/fetch_now_v32.txt"
+FRC=${PIPESTATUS[0]}
+set -e
+if [[ $FRC -ne 0 ]]; then
+  echo "❌ Fetch failed. See $BACKUP_DIR/fetch_now_v32.txt"
+  exit 1
+fi
+
+echo "▶️ Running watchdog once..."
+set +e
+"$WATCHDOG"
+WRC=$?
+set -e
+echo "Watchdog exit code: $WRC"
+cat "$LOG_DIR/elastix_watchdog_status.json" | tee "$BACKUP_DIR/elastix_watchdog_status.json"
+
+# ERP validation quick
+set +e
+bench_exec execute restaurant_ops.api.queue_journey_api.debug_queue_journey_status | tee "$BACKUP_DIR/debug_queue_journey_status.txt"
+bench_exec execute restaurant_ops.api.queue_journey_api.get_queue_journey_report | tee "$BACKUP_DIR/get_queue_journey_report.txt"
+set -e
+
+echo "============================================================"
+echo "✅ DONE V32"
+echo "Fetch script: $FETCH_SCRIPT"
+echo "Watchdog: $WATCHDOG"
+echo "Cron: /etc/cron.d/roshdy_elastix_watchdog"
+echo "Status: $LOG_DIR/elastix_watchdog_status.json"
+echo "Log: $LOG_DIR/elastix_watchdog.log"
+echo "============================================================"

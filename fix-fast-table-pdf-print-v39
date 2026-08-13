@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Roshdy V39: Fast table-only PDF/Print export
+# ------------------------------------------------------------
+# Problem:
+#   Some pages use window.print(), which prints the whole page and is slow/heavy.
+# Fix:
+#   Replace window.print() buttons in operational report pages with a fast helper:
+#   - opens a lightweight print window
+#   - includes visible tables only
+#   - includes page title + current filters summary
+#   - RTL + clean table styling
+#   - much faster than printing the whole page
+# Safety:
+#   - Backup first.
+#   - Does NOT touch report_api.py / Elastix / CDR / AMI.
+#   - Skips quality pages by default.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+SKIP_QUALITY="${SKIP_QUALITY:-1}"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "❌ docker compose/docker-compose مش موجود"
+  exit 1
+fi
+
+APP_DIR="$ROOT/apps/$APP"
+PKG_DIR="$APP_DIR/$APP"
+WWW_DIR="$PKG_DIR/www"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/FAST_TABLE_PDF_PRINT_V39_BEFORE_$TS"
+mkdir -p "$BACKUP_DIR/files"
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend container مش شغال أو مش لاقيه"
+  exit 1
+fi
+
+bench_exec() { "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"; }
+
+echo "============================================================"
+echo "🖨️ Roshdy V39: Fast table-only PDF/Print export"
+echo "📦 Backup: $BACKUP_DIR"
+echo "============================================================"
+
+if [[ ! -d "$WWW_DIR" ]]; then
+  echo "❌ www dir not found: $WWW_DIR"
+  exit 1
+fi
+
+echo "🧯 Step 1: Backup files + bench backup"
+# Back up all HTML files that currently reference window.print or طباعة/PDF.
+while IFS= read -r f; do
+  rel="${f#$ROOT/}"
+  mkdir -p "$BACKUP_DIR/files/$(dirname "$rel")"
+  cp -a "$f" "$BACKUP_DIR/files/$rel"
+done < <(grep -RIl --include='*.html' -e 'window.print' -e 'طباعة/PDF' -e 'PDF/طباعة' "$WWW_DIR" || true)
+bench_exec backup --with-files | tee "$BACKUP_DIR/bench_backup_output.txt"
+
+echo "🧩 Step 2: Patch HTML print buttons"
+export WWW_DIR SKIP_QUALITY
+python3 - <<'PY'
+# -*- coding: utf-8 -*-
+from pathlib import Path
+import os, re
+
+www = Path(os.environ['WWW_DIR'])
+skip_quality = os.environ.get('SKIP_QUALITY','1') == '1'
+
+HELPER_A = '<!-- BEGIN ROSHDY FAST TABLE PRINT V39 -->'
+HELPER_B = '<!-- END ROSHDY FAST TABLE PRINT V39 -->'
+HELPER = r'''
+<!-- BEGIN ROSHDY FAST TABLE PRINT V39 -->
+<script>
+(function(){
+  if(window.RoshdyFastTablePrintV39) return;
+  function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+  function visible(el){return !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));}
+  function cloneTable(t){
+    var c=t.cloneNode(true);
+    c.querySelectorAll('script,button,input,select,textarea,a.play,a.attach,.btn').forEach(function(x){
+      if(x.tagName && x.tagName.toLowerCase()==='a') x.textContent=x.textContent||x.href;
+      else x.remove();
+    });
+    c.removeAttribute('id');
+    c.removeAttribute('class');
+    return c.outerHTML;
+  }
+  function filterSummary(){
+    var arr=[];
+    document.querySelectorAll('input,select').forEach(function(el){
+      if(!visible(el)) return;
+      var type=(el.getAttribute('type')||'').toLowerCase();
+      if(type==='hidden' || type==='file' || type==='password') return;
+      var val='';
+      if(el.tagName.toLowerCase()==='select') val=el.options[el.selectedIndex]?el.options[el.selectedIndex].text:'';
+      else val=el.value||'';
+      if(!val) return;
+      var label='';
+      var parent=el.closest('.fg,div,label');
+      if(parent){
+        var lab=parent.querySelector('label');
+        if(lab) label=lab.textContent.trim();
+      }
+      if(!label && el.id) label=el.id;
+      arr.push((label?label+': ':'')+val);
+    });
+    return arr.slice(0,12);
+  }
+  function pageTitle(){
+    var h=document.querySelector('.title,.page-title,h1,h2,.head b,.top b');
+    return (h&&h.textContent.trim()) || document.title || 'تقرير';
+  }
+  window.RoshdyFastTablePrintV39={
+    print:function(){
+      var tables=Array.prototype.slice.call(document.querySelectorAll('table')).filter(function(t){return visible(t) && t.querySelectorAll('tr').length>0;});
+      if(!tables.length){
+        alert('لا توجد جداول ظاهرة للطباعة. سيتم استخدام طباعة الصفحة العادية.');
+        window.print();
+        return false;
+      }
+      var title=pageTitle();
+      var filters=filterSummary();
+      var html='<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><title>'+esc(title)+'</title>'+
+      '<style>*{box-sizing:border-box}body{direction:rtl;font-family:Tahoma,Arial,sans-serif;color:#111827;margin:18px;background:#fff}h1{font-size:22px;color:#1F4E79;margin:0 0 6px}.meta{color:#64748b;font-size:12px;margin-bottom:12px}.filters{background:#f8fafc;border:1px solid #e5e7eb;border-radius:10px;padding:8px;margin:10px 0 16px;font-size:12px}.section{page-break-inside:auto;margin:0 0 18px}table{width:100%;border-collapse:collapse;margin:8px 0 18px;font-size:12px;page-break-inside:auto}thead{display:table-header-group}tr{page-break-inside:avoid;page-break-after:auto}th{background:#111827!important;color:#fff!important;padding:8px;border:1px solid #d1d5db;text-align:right}td{padding:7px;border:1px solid #e5e7eb;text-align:right;vertical-align:top}a{color:#111827;text-decoration:none}.idx{font-weight:bold;color:#1F4E79;margin:14px 0 4px}@media print{@page{size:A4 landscape;margin:10mm}body{margin:0}.no-print{display:none}}</style></head><body>';
+      html+='<h1>'+esc(title)+'</h1><div class="meta">وقت الطباعة: '+esc(new Date().toLocaleString('ar-EG'))+'</div>';
+      if(filters.length) html+='<div class="filters"><b>الفلاتر الحالية:</b> '+filters.map(esc).join(' — ')+'</div>';
+      tables.forEach(function(t,i){ html+='<div class="section"><div class="idx">جدول '+(i+1)+'</div>'+cloneTable(t)+'</div>'; });
+      html+='<div class="no-print" style="margin-top:20px"><button onclick="window.print()" style="padding:10px 18px;background:#1F4E79;color:white;border:0;border-radius:8px;font-weight:bold">طباعة / حفظ PDF</button> <button onclick="window.close()" style="padding:10px 18px;border:1px solid #999;border-radius:8px">إغلاق</button></div>';
+      html+='</body></html>';
+      var w=window.open('', '_blank', 'width=1200,height=800');
+      if(!w){ alert('المتصفح منع نافذة الطباعة. اسمح بالـ popups لهذه الصفحة.'); return false; }
+      w.document.open(); w.document.write(html); w.document.close();
+      setTimeout(function(){ try{w.focus(); w.print();}catch(e){} }, 350);
+      return false;
+    }
+  };
+})();
+</script>
+<!-- END ROSHDY FAST TABLE PRINT V39 -->
+'''
+
+patched=[]
+for p in www.glob('*.html'):
+    name=p.name.lower()
+    if skip_quality and ('quality' in name):
+        continue
+    s=p.read_text(encoding='utf-8', errors='ignore')
+    if 'window.print' not in s and 'طباعة/PDF' not in s and 'PDF/طباعة' not in s:
+        continue
+    # Remove existing helper block.
+    while HELPER_A in s and HELPER_B in s:
+        i=s.index(HELPER_A); j=s.index(HELPER_B,i)+len(HELPER_B); s=s[:i]+'\n'+s[j:]
+    # Replace direct window.print() calls in onclick only and simple JS calls.
+    s=re.sub(r'onclick=("|\')\s*window\.print\(\)\s*(;)?\s*\1', 'onclick="return RoshdyFastTablePrintV39.print()"', s)
+    s=s.replace('onclick="window.print()"', 'onclick="return RoshdyFastTablePrintV39.print()"')
+    s=s.replace("onclick='window.print()'", 'onclick="return RoshdyFastTablePrintV39.print()"')
+    s=s.replace('onclick="window.print();"', 'onclick="return RoshdyFastTablePrintV39.print()"')
+    s=s.replace("onclick='window.print();'", 'onclick="return RoshdyFastTablePrintV39.print()"')
+    # If custom function uses window.print directly, replace the exact token with helper fallback.
+    s=s.replace('window.print()', 'RoshdyFastTablePrintV39.print()')
+    # Inject helper before body end.
+    low=s.lower(); idx=low.rfind('</body>')
+    if idx>=0:
+        s=s[:idx]+'\n'+HELPER+'\n'+s[idx:]
+    else:
+        s=s.rstrip()+'\n'+HELPER+'\n'
+    p.write_text(s, encoding='utf-8')
+    patched.append(str(p))
+
+print('\n'.join(patched))
+PY
+
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+[[ -n "$APP_OWNER" ]] && chown -R "$APP_OWNER" "$WWW_DIR" 2>/dev/null || true
+
+echo "🧹 Step 3: Clear cache + restart frontend/backend"
+bench_exec clear-cache || true
+"${COMPOSE[@]}" restart backend frontend websocket >/dev/null
+sleep 8
+bench_exec clear-cache || true
+
+echo "🧪 Step 4: Page smoke checks"
+set +e
+for p in break-admin sales-report order-cancellations-report feedback-admin queue-journey-report call-report; do
+  code="$(curl -k -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$p" 2>/dev/null || echo 000)"
+  echo "$p => $code" | tee -a "$BACKUP_DIR/page_smoke_checks_v39.txt"
+done
+set -e
+
+echo "🏥 Step 5: Health Check - Elastix/CDR/AMI + Queue + Call Report"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$BACKUP_DIR/health_asterisk_bridge.txt"
+H1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status | tee "$BACKUP_DIR/health_queue_status.txt"
+H2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' | tee "$BACKUP_DIR/health_call_report.txt"
+H3=${PIPESTATUS[0]}
+set -e
+
+if [[ $H1 -ne 0 || $H2 -ne 0 || $H3 -ne 0 ]]; then
+  echo "⚠️ Health returned non-zero. راجع: $BACKUP_DIR"
+else
+  echo "✅ Health checks OK"
+fi
+
+echo "============================================================"
+echo "✅ DONE V39"
+echo "📦 Backup folder: $BACKUP_DIR"
+echo "🖨️ PDF/Print buttons now print visible tables only in a lightweight window"
+echo "📌 لو المتصفح منع نافذة الطباعة، اعمل Allow popups للموقع"
+echo "🛡️ report_api.py / Elastix / CDR / AMI untouched"
+echo "============================================================"

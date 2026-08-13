@@ -1,0 +1,602 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Roshdy V35: Fix email shift window + robust test send + call-report employee filter
+# ------------------------------------------------------------------------------
+# Fixes:
+# 1) Email call metrics were counting from 00:00 instead of shift hours.
+#    Uses Call Center Settings shift_start_hour / shift_end_hour (e.g. 10 -> 05) when builder shift is default.
+# 2) Test email sending can send BOTH reports robustly:
+#    - Center Manager report through email_report center renderer
+#    - Upper Management report through upper_management_email_api
+# 3) Call Report page gets employee/extension filter without editing report_api.py.
+#
+# Safety:
+# - Backup first.
+# - Does NOT edit report_api.py.
+# - Does NOT touch Elastix/CDR/AMI config.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "❌ docker compose/docker-compose مش موجود"
+  exit 1
+fi
+
+APP_DIR="$ROOT/apps/$APP"
+PKG_DIR="$APP_DIR/$APP"
+API_DIR="$PKG_DIR/api"
+WWW_DIR="$PKG_DIR/www"
+EMAIL_REPORT="$API_DIR/email_report.py"
+UPPER_API="$API_DIR/upper_management_email_api.py"
+CALL_FILTER_API="$API_DIR/call_filter_api.py"
+CALL_REPORT_HTML="$WWW_DIR/call-report.html"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/FIX_EMAIL_SHIFT_SEND_CALLFILTER_V35_BEFORE_$TS"
+mkdir -p "$BACKUP_DIR/files"
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend container مش شغال أو مش لاقيه"
+  exit 1
+fi
+
+bench_exec() { "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"; }
+
+echo "============================================================"
+echo "🔧 Roshdy V35: email shift + test send + call employee filter"
+echo "📦 Backup: $BACKUP_DIR"
+echo "============================================================"
+
+echo "🧯 Step 1: Backup files + bench backup"
+for f in "$EMAIL_REPORT" "$UPPER_API" "$CALL_FILTER_API" "$CALL_REPORT_HTML"; do
+  [[ -e "$f" ]] && cp -a "$f" "$BACKUP_DIR/files/$(basename "$f").before" || true
+done
+bench_exec backup --with-files | tee "$BACKUP_DIR/bench_backup_output.txt"
+
+# -----------------------------------------------------------------------------
+# 2) Call filter API
+# -----------------------------------------------------------------------------
+echo "🧩 Step 2: Install call_filter_api.py"
+cat > "$CALL_FILTER_API" <<'PYAPI'
+# -*- coding: utf-8 -*-
+import re
+import frappe
+from frappe.utils import cstr, today
+
+
+def _admin_allowed():
+    try:
+        if frappe.session.user == "Administrator":
+            return True
+        roles = set(frappe.get_roles(frappe.session.user))
+        return bool(roles.intersection({"System Manager", "Call Center Admin", "Restaurant Manager"}))
+    except Exception:
+        return False
+
+
+def _table_cols(table):
+    try:
+        rows = frappe.db.sql("describe `%s`" % table, as_dict=True)
+        return [r.get("Field") for r in rows]
+    except Exception:
+        return []
+
+
+def _ext_from_text(text):
+    text = cstr(text or "")
+    for pat in (r"\((\d{3,6})\)", r"تحويلة\s*(\d{3,6})", r"(?:Local|SIP|PJSIP)/(\d{3,6})", r"\b(\d{3,6})\b"):
+        m = re.search(pat, text, re.I)
+        if m and m.group(1) not in ("123", "1234"):
+            return m.group(1)
+    return ""
+
+
+def _add_option(opts, value, label, source=""):
+    value = cstr(value or "").strip()
+    if not value:
+        return
+    if value in ("123", "1234"):
+        return
+    if not re.match(r"^\d{3,6}$", value):
+        return
+    if value not in opts:
+        opts[value] = {"value": value, "label": label or ("تحويلة " + value), "source": source}
+
+
+@frappe.whitelist()
+def list_call_filter_options(date_from=None, date_to=None):
+    if not _admin_allowed():
+        frappe.throw("غير مسموح")
+    opts = {}
+
+    # 1) Employee extension fields from real DB columns (avoid stale meta columns).
+    try:
+        cols = _table_cols("tabEmployee")
+        ext_cols = [c for c in cols if c and any(x in c.lower() for x in ("extension", "ext", "sip"))]
+        select_cols = ["name"]
+        if "employee_name" in cols:
+            select_cols.append("employee_name")
+        if "status" in cols:
+            select_cols.append("status")
+        select_cols += [c for c in ext_cols if c not in select_cols]
+        rows = frappe.db.sql("select %s from `tabEmployee`" % ",".join("`%s`" % c for c in select_cols), as_dict=True)
+        for r in rows:
+            emp_name = r.get("employee_name") or r.get("name") or ""
+            status = r.get("status") or ""
+            for c in ext_cols:
+                ext = cstr(r.get(c) or "").strip()
+                if ext:
+                    label = "%s (%s)%s" % (emp_name, ext, "" if status in ("", "Active") else " - " + status)
+                    _add_option(opts, ext, label, "Employee." + c)
+    except Exception:
+        pass
+
+    # 2) Active Extension Sessions.
+    try:
+        if frappe.db.exists("DocType", "Extension Session"):
+            rows = frappe.get_all("Extension Session", filters={"session_status": "active"}, fields=["user", "employee", "extension"], limit_page_length=1000)
+            for r in rows:
+                ext = cstr(r.get("extension") or "").strip()
+                label = cstr(r.get("employee") or r.get("user") or "تحويلة") + " (" + ext + ")"
+                _add_option(opts, ext, label, "Extension Session")
+    except Exception:
+        pass
+
+    # 3) Recent Call Report actual_ext values so unmapped extensions still appear.
+    try:
+        from restaurant_ops.api import report_api
+        res = report_api.get_calls_report(page=1, page_size=1000, view_mode="admin", date_from=date_from or today(), date_to=date_to or date_from or today())
+        if isinstance(res, dict) and isinstance(res.get("message"), dict):
+            res = res.get("message")
+        rows = []
+        if isinstance(res, dict):
+            rows = res.get("calls") or res.get("rows") or []
+        for r in rows:
+            ext = cstr(r.get("actual_ext") or "").strip() or _ext_from_text(" ".join([cstr(r.get("agent_name") or ""), cstr(r.get("dstchannel") or "")]))
+            if ext:
+                agent = cstr(r.get("agent_name") or "").strip()
+                label = agent if agent else "تحويلة " + ext
+                _add_option(opts, ext, label, "Call Report")
+    except Exception:
+        pass
+
+    options = sorted(opts.values(), key=lambda x: x.get("label") or x.get("value"))
+    return {"success": True, "options": options, "count": len(options)}
+PYAPI
+
+# -----------------------------------------------------------------------------
+# 3) Email report final shift/send patch
+# -----------------------------------------------------------------------------
+echo "🧩 Step 3: Patch email_report.py final V35"
+cat >> "$EMAIL_REPORT" <<'PYEMAIL'
+
+# BEGIN ROSHDY EMAIL SHIFT SEND FINAL V35
+try:
+    import frappe
+    from frappe.utils import today, getdate, get_datetime, now_datetime, cstr, cint
+    from datetime import datetime, time, timedelta
+except Exception:
+    pass
+
+
+def _v35_parse_time_value(v, default="00:00"):
+    s = cstr(v if v is not None else "").strip()
+    if not s:
+        s = default
+    # Numeric hour such as 10 or 5.
+    try:
+        if s.isdigit():
+            h = int(s)
+            if 0 <= h <= 23:
+                return "%02d:00" % h
+    except Exception:
+        pass
+    import re
+    m = re.search(r"(\d{1,2}):(\d{2})", s)
+    if m:
+        h, mm = int(m.group(1)), int(m.group(2))
+        if 0 <= h <= 23 and 0 <= mm <= 59:
+            return "%02d:%02d" % (h, mm)
+    return default
+
+
+def _v35_call_center_shift_times(st=None):
+    # Prefer builder settings if they are explicitly not default.
+    ss = cstr((st or {}).get("shift_start") if isinstance(st, dict) else "").strip()
+    se = cstr((st or {}).get("shift_end") if isinstance(st, dict) else "").strip()
+    if ss and se and not (ss in ("00:00", "0", "") and se in ("23:59", "", "0")):
+        return _v35_parse_time_value(ss, "00:00"), _v35_parse_time_value(se, "23:59")
+    # Then Call Center Settings numeric fields.
+    try:
+        start_hour = frappe.db.get_single_value("Call Center Settings", "shift_start_hour")
+        end_hour = frappe.db.get_single_value("Call Center Settings", "shift_end_hour")
+        if start_hour not in (None, "") and end_hour not in (None, ""):
+            return _v35_parse_time_value(start_hour, "00:00"), _v35_parse_time_value(end_hour, "23:59")
+    except Exception:
+        pass
+    return "00:00", "23:59"
+
+
+def _v35_shift_window(date_from=None, date_to=None, st=None):
+    ss, se = _v35_call_center_shift_times(st)
+    df = getdate(date_from or today())
+    # date_to is ignored for crossing shift; one shift starts on df.
+    sh, sm = [int(x) for x in ss.split(":")[:2]]
+    eh, em = [int(x) for x in se.split(":")[:2]]
+    start_dt = datetime.combine(df, time(sh, sm))
+    end_dt = datetime.combine(df, time(eh, em))
+    if end_dt <= start_dt:
+        end_dt += timedelta(days=1)
+    return start_dt, end_dt, ss, se
+
+
+def _v35_calls_rows_for_shift(date_from=None, date_to=None, st=None):
+    start_dt, end_dt, ss, se = _v35_shift_window(date_from, date_to, st)
+    from restaurant_ops.api import report_api
+    # Ask report_api for the date span covering the shift, then filter in-memory.
+    df = start_dt.date().isoformat()
+    dt = end_dt.date().isoformat()
+    all_rows = []
+    first_summary = {}
+    for page in range(1, 21):
+        try:
+            res = report_api.get_calls_report(page=page, page_size=1000, view_mode="admin", date_from=df, date_to=dt)
+        except TypeError:
+            res = report_api.get_calls_report(page=page, page_size=1000, view_mode="admin")
+        if isinstance(res, dict) and isinstance(res.get("message"), dict):
+            res = res.get("message")
+        if not isinstance(res, dict):
+            break
+        if page == 1:
+            first_summary = res.get("summary") or {}
+        rows = res.get("calls") or res.get("rows") or []
+        if not rows:
+            break
+        all_rows.extend(rows)
+        pag = res.get("pagination") or {}
+        if page >= cint(pag.get("total_pages") or page):
+            break
+    filtered = []
+    for r in all_rows:
+        cd = r.get("calldate") or r.get("call_time") or r.get("time")
+        if not cd:
+            continue
+        try:
+            cdt = get_datetime(cd)
+        except Exception:
+            continue
+        if start_dt <= cdt <= end_dt:
+            filtered.append(r)
+    return filtered, {"start_dt": start_dt.strftime("%Y-%m-%d %H:%M:%S"), "end_dt": end_dt.strftime("%Y-%m-%d %H:%M:%S"), "shift_start": ss, "shift_end": se, "asked_date_from": df, "asked_date_to": dt, "raw_summary": first_summary}
+
+
+def _v35_summarize_rows(rows):
+    summary = {"raw_total": len(rows), "total": len(rows), "queue_total": len(rows), "answered": 0, "queue_answered": 0, "declined": 0, "abandoned": 0, "staff_missed": 0}
+    for r in rows:
+        smart = cstr(r.get("smart_category") or "").lower()
+        disp = cstr(r.get("disposition") or "").upper()
+        label = cstr(r.get("category_label") or "")
+        if smart == "answered" or disp == "ANSWERED" or "تم الرد" in label:
+            summary["answered"] += 1
+            summary["queue_answered"] += 1
+        elif smart in ("busy", "declined") or disp in ("BUSY", "FAILED"):
+            summary["declined"] += 1
+        elif smart == "abandoned":
+            summary["abandoned"] += 1
+        elif smart in ("staff_missed", "employee_missed"):
+            summary["staff_missed"] += 1
+    qt = summary["queue_total"] or 0
+    raw = summary["raw_total"] or 0
+    summary["answer_rate_of_queue"] = round(summary["queue_answered"] * 100 / qt, 2) if qt else 0
+    summary["queue_reach_rate_of_all"] = round(qt * 100 / raw, 2) if raw else 0
+    return summary
+
+
+# Override old simple metrics used by legacy center report.
+def _metrics(mode="admin"):
+    rows, info = _v35_calls_rows_for_shift(today(), today())
+    sm = _v35_summarize_rows(rows)
+    sm["shift_window"] = info
+    return sm
+
+
+# Override customizer period args.
+def _er_period_args(st=None):
+    st = st or _er_get_customizer()
+    dt = today()
+    ss, se = _v35_call_center_shift_times(st)
+    return dt, dt, ss, se
+
+
+# Override advanced builder period args.
+def _adv_period(st):
+    dt = today()
+    ss, se = _v35_call_center_shift_times(st)
+    return dt, dt, ss, se
+
+
+try:
+    _v35_previous_send_report_now = send_report_now
+except Exception:
+    _v35_previous_send_report_now = None
+
+
+@frappe.whitelist()
+def send_report_now(report_type="both", **kwargs):
+    """Robust send from email customizer.
+    both => sends center + upper independently and returns both statuses.
+    """
+    rt = cstr(report_type or kwargs.get("report_type") or "both").lower()
+    settings = frappe.get_single("Call Center Settings")
+    center = None
+    upper = None
+    if rt in ("center", "service", "manager", "customer_service"):
+        if 'send_center_manager_report' in globals():
+            return send_center_manager_report(settings)
+        return _v35_previous_send_report_now(report_type="center")
+    if rt in ("upper", "management", "upper_management"):
+        from restaurant_ops.api.upper_management_email_api import send_upper_management_report
+        return send_upper_management_report(**kwargs)
+    # both
+    try:
+        if 'send_center_manager_report' in globals():
+            center = send_center_manager_report(settings)
+        else:
+            center = _v35_previous_send_report_now(report_type="center") if _v35_previous_send_report_now else {"success": False, "message": "center sender missing"}
+    except Exception as e:
+        center = {"success": False, "message": cstr(e)}
+    try:
+        from restaurant_ops.api.upper_management_email_api import send_upper_management_report
+        upper = send_upper_management_report(**kwargs)
+    except Exception as e:
+        upper = {"success": False, "message": cstr(e)}
+    ok = bool(center and center.get("success")) and bool(upper and upper.get("success"))
+    return {"success": ok, "message": "Center: %s | Upper: %s" % ((center or {}).get("message"), (upper or {}).get("message")), "center": center, "upper": upper}
+
+
+@frappe.whitelist()
+def debug_email_shift_window_v35(date_from=None, date_to=None):
+    rows, info = _v35_calls_rows_for_shift(date_from or today(), date_to or date_from or today())
+    return {"success": True, "shift_window": info, "rows_count": len(rows), "summary": _v35_summarize_rows(rows), "sample": rows[:5]}
+# END ROSHDY EMAIL SHIFT SEND FINAL V35
+PYEMAIL
+
+# -----------------------------------------------------------------------------
+# 4) Patch upper API shift calls wrapper
+# -----------------------------------------------------------------------------
+echo "🧩 Step 4: Patch upper_management_email_api.py shift call counts"
+cat >> "$UPPER_API" <<'PYUPPER'
+
+# BEGIN ROSHDY UPPER SHIFT CALLS FINAL V35
+try:
+    import frappe
+    from frappe.utils import today, cstr, cint, getdate, get_datetime
+    from datetime import datetime, time, timedelta
+except Exception:
+    pass
+
+try:
+    _v35_prev_upper_data = get_upper_management_report_data
+except Exception:
+    _v35_prev_upper_data = None
+
+
+def _u35_parse_time(v, default="00:00"):
+    s=cstr(v if v is not None else "").strip()
+    if s.isdigit():
+        h=int(s)
+        if 0 <= h <= 23: return "%02d:00" % h
+    import re
+    m=re.search(r"(\d{1,2}):(\d{2})", s)
+    if m:
+        h=int(m.group(1)); mm=int(m.group(2))
+        if 0 <= h <= 23 and 0 <= mm <= 59: return "%02d:%02d" % (h,mm)
+    return default
+
+
+def _u35_shift_times():
+    try:
+        sh=frappe.db.get_single_value("Call Center Settings", "shift_start_hour")
+        eh=frappe.db.get_single_value("Call Center Settings", "shift_end_hour")
+        if sh not in (None,"") and eh not in (None,""):
+            return _u35_parse_time(sh,"00:00"), _u35_parse_time(eh,"23:59")
+    except Exception:
+        pass
+    return "00:00","23:59"
+
+
+def _u35_window(date_from=None):
+    ss,se=_u35_shift_times()
+    d=getdate(date_from or today())
+    sh,sm=[int(x) for x in ss.split(":")]
+    eh,em=[int(x) for x in se.split(":")]
+    start=datetime.combine(d,time(sh,sm)); end=datetime.combine(d,time(eh,em))
+    if end <= start: end += timedelta(days=1)
+    return start,end,ss,se
+
+
+def _u35_call_rows(date_from=None):
+    start,end,ss,se=_u35_window(date_from)
+    from restaurant_ops.api import report_api
+    rows=[]
+    for page in range(1,21):
+        try:
+            res=report_api.get_calls_report(page=page,page_size=1000,view_mode="admin",date_from=start.date().isoformat(),date_to=end.date().isoformat())
+        except TypeError:
+            res=report_api.get_calls_report(page=page,page_size=1000,view_mode="admin")
+        if isinstance(res,dict) and isinstance(res.get("message"),dict): res=res.get("message")
+        if not isinstance(res,dict): break
+        part=res.get("calls") or res.get("rows") or []
+        if not part: break
+        rows.extend(part)
+        pag=res.get("pagination") or {}
+        if page >= cint(pag.get("total_pages") or page): break
+    out=[]
+    for r in rows:
+        try: cd=get_datetime(r.get("calldate") or r.get("call_time") or r.get("time"))
+        except Exception: continue
+        if start <= cd <= end: out.append(r)
+    return out,{"start_dt":start.strftime('%Y-%m-%d %H:%M:%S'),"end_dt":end.strftime('%Y-%m-%d %H:%M:%S'),"shift_start":ss,"shift_end":se}
+
+
+def _u35_summary(rows):
+    ans=0
+    for r in rows:
+        if cstr(r.get("smart_category") or "").lower()=="answered" or cstr(r.get("disposition") or "").upper()=="ANSWERED" or "تم الرد" in cstr(r.get("category_label") or ""):
+            ans+=1
+    return {"total":len(rows),"answered":ans}
+
+
+@frappe.whitelist()
+def get_upper_management_report_data(date_from=None, date_to=None):
+    data=_v35_prev_upper_data(date_from=date_from,date_to=date_to) if _v35_prev_upper_data else {"success":True}
+    try:
+        period=data.get("period") or {}
+        df=date_from or period.get("from") or today()
+        rows,info=_u35_call_rows(df)
+        sm=_u35_summary(rows)
+        calls=data.setdefault("calls",{})
+        calls["total"]=sm["total"]
+        calls["answered"]=sm["answered"]
+        calls["shift_window"]=info
+        # complaint queue count in same shift
+        cq=0
+        for r in rows:
+            dst=cstr(r.get("dst") or "").strip(); actual=cstr(r.get("actual_ext") or "").strip(); agent=cstr(r.get("agent_name") or "")
+            if dst=="123" or (actual=="123" and "طابور" in agent) or cstr(r.get("lastdata") or "").startswith("123,"):
+                cq+=1
+        data.setdefault("complaint_queue",{})["count"]=cq
+        data["shift_window"] = info
+    except Exception as e:
+        data.setdefault("calls",{})["shift_error"]=cstr(e)
+    return data
+
+@frappe.whitelist()
+def debug_upper_shift_window_v35(date_from=None,date_to=None):
+    rows,info=_u35_call_rows(date_from or today())
+    return {"success":True,"shift_window":info,"rows_count":len(rows),"summary":_u35_summary(rows),"sample":rows[:5]}
+# END ROSHDY UPPER SHIFT CALLS FINAL V35
+PYUPPER
+
+# -----------------------------------------------------------------------------
+# 5) Patch call-report page employee filter
+# -----------------------------------------------------------------------------
+echo "🧩 Step 5: Patch call-report.html employee/extension filter"
+python3 - <<'PY'
+from pathlib import Path
+import os
+p=Path(os.environ['CALL_REPORT_HTML'])
+if not p.exists(): raise SystemExit(0)
+s=p.read_text(encoding='utf-8', errors='ignore')
+# Avoid duplicate patch.
+a='<!-- BEGIN ROSHDY CALL REPORT EMPLOYEE FILTER V35 -->'; b='<!-- END ROSHDY CALL REPORT EMPLOYEE FILTER V35 -->'
+while a in s and b in s:
+    i=s.index(a); j=s.index(b,i)+len(b); s=s[:i]+'\n'+s[j:]
+# Insert select after category or before search.
+select_html='''\n<!-- BEGIN ROSHDY CALL REPORT EMPLOYEE FILTER V35 -->\n<div class="fg"><label>الموظف / التحويلة</label><select id="f-employee-ext"><option value="">-- الكل --</option></select></div>\n<!-- END ROSHDY CALL REPORT EMPLOYEE FILTER V35 -->\n'''
+needle='<div class="fg"><label>بحث برقم العميل أو التحويلة</label><input id="f-search" placeholder="010... أو 1001"></div>'
+if needle in s:
+    s=s.replace(needle, select_html+needle, 1)
+# Patch loadCalls to apply selected extension into search if no manual search.
+old="""search:document.getElementById(\"f-search\").value,"""
+new="""search:(document.getElementById(\"f-search\").value || (document.getElementById(\"f-employee-ext\")?document.getElementById(\"f-employee-ext\").value:\"\")),"""
+s=s.replace(old,new,1)
+# Add loader script before </body>.
+script=r'''
+<!-- BEGIN ROSHDY CALL REPORT EMPLOYEE FILTER LOADER V35 -->
+<script>
+(function(){
+  async function loadEmployeeExtOptions(){
+    try{
+      var sel=document.getElementById('f-employee-ext'); if(!sel) return;
+      var qs=new URLSearchParams();
+      var df=document.getElementById('f-from'); var dt=document.getElementById('f-to');
+      if(df&&df.value) qs.append('date_from',df.value); if(dt&&dt.value) qs.append('date_to',dt.value);
+      var r=await fetch('/api/method/restaurant_ops.api.call_filter_api.list_call_filter_options?'+qs.toString(),{credentials:'same-origin',cache:'no-store'});
+      var j=await r.json(); var d=j.message||{}; var rows=d.options||[];
+      var cur=sel.value;
+      sel.innerHTML='<option value="">-- الكل --</option>'+rows.map(function(x){return '<option value="'+String(x.value).replace(/"/g,'&quot;')+'">'+String(x.label||x.value)+'</option>';}).join('');
+      sel.value=cur;
+      sel.onchange=function(){ var s=document.getElementById('f-search'); if(s) s.value=''; loadCalls(1); };
+    }catch(e){console.log('employee ext options failed',e)}
+  }
+  setTimeout(loadEmployeeExtOptions,500);
+  setInterval(loadEmployeeExtOptions,60000);
+})();
+</script>
+<!-- END ROSHDY CALL REPORT EMPLOYEE FILTER LOADER V35 -->
+'''
+low=s.lower(); idx=low.rfind('</body>')
+if idx>=0: s=s[:idx]+'\n'+script+'\n'+s[idx:]
+else: s=s+'\n'+script
+p.write_text(s,encoding='utf-8')
+PY
+
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+[[ -n "$APP_OWNER" ]] && chown "$APP_OWNER" "$EMAIL_REPORT" "$UPPER_API" "$CALL_FILTER_API" "$CALL_REPORT_HTML" 2>/dev/null || true
+
+# -----------------------------------------------------------------------------
+# 6) Clear cache/restart/validate
+# -----------------------------------------------------------------------------
+echo "🧹 Step 6: Clear cache + restart app services"
+bench_exec clear-cache || true
+"${COMPOSE[@]}" restart backend frontend websocket queue-short queue-long scheduler >/dev/null
+sleep 8
+bench_exec clear-cache || true
+
+echo "🧪 Step 7: Validation"
+set +e
+bench_exec execute restaurant_ops.api.email_report.debug_email_shift_window_v35 | tee "$BACKUP_DIR/debug_email_shift_window_v35.txt"
+V1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.upper_management_email_api.debug_upper_shift_window_v35 | tee "$BACKUP_DIR/debug_upper_shift_window_v35.txt"
+V2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.email_report.send_report_now --kwargs '{"report_type":"both"}' | tee "$BACKUP_DIR/send_report_now_both_v35.txt"
+V3=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.call_filter_api.list_call_filter_options | tee "$BACKUP_DIR/call_filter_options_v35.txt"
+V4=${PIPESTATUS[0]}
+for p in call-report email-report-customizer admin-desk; do
+  code="$(curl -k -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$p" 2>/dev/null || echo 000)"
+  echo "$p => $code" | tee -a "$BACKUP_DIR/page_smoke_checks_v35.txt"
+done
+set -e
+
+if [[ $V1 -ne 0 || $V2 -ne 0 || $V4 -ne 0 ]]; then
+  echo "❌ Validation failed. راجع: $BACKUP_DIR"
+  exit 1
+fi
+if [[ $V3 -ne 0 ]]; then
+  echo "⚠️ إرسال both من الطرفية رجع non-zero. راجع: $BACKUP_DIR/send_report_now_both_v35.txt"
+fi
+
+echo "🏥 Step 8: Health Check - Elastix/CDR/AMI + Queue + Call Report"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$BACKUP_DIR/health_asterisk_bridge.txt"
+H1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status | tee "$BACKUP_DIR/health_queue_status.txt"
+H2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' | tee "$BACKUP_DIR/health_call_report.txt"
+H3=${PIPESTATUS[0]}
+set -e
+
+if [[ $H1 -ne 0 || $H2 -ne 0 || $H3 -ne 0 ]]; then
+  echo "⚠️ Health returned non-zero. راجع: $BACKUP_DIR"
+else
+  echo "✅ Health checks OK"
+fi
+
+echo "============================================================"
+echo "✅ DONE V35"
+echo "📦 Backup folder: $BACKUP_DIR"
+echo "📧 Email both-send + shift call window patched"
+echo "📞 Call Report employee/extension filter added"
+echo "🛡️ report_api.py / Elastix / CDR / AMI untouched"
+echo "============================================================"

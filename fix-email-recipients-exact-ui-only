@@ -1,0 +1,429 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Fix over-sending recipients in Upper Management email.
+# Problem: Upper report could fallback to role/users or broad settings scan, so it sent to 4 while UI has 2.
+# Fix: Upper report sends ONLY to explicit recipients passed by UI OR the exact Upper Management emails setting.
+# No role fallback. No broad all-email scan. No touching report_api / Elastix / CDR / AMI.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+RUN_EMAIL_SEND_TEST="${RUN_EMAIL_SEND_TEST:-0}"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "❌ docker compose/docker-compose مش موجود"
+  exit 1
+fi
+
+APP_DIR="$ROOT/apps/$APP"
+PKG_DIR="$APP_DIR/$APP"
+API_DIR="$PKG_DIR/api"
+EMAIL_REPORT="$API_DIR/email_report.py"
+UPPER_API="$API_DIR/upper_management_email_api.py"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/FIX_EMAIL_RECIPIENTS_EXACT_BEFORE_$TS"
+mkdir -p "$BACKUP_DIR"
+
+if [[ ! -f "$EMAIL_REPORT" || ! -f "$UPPER_API" ]]; then
+  echo "❌ مش لاقي ملفات الإيميل المطلوبة"
+  echo "EMAIL_REPORT=$EMAIL_REPORT"
+  echo "UPPER_API=$UPPER_API"
+  exit 1
+fi
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend container مش شغال أو مش لاقيه"
+  exit 1
+fi
+
+bench_exec() {
+  "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"
+}
+
+echo "============================================================"
+echo "🔧 Fix Upper Email Recipients Exact/UI Only"
+echo "📦 Backup: $BACKUP_DIR"
+echo "============================================================"
+
+echo "🧯 Backup current email files"
+cp -a "$EMAIL_REPORT" "$BACKUP_DIR/email_report.py.before"
+cp -a "$UPPER_API" "$BACKUP_DIR/upper_management_email_api.py.before"
+
+export UPPER_API EMAIL_REPORT
+python3 - <<'PY'
+# -*- coding: utf-8 -*-
+from pathlib import Path
+import os
+
+upper_api = Path(os.environ["UPPER_API"])
+email_report = Path(os.environ["EMAIL_REPORT"])
+
+# ------------------------------------------------------------------
+# 1) Append strict recipient override to upper_management_email_api.py
+# ------------------------------------------------------------------
+s = upper_api.read_text(encoding="utf-8", errors="ignore")
+start = "# BEGIN ROSHDY STRICT UPPER EMAIL RECIPIENTS V4"
+end = "# END ROSHDY STRICT UPPER EMAIL RECIPIENTS V4"
+block = r'''
+# BEGIN ROSHDY STRICT UPPER EMAIL RECIPIENTS V4
+# Purpose:
+#   Do NOT send Upper Management report to role fallback users.
+#   Do NOT collect random emails from broad settings.
+#   Send ONLY to:
+#     1) explicit recipients passed by the UI/API, OR
+#     2) the exact saved Upper Management emails setting.
+
+try:
+    import json as _roshdy_json_v4
+    import re as _roshdy_re_v4
+except Exception:
+    pass
+
+
+def _roshdy_v4_extract_emails(value):
+    out = []
+    if value is None:
+        return out
+    if isinstance(value, (list, tuple, set)):
+        for x in value:
+            out.extend(_roshdy_v4_extract_emails(x))
+        return out
+    if isinstance(value, dict):
+        for x in value.values():
+            out.extend(_roshdy_v4_extract_emails(x))
+        return out
+    text = cstr(value)
+    if not text:
+        return out
+    t = text.strip()
+    if t.startswith("[") or t.startswith("{"):
+        try:
+            out.extend(_roshdy_v4_extract_emails(_roshdy_json_v4.loads(t)))
+        except Exception:
+            pass
+    out.extend(_roshdy_re_v4.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", text))
+    return out
+
+
+def _roshdy_v4_clean(values):
+    seen = set()
+    cleaned = []
+    for e in _roshdy_v4_extract_emails(values):
+        e = cstr(e).strip().strip(",; ")
+        if not e:
+            continue
+        key = e.lower()
+        if key in seen:
+            continue
+        # Never auto-send to placeholders.
+        if key.endswith("@local.local") or key.endswith("@example.com"):
+            continue
+        seen.add(key)
+        cleaned.append(e)
+    return cleaned
+
+
+def _roshdy_v4_explicit_recipients(kwargs=None, direct=None):
+    kwargs = kwargs or {}
+    candidates = []
+    candidates.append(direct)
+    # Include many possible UI/API names. This makes the visible textarea win immediately.
+    keys = (
+        "recipients", "recipient", "emails", "email", "to", "send_to", "test_email", "email_to", "mail_to",
+        "upper_emails", "upper_email", "upper_recipients", "upper_recipient",
+        "upper_management_emails", "upper_management_email", "upper_management_recipients",
+        "management_emails", "management_recipients", "executive_emails", "executive_recipients"
+    )
+    for k in keys:
+        if k in kwargs and kwargs.get(k) not in (None, ""):
+            candidates.append(kwargs.get(k))
+    return _roshdy_v4_clean(candidates)
+
+
+def _roshdy_v4_score_single_row(doctype, field, value):
+    hay = f"{doctype or ''} {field or ''}".lower()
+    val = cstr(value or "").lower()
+
+    # hard excludes: these must never be recipient sources for upper report
+    hard_excludes = (
+        "smtp", "mail_server", "email_server", "host", "server", "password", "secret", "token", "api_key",
+        "sender", "from_email", "from", "login", "username", "user_name", "owner",
+        "center_manager", "centre_manager", "call_center_manager", "customer_service_manager",
+        "center_emails", "centre_emails", "service_manager", "مدير السنتر", "مدير خدمة العملاء"
+    )
+    if any(x in hay for x in hard_excludes):
+        return -9999
+
+    score = 0
+    # exact upper-management fields are preferred
+    if "upper_management" in hay or "upper-management" in hay:
+        score += 200
+    if "upper" in hay:
+        score += 160
+    if "executive" in hay or "top_management" in hay:
+        score += 130
+    # management alone is accepted but lower priority
+    if "management" in hay and "upper" not in hay:
+        score += 80
+    # recipient-like fields
+    if any(x in hay for x in ("recipient", "recipients", "emails", "email_to", "send_to", "to_email", "mail_to")):
+        score += 40
+    # known settings doctype can hold JSON, but it is lower than exact fields
+    if "roshdy email builder" in hay:
+        score += 20
+    # If value text itself clearly contains upper keys, give small boost. Do not use value text alone as primary if no path/field clue.
+    if any(x in val for x in ("upper_management", "upper management", "executive")):
+        score += 25
+    return score
+
+
+def _roshdy_v4_pick_saved_upper_from_singles():
+    """Pick the best exact Upper Management email setting from tabSingles only."""
+    candidates = []
+    try:
+        rows = frappe.db.sql(
+            """
+            select doctype, field, value
+            from `tabSingles`
+            where value like '%%@%%'
+            """,
+            as_dict=True,
+        )
+    except Exception:
+        rows = []
+
+    for r in rows:
+        emails = _roshdy_v4_clean(r.get("value"))
+        if not emails:
+            continue
+        score = _roshdy_v4_score_single_row(r.get("doctype"), r.get("field"), r.get("value"))
+        if score <= 0:
+            continue
+        candidates.append({"score": score, "doctype": r.get("doctype"), "field": r.get("field"), "emails": emails})
+
+    if not candidates:
+        return [], "not_found", []
+
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+    best_score = candidates[0]["score"]
+
+    # Use ONLY the best exact row(s), not all email settings.
+    # This prevents center/old/admin emails from being added.
+    best = [c for c in candidates if c["score"] == best_score]
+    emails = []
+    sources = []
+    for c in best:
+        emails.extend(c["emails"])
+        sources.append(f"{c.get('doctype')}.{c.get('field')} score={c.get('score')}")
+    return _roshdy_v4_clean(emails), "tabSingles_best_exact", sources
+
+
+def _roshdy_v4_walk_json_upper(obj, path=""):
+    """Fallback parser for a JSON settings blob, but only paths that clearly mean upper/executive management."""
+    emails = []
+    path_l = path.lower()
+    bad_path = any(x in path_l for x in ("center", "centre", "customer_service", "service_manager", "sender", "smtp", "password", "host"))
+    good_path = any(x in path_l for x in ("upper", "upper_management", "executive", "top_management"))
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            emails.extend(_roshdy_v4_walk_json_upper(v, f"{path}.{k}" if path else cstr(k)))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            emails.extend(_roshdy_v4_walk_json_upper(v, f"{path}[{i}]"))
+    else:
+        if good_path and not bad_path:
+            emails.extend(_roshdy_v4_extract_emails(obj))
+    return emails
+
+
+def _roshdy_v4_pick_saved_upper_from_json():
+    """Last fallback: parse known JSON settings only on upper/executive paths."""
+    emails = []
+    sources = []
+    try:
+        rows = frappe.db.sql(
+            """
+            select doctype, field, value
+            from `tabSingles`
+            where value like '%%@%%'
+              and (field like '%%json%%' or field='settings_json' or doctype like '%%Email Builder%%')
+            """,
+            as_dict=True,
+        )
+    except Exception:
+        rows = []
+    for r in rows:
+        text = cstr(r.get("value") or "").strip()
+        if not (text.startswith("{") or text.startswith("[")):
+            continue
+        try:
+            obj = _roshdy_json_v4.loads(text)
+        except Exception:
+            continue
+        found = _roshdy_v4_walk_json_upper(obj)
+        if found:
+            emails.extend(found)
+            sources.append(f"{r.get('doctype')}.{r.get('field')}")
+    return _roshdy_v4_clean(emails), "json_upper_paths", sources
+
+
+def _roshdy_v4_resolve_upper_recipients(direct=None, kwargs=None):
+    explicit = _roshdy_v4_explicit_recipients(kwargs=kwargs, direct=direct)
+    if explicit:
+        return explicit, "explicit_ui_or_api", ["kwargs/direct"]
+
+    saved, source, sources = _roshdy_v4_pick_saved_upper_from_singles()
+    if saved:
+        return saved, source, sources
+
+    saved_json, source_json, sources_json = _roshdy_v4_pick_saved_upper_from_json()
+    if saved_json:
+        return saved_json, source_json, sources_json
+
+    # Important: NO role fallback here. If no exact recipients, fail clearly instead of sending to extra users.
+    return [], "not_found", []
+
+
+@frappe.whitelist()
+def debug_email_send_config(**kwargs):
+    recips, source, sources = _roshdy_v4_resolve_upper_recipients(kwargs=kwargs)
+    return {
+        "success": True,
+        "upper_recipients_count": len(recips),
+        "upper_recipients": recips,
+        "source": source,
+        "sources": sources,
+        "note": "No email was sent. Upper report will NOT fallback to role users after this fix.",
+    }
+
+
+@frappe.whitelist()
+def send_upper_management_report(recipients=None, date_from=None, date_to=None, subject=None, **kwargs):
+    recips, source, sources = _roshdy_v4_resolve_upper_recipients(direct=recipients, kwargs=kwargs)
+    if not recips:
+        frappe.throw("لم يتم العثور على إيميلات الإدارة العليا بدقة. الإرسال اتوقف بدل ما يبعت لمستخدمين زيادة. راجع خانة إيميلات الإدارة العليا واضغط حفظ.")
+
+    html_body = render_upper_management_report_html(date_from=date_from, date_to=date_to)
+    start_date, end_date, _start_dt, _end_dt = _period(date_from, date_to)
+    subj = subject or kwargs.get("email_subject") or kwargs.get("subject") or f"تقرير الإدارة العليا - مطعم رشدي - {_date_label(start_date, end_date)}"
+
+    frappe.sendmail(recipients=recips, subject=subj, message=html_body, now=True)
+    return {
+        "success": True,
+        "message": f"تم إرسال تقرير الإدارة العليا إلى {len(recips)} مستخدم",
+        "recipients": recips,
+        "recipients_count": len(recips),
+        "source": source,
+        "sources": sources,
+        "subject": subj,
+    }
+# END ROSHDY STRICT UPPER EMAIL RECIPIENTS V4
+'''
+if start in s and end in s:
+    a = s.index(start)
+    b = s.index(end, a) + len(end)
+    s = s[:a] + block.strip() + s[b:]
+else:
+    s = s.rstrip() + "\n\n" + block.strip() + "\n"
+compile(s, str(upper_api), "exec")
+upper_api.write_text(s, encoding="utf-8")
+
+# ------------------------------------------------------------------
+# 2) Tighten router so generic management does not accidentally mean upper.
+# ------------------------------------------------------------------
+s2 = email_report.read_text(encoding="utf-8", errors="ignore")
+router_marker_start = "# BEGIN ROSHDY ROUTER STRICT UPPER TYPES V4"
+router_marker_end = "# END ROSHDY ROUTER STRICT UPPER TYPES V4"
+router_patch = r'''
+# BEGIN ROSHDY ROUTER STRICT UPPER TYPES V4
+# Final override for _roshdy_is_upper_report: only explicit upper-management names use the new upper report.
+def _roshdy_is_upper_report(report_type=None, **kwargs):
+    rt = (report_type or kwargs.get("report_type") or kwargs.get("type") or kwargs.get("report") or "").strip().lower()
+    return rt in (
+        "upper", "upper_management", "upper-management", "upper_management_report",
+        "executive", "top_management", "admin_upper",
+        "الإدارة العليا", "الادارة العليا", "ادارة عليا", "إدارة عليا"
+    )
+# END ROSHDY ROUTER STRICT UPPER TYPES V4
+'''
+# Put this before the router if possible? Better append at the very end; runtime function lookup uses latest definition in wrappers.
+if router_marker_start in s2 and router_marker_end in s2:
+    a = s2.index(router_marker_start)
+    b = s2.index(router_marker_end, a) + len(router_marker_end)
+    s2 = s2[:a] + router_patch.strip() + s2[b:]
+else:
+    s2 = s2.rstrip() + "\n\n" + router_patch.strip() + "\n"
+compile(s2, str(email_report), "exec")
+email_report.write_text(s2, encoding="utf-8")
+PY
+
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+if [[ -n "$APP_OWNER" ]]; then
+  chown "$APP_OWNER" "$EMAIL_REPORT" "$UPPER_API" 2>/dev/null || true
+fi
+
+echo "🧹 Clear cache + restart app services"
+bench_exec clear-cache || true
+"${COMPOSE[@]}" restart backend frontend websocket queue-short queue-long scheduler >/dev/null
+sleep 8
+bench_exec clear-cache || true
+
+echo "🧪 Validation: debug recipients only, no email is sent"
+set +e
+bench_exec execute restaurant_ops.api.upper_management_email_api.debug_email_send_config | tee "$BACKUP_DIR/debug_upper_recipients_after_fix.txt"
+V1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.upper_management_email_api.preview_upper_management_report > "$BACKUP_DIR/preview_upper_after_fix.txt" 2>&1
+V2=$?
+head -c 700 "$BACKUP_DIR/preview_upper_after_fix.txt" | tee "$BACKUP_DIR/preview_upper_after_fix_head.txt"
+echo
+set -e
+
+if [[ $V1 -ne 0 || $V2 -ne 0 ]]; then
+  echo "❌ Validation failed. راجع: $BACKUP_DIR"
+  exit 1
+fi
+
+if [[ "$RUN_EMAIL_SEND_TEST" == "1" ]]; then
+  echo "📧 RUN_EMAIL_SEND_TEST=1 -> sending real upper management test email to EXACT resolved recipients only"
+  set +e
+  bench_exec execute restaurant_ops.api.upper_management_email_api.send_upper_management_report | tee "$BACKUP_DIR/send_upper_test_after_fix.txt"
+  S1=${PIPESTATUS[0]}
+  set -e
+  if [[ $S1 -ne 0 ]]; then
+    echo "❌ Actual email send failed. راجع: $BACKUP_DIR/send_upper_test_after_fix.txt"
+    exit 1
+  fi
+else
+  echo "ℹ️ لم يتم إرسال إيميل فعلي من السكريبت. جرّب من الواجهة بعد ما تشوف العدد في debug فوق."
+fi
+
+echo "🏥 Health Check - Elastix/CDR/AMI + Queue + Call Report"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$BACKUP_DIR/health_asterisk_bridge.txt"
+H1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status | tee "$BACKUP_DIR/health_queue_status.txt"
+H2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' | tee "$BACKUP_DIR/health_call_report.txt"
+H3=${PIPESTATUS[0]}
+set -e
+
+if [[ $H1 -ne 0 || $H2 -ne 0 || $H3 -ne 0 ]]; then
+  echo "⚠️ Health returned non-zero. راجع: $BACKUP_DIR"
+else
+  echo "✅ Health checks OK"
+fi
+
+echo "============================================================"
+echo "✅ DONE"
+echo "📦 Backup folder: $BACKUP_DIR"
+echo "📧 Upper email now uses exact UI/settings recipients only. No role fallback."
+echo "🛡️ report_api.py لم يتم لمسه"
+echo "============================================================"

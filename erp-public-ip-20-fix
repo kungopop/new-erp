@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# erp-public-ip-20-fix
+# Fix ERP/Frappe host_name to public IP 196.219.158.20 without typing/copying clickable URLs.
+# Safe: does not change FortiGate, does not touch Elastix/CDR logic.
+# Optional usage:
+#   ./erp-public-ip-20-fix 196.219.158.20
+
+ROOT="/opt/frappe_crm"
+SITE="crm.local"
+PUBLIC_IP="${1:-196.219.158.20}"
+
+say(){ echo -e "\n============================================================\n$1\n============================================================"; }
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo "❌ شغّل كـ root: sudo -i ثم ./erp-public-ip-20-fix"
+  exit 1
+fi
+
+say "1) Preflight"
+if [[ ! -d "$ROOT" ]]; then
+  echo "❌ مش لاقي $ROOT"
+  exit 1
+fi
+cd "$ROOT"
+BACKEND="$(docker compose ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ مش لاقي backend container. جرّب: cd /opt/frappe_crm && docker compose up -d"
+  exit 1
+fi
+
+echo "Backend: $BACKEND"
+echo "Public IP requested: $PUBLIC_IP"
+
+# Validate simple IPv4.
+if ! echo "$PUBLIC_IP" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+  echo "❌ PUBLIC_IP مش IPv4 صحيح: $PUBLIC_IP"
+  exit 1
+fi
+
+IFS='.' read -r A B C D <<< "$PUBLIC_IP"
+HOST_URL="$(printf 'http://%s.%s.%s.%s' "$A" "$B" "$C" "$D")"
+echo "Clean HOST_URL: $HOST_URL"
+
+say "2) Backup site_config before editing"
+TS="$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$ROOT/backups/HOSTNAME_FIX_$TS"
+docker exec "$BACKEND" bash -lc "cp -a /home/frappe/frappe-bench/sites/$SITE/site_config.json /home/frappe/frappe-bench/sites/$SITE/site_config.json.before_public_ip_fix_$TS" || true
+docker cp "$BACKEND:/home/frappe/frappe-bench/sites/$SITE/site_config.json" "$ROOT/backups/HOSTNAME_FIX_$TS/site_config.before.json" >/dev/null 2>&1 || true
+echo "Backup folder: $ROOT/backups/HOSTNAME_FIX_$TS"
+
+say "3) Set host_name via bench"
+docker exec "$BACKEND" bench --site "$SITE" set-config host_name "$HOST_URL"
+
+say "4) Force clean JSON value to prevent markdown link corruption"
+docker exec "$BACKEND" python3 -c "import json; p='/home/frappe/frappe-bench/sites/$SITE/site_config.json'; d=json.load(open(p)); d['host_name']='http://' + '.'.join(['$A','$B','$C','$D']); open(p,'w').write(json.dumps(d,indent=1,ensure_ascii=False)+'\n'); print('forced host_name =', d['host_name'])"
+
+say "5) Clear cache + restart web services"
+docker exec "$BACKEND" bench --site "$SITE" clear-cache || true
+docker exec "$BACKEND" bench --site "$SITE" clear-website-cache || true
+docker compose restart backend frontend websocket
+sleep 10
+BACKEND="$(docker compose ps -q backend || true)"
+
+say "6) Verify host_name"
+VERIFY="$(docker exec "$BACKEND" python3 -c "import json; print(json.load(open('/home/frappe/frappe-bench/sites/$SITE/site_config.json')).get('host_name'))")"
+echo "Current host_name: $VERIFY"
+if [[ "$VERIFY" == "$HOST_URL" ]]; then
+  echo "✅ host_name OK"
+else
+  echo "❌ host_name still wrong"
+  echo "Expected: $HOST_URL"
+  echo "Got:      $VERIFY"
+  exit 1
+fi
+
+say "7) Local ERP HTTP checks"
+echo "--- 127.0.0.1/login ---"
+curl -I --max-time 10 http://127.0.0.1/login || true
+
+echo "--- LAN IP/login if available ---"
+LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+if [[ -n "$LAN_IP" ]]; then
+  echo "LAN_IP=$LAN_IP"
+  curl -I --max-time 10 "http://$LAN_IP/login" || true
+fi
+
+echo "--- Host header public IP to local nginx ---"
+curl -I --max-time 10 -H "Host: $PUBLIC_IP" http://127.0.0.1/login || true
+
+say "8) Docker status"
+docker compose ps
+
+say "9) Elastix/CDR/AMI health check"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics || true
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.queue_api.get_queue_status || true
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":3,"view_mode":"admin"}' || true
+
+say "✅ ERP public host_name fixed"
+echo "Public URL should be: $HOST_URL/login"
+echo
+cat <<EOF
+FortiGate reminder, لو لسه مش بيفتح من 4G:
+1) شغّل على FortiGate:
+   diagnose sniffer packet wan1 'tcp port 80' 4 0 a
+2) افتح من موبايل 4G:
+   $HOST_URL/login
+3) لو مفيش packets، المشكلة قبل FortiGate: Huawei/ISP/IP Mapping.
+EOF

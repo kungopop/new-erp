@@ -1,0 +1,510 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# email-report-builder-advanced
+# Advanced email report builder/customizer:
+# - Full style controls (colors/font/CSS)
+# - Editable call metrics labels/notes/show/order
+# - Choose visible columns per section
+# - Separate Center Service Manager / Upper Management settings
+# - Actual send_report_now uses these settings
+# - Does NOT touch report_api.py core.
+
+ROOT="/opt/frappe_crm"
+SITE="crm.local"
+APP_HOST="$ROOT/apps/restaurant_ops"
+APP_DIR="$APP_HOST/restaurant_ops"
+API_DIR="$APP_DIR/api"
+WWW_DIR="$APP_DIR/www"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/EMAIL_REPORT_BUILDER_ADVANCED_BEFORE_$TS"
+
+say(){ echo -e "\n============================================================\n$1\n============================================================"; }
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo "❌ شغّل كـ root: sudo -i ثم ./email-report-builder-advanced"
+  exit 1
+fi
+
+say "1) Backup قبل Email Builder المتقدم"
+cd "$ROOT"
+BACKEND="$(docker compose ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ لم أجد backend container. شغّل: cd /opt/frappe_crm && docker compose up -d"
+  exit 1
+fi
+mkdir -p "$BACKUP_DIR"
+cp -a "$APP_HOST" "$BACKUP_DIR/restaurant_ops"
+[[ -f "$ROOT/docker-compose.yml" ]] && cp -a "$ROOT/docker-compose.yml" "$BACKUP_DIR/docker-compose.yml"
+echo "✅ Backup: $BACKUP_DIR"
+
+say "2) Append advanced email_report.py overrides"
+cat >> "$API_DIR/email_report.py" <<'PY'
+
+# ===== ROSHDY ADVANCED EMAIL BUILDER START =====
+import json as _adv_json
+
+
+def _adv_bool(v, default=1):
+    if v is None:
+        return bool(default)
+    if isinstance(v, bool):
+        return v
+    try:
+        return bool(int(v))
+    except Exception:
+        return str(v).strip().lower() in ("true", "yes", "on", "y")
+
+
+def _adv_recipients(raw):
+    return [x.strip() for x in str(raw or "").replace(";", ",").split(",") if x.strip()]
+
+
+def _adv_place():
+    try:
+        return frappe.conf.get("restaurant_place_name") or "مطعم رشدي"
+    except Exception:
+        return "مطعم رشدي"
+
+
+def _adv_default_metrics():
+    return [
+        {"key":"raw_total", "show":1, "label":"كل أحداث الاتصال داخل السنترال", "note":"رقم تقني يشمل IVR والتحويلات وأحداث داخلية، وليس عدد عملاء حقيقيين بالضرورة."},
+        {"key":"queue_total", "show":1, "label":"مكالمات وصلت للطوابير الرسمية", "note":"المكالمات التي دخلت Queue الأوردرات/الشكاوى فعلياً."},
+        {"key":"queue_answered", "show":1, "label":"تم الرد داخل الطابور", "note":"مكالمات Queue التي رد عليها موظف."},
+        {"key":"queue_not_answered", "show":1, "label":"لم يتم الرد داخل الطابور", "note":"مكالمات دخلت الطابور ولم تنتهِ برد."},
+        {"key":"before_queue_or_technical", "show":1, "label":"قبل الطابور / IVR / أحداث تقنية", "note":"قد تشمل عميل سمع رسالة وقفل أو اختار من IVR وقفل أو أحداث متعددة لنفس الاتصال."},
+        {"key":"busy", "show":1, "label":"مشغول/مرفوض تقني", "note":"أحداث CDR بحالة BUSY."},
+        {"key":"short_abandon", "show":0, "label":"إغلاق سريع أقل من 15 ثانية", "note":"غالباً العميل أغلق مبكراً قبل اكتمال الرحلة أو أثناء رسالة البداية."},
+        {"key":"staff_missed_raw", "show":0, "label":"محاولات فائتة محتملة على الموظفين", "note":"أحداث NO ANSWER/FAILED لمدة 15 ثانية أو أكثر، للمراجعة التشغيلية."},
+        {"key":"queue_reach_rate_of_all", "show":1, "label":"نسبة الوصول للطوابير من كل الأحداث", "note":"مؤشر يوضح كم من أحداث السنترال وصلت فعلياً للطوابير."},
+        {"key":"answer_rate_of_queue", "show":1, "label":"نسبة الرد داخل الطوابير", "note":"نسبة الرد على المكالمات التي وصلت للطوابير الرسمية."},
+    ]
+
+
+def _adv_defaults():
+    return {
+        "place_name": _adv_place(),
+        "primary_color": "#1F4E79",
+        "header_bg": "#24292e",
+        "header_text": "#ffffff",
+        "table_header_bg": "#24292e",
+        "table_header_text": "#ffffff",
+        "table_border": "#d9d9d9",
+        "font_family": "Tahoma, Arial, sans-serif",
+        "font_size": "13px",
+        "custom_css": "",
+        "center_title": "تقرير مدير إدارة خدمة العملاء",
+        "upper_title": "تقرير الإدارة العليا",
+        "shift_start": "00:00",
+        "shift_end": "23:59",
+        "center_recipients_override": "",
+        "upper_recipients_override": "",
+        "center_intro": "",
+        "center_footer": "",
+        "upper_intro": "",
+        "upper_footer": "",
+        "center_sections": {"calls":1,"breaks":1,"sales_agent":1,"sales_item":1,"sales_detail":0,"complaints":1,"staff_missed":1,"permissions":1,"charges":1},
+        "upper_sections": {"calls":1,"call_kpi":1,"breaks":0,"sales_agent":1,"sales_item":1,"sales_detail":1,"complaints":1,"staff_missed":1,"permissions":0,"charges":0},
+        "section_titles": {"calls":"ملخص المكالمات الإداري","call_kpi":"مؤشرات مختصرة","breaks":"البريكات","sales_agent":"المبيعات حسب الموظف","sales_item":"المبيعات حسب الصنف","sales_detail":"تفاصيل عمليات البيع","complaints":"الشكاوى","staff_missed":"محاولات فائتة على الموظفين","permissions":"الأذونات","charges":"الجزاءات / الخصومات"},
+        "call_columns": ["label","count","percent","note"],
+        "break_columns": ["employee_name","count","minutes"],
+        "sales_agent_columns": ["employee_name","orders","quantity"],
+        "sales_item_columns": ["item_name","orders","quantity"],
+        "sales_detail_columns": ["name","sale_date_text","employee_name","item_name","quantity","customer_name","customer_phone","notes"],
+        "complaint_columns": ["status","category","priority","count"],
+        "staff_missed_columns": ["agent","count","duration"],
+        "call_metrics": _adv_default_metrics(),
+    }
+
+
+def _adv_get():
+    raw = "{}"
+    for key in ("roshdy_email_builder_v5", "roshdy_email_customizer_v4", "roshdy_email_customizer_v3"):
+        try:
+            raw = frappe.db.get_default(key) or "{}"
+            if raw and raw != "{}":
+                break
+        except Exception:
+            raw = "{}"
+    try:
+        saved = _adv_json.loads(raw or "{}")
+    except Exception:
+        saved = {}
+    d = _adv_defaults()
+    # merge shallow + nested known dicts
+    for k,v in (saved or {}).items():
+        if isinstance(v, dict) and isinstance(d.get(k), dict):
+            d[k].update(v)
+        else:
+            d[k] = v
+    if not isinstance(d.get("call_metrics"), list):
+        d["call_metrics"] = _adv_default_metrics()
+    return d
+
+
+def _adv_save(data):
+    frappe.db.set_default("roshdy_email_builder_v5", _adv_json.dumps(data, ensure_ascii=False))
+    frappe.db.commit()
+    return data
+
+
+def _adv_escape(x):
+    return frappe.utils.escape_html(str(x if x is not None else ""))
+
+
+def _adv_table(headers, rows, st):
+    h = "".join([f"<th>{_adv_escape(x)}</th>" for x in headers])
+    body = ""
+    for row in rows:
+        body += "<tr>" + "".join([f"<td>{_adv_escape(x)}</td>" for x in row]) + "</tr>"
+    if not rows:
+        body = f"<tr><td colspan='{len(headers)}' style='text-align:center;color:#777'>لا توجد بيانات</td></tr>"
+    return f"<table><thead><tr>{h}</tr></thead><tbody>{body}</tbody></table>"
+
+
+def _adv_base(title, st, inner):
+    css = st.get("custom_css") or ""
+    return f"""
+    <div dir="rtl" style="font-family:{_adv_escape(st.get('font_family'))};font-size:{_adv_escape(st.get('font_size'))};color:#111827">
+    <style>
+      .rmail h2{{color:{st.get('primary_color')};margin:0 0 10px}}
+      .rmail h3{{color:{st.get('primary_color')};border-bottom:1px solid #ddd;padding-bottom:6px;margin-top:22px}}
+      .rmail table{{width:100%;border-collapse:collapse;margin:10px 0 16px}}
+      .rmail th{{background:{st.get('table_header_bg')};color:{st.get('table_header_text')};padding:8px;border:1px solid #111;text-align:right}}
+      .rmail td{{padding:7px;border:1px solid {st.get('table_border')};text-align:right;vertical-align:top}}
+      .rmail .note{{background:#f8fafc;border:1px solid #e5e7eb;border-radius:10px;padding:10px;margin:8px 0;line-height:1.7}}
+      .rmail .kpi{{display:inline-block;margin:4px;padding:8px 12px;border-radius:10px;background:#eef2ff;color:#1F4E79;font-weight:bold}}
+      {css}
+    </style>
+    <div class="rmail">
+      <h2>{_adv_escape(title)}</h2>
+      <div style="color:#64748b;margin-bottom:12px">{_adv_escape(st.get('place_name'))} — {_adv_escape(str(now_datetime()))}</div>
+      {inner}
+      <div style="margin-top:25px;color:#64748b;text-align:center;font-size:12px">ERPNext — {_adv_escape(st.get('place_name'))}</div>
+    </div></div>
+    """
+
+
+def _adv_period(st):
+    dt = today()
+    return dt, dt, st.get("shift_start") or "00:00", st.get("shift_end") or "23:59"
+
+
+def _adv_col_label(col):
+    labels = {
+        "label":"البند", "count":"العدد", "percent":"النسبة", "note":"التفسير",
+        "employee_name":"الموظف", "count":"العدد", "minutes":"الدقائق", "total_formatted":"الوقت",
+        "orders":"عدد العمليات", "quantity":"الكمية", "item_name":"الصنف", "agent":"الموظف",
+        "name":"رقم", "sale_date_text":"التاريخ", "customer_name":"العميل", "customer_phone":"الهاتف", "notes":"ملاحظات",
+        "status":"الحالة", "category":"الفئة", "priority":"الأولوية", "duration":"المدة"
+    }
+    return labels.get(col, col)
+
+
+def _adv_metric_percent(key, val, summary):
+    try:
+        if key == "queue_answered":
+            return str(summary.get("answer_rate_of_queue", 0)) + "%"
+        if key == "queue_total":
+            return str(summary.get("queue_reach_rate_of_all", 0)) + "%"
+        if key in ("raw_total", "answer_rate_of_queue", "queue_reach_rate_of_all"):
+            return ""
+        raw = float(summary.get("raw_total") or 0)
+        if raw:
+            return str(round(float(val or 0) * 100 / raw, 2)) + "%"
+    except Exception:
+        pass
+    return ""
+
+
+def _adv_calls_section(st):
+    from restaurant_ops.api.ops_reports_api import get_owner_call_summary
+    df,dt,ss,se = _adv_period(st)
+    calls = get_owner_call_summary(df, dt, ss, se)
+    summary = calls.get("summary", {})
+    cols = st.get("call_columns") or ["label","count","percent","note"]
+    metrics = st.get("call_metrics") or _adv_default_metrics()
+    rows = []
+    for m in metrics:
+        if not _adv_bool(m.get("show"), 1):
+            continue
+        key = m.get("key")
+        val = summary.get(key, "")
+        row_map = {"label": m.get("label") or key, "count": val, "percent": _adv_metric_percent(key, val, summary), "note": m.get("note") or ""}
+        rows.append([row_map.get(c, "") for c in cols])
+    title = st.get("section_titles", {}).get("calls", "ملخص المكالمات الإداري")
+    return "<h3>%s</h3>" % _adv_escape(title) + _adv_table([_adv_col_label(c) for c in cols], rows, st)
+
+
+def _adv_call_kpi(st):
+    from restaurant_ops.api.ops_reports_api import get_owner_call_summary
+    df,dt,ss,se = _adv_period(st)
+    sm = get_owner_call_summary(df, dt, ss, se).get("summary", {})
+    title = st.get("section_titles", {}).get("call_kpi", "مؤشرات مختصرة")
+    html = f"<h3>{_adv_escape(title)}</h3>"
+    for label, key in [("كل الأحداث","raw_total"),("وصل للطوابير","queue_total"),("تم الرد","queue_answered"),("نسبة وصول للطابور","queue_reach_rate_of_all"),("نسبة رد داخل الطابور","answer_rate_of_queue")]:
+        val = sm.get(key, 0)
+        if key.endswith("rate_of_all") or key.endswith("rate_of_queue"):
+            val = str(val) + "%"
+        html += f"<span class='kpi'>{_adv_escape(label)}: {_adv_escape(val)}</span>"
+    return html
+
+
+def _adv_breaks_section(st):
+    from restaurant_ops.api.ops_reports_api import get_break_report
+    df,dt,ss,se = _adv_period(st)
+    data = get_break_report(df, dt, ss, se)
+    cols = st.get("break_columns") or ["employee_name","count","minutes"]
+    rows = [[x.get(c, "") for c in cols] for x in data.get("by_employee", [])]
+    title = st.get("section_titles", {}).get("breaks", "البريكات")
+    return "<h3>%s</h3>" % _adv_escape(title) + _adv_table([_adv_col_label(c) for c in cols], rows, st)
+
+
+def _adv_sales_agent_section(st):
+    from restaurant_ops.api.ops_reports_api import get_sales_report
+    df,dt,ss,se = _adv_period(st)
+    data = get_sales_report(df, dt, ss, se)
+    cols = st.get("sales_agent_columns") or ["employee_name","orders","quantity"]
+    rows = [[x.get(c, "") for c in cols] for x in data.get("by_agent", [])]
+    title = st.get("section_titles", {}).get("sales_agent", "المبيعات حسب الموظف")
+    return "<h3>%s</h3>" % _adv_escape(title) + _adv_table([_adv_col_label(c) for c in cols], rows, st)
+
+
+def _adv_sales_item_section(st):
+    from restaurant_ops.api.ops_reports_api import get_sales_report
+    df,dt,ss,se = _adv_period(st)
+    data = get_sales_report(df, dt, ss, se)
+    cols = st.get("sales_item_columns") or ["item_name","orders","quantity"]
+    rows = [[x.get(c, "") for c in cols] for x in data.get("by_item", [])]
+    title = st.get("section_titles", {}).get("sales_item", "المبيعات حسب الصنف")
+    return "<h3>%s</h3>" % _adv_escape(title) + _adv_table([_adv_col_label(c) for c in cols], rows, st)
+
+
+def _adv_sales_detail_section(st):
+    from restaurant_ops.api.ops_reports_api import get_sales_report
+    df,dt,ss,se = _adv_period(st)
+    data = get_sales_report(df, dt, ss, se)
+    cols = st.get("sales_detail_columns") or ["name","sale_date_text","employee_name","item_name","quantity","customer_name","customer_phone","notes"]
+    rows = [[x.get(c, "") for c in cols] for x in data.get("rows", [])[:100]]
+    title = st.get("section_titles", {}).get("sales_detail", "تفاصيل عمليات البيع")
+    return "<h3>%s</h3>" % _adv_escape(title) + _adv_table([_adv_col_label(c) for c in cols], rows, st)
+
+
+def _adv_complaints_section(st):
+    df,dt,_,_ = _adv_period(st)
+    try:
+        rows = frappe.db.sql("""
+            SELECT status, complaint_category category, complaint_priority priority, COUNT(*) count
+            FROM `tabCall Center Complaint`
+            WHERE COALESCE(complaint_datetime, creation) BETWEEN %s AND %s
+            GROUP BY status, complaint_category, complaint_priority ORDER BY count DESC
+        """, (f"{df} 00:00:00", f"{dt} 23:59:59"), as_dict=True)
+    except Exception:
+        rows = []
+    cols = st.get("complaint_columns") or ["status","category","priority","count"]
+    title = st.get("section_titles", {}).get("complaints", "الشكاوى")
+    return "<h3>%s</h3>" % _adv_escape(title) + _adv_table([_adv_col_label(c) for c in cols], [[x.get(c, "") for c in cols] for x in rows], st)
+
+
+def _adv_staff_missed_section(st):
+    df,dt,_,_ = _adv_period(st)
+    rows=[]
+    try:
+        from restaurant_ops.api.report_api import get_staff_missed_attempts
+        d = get_staff_missed_attempts(df, dt, 15)
+        for x in d.get("grouped", [])[:50]:
+            rows.append([x.get("agent_name") or x.get("actual_ext") or "", x.get("count") or 0, x.get("total_duration") or ""])
+    except Exception:
+        pass
+    title = st.get("section_titles", {}).get("staff_missed", "محاولات فائتة على الموظفين")
+    return "<h3>%s</h3>" % _adv_escape(title) + _adv_table(["الموظف/التحويلة","العدد","المدة"], rows, st)
+
+
+def _adv_permissions_section(st):
+    try:
+        month=today()[:7]
+        rows=frappe.db.sql("""SELECT e.employee_name, COALESCE(SUM(p.hours),0) hours FROM `tabEmployee Permission Log` p LEFT JOIN `tabEmployee` e ON p.employee=e.name WHERE p.month=%s GROUP BY e.employee_name ORDER BY hours DESC""", (month,), as_dict=True)
+    except Exception:
+        rows=[]
+    title = st.get("section_titles", {}).get("permissions", "الأذونات")
+    return "<h3>%s</h3>" % _adv_escape(title) + _adv_table(["الموظف","الساعات"], [[r.employee_name or '', r.hours or 0] for r in rows], st)
+
+
+def _adv_charges_section(st):
+    try:
+        month=today()[:7]
+        rows=frappe.db.sql("""SELECT e.employee_name, COUNT(c.name) cnt, COALESCE(SUM(c.amount),0) amount FROM `tabEmployee Charge Log` c LEFT JOIN `tabEmployee` e ON c.employee=e.name WHERE c.month=%s GROUP BY e.employee_name ORDER BY amount DESC""", (month,), as_dict=True)
+    except Exception:
+        rows=[]
+    title = st.get("section_titles", {}).get("charges", "الجزاءات / الخصومات")
+    return "<h3>%s</h3>" % _adv_escape(title) + _adv_table(["الموظف","العدد","المبلغ"], [[r.employee_name or '', r.cnt or 0, r.amount or 0] for r in rows], st)
+
+
+def _adv_section_html(section, st):
+    return {
+        "calls": _adv_calls_section,
+        "call_kpi": _adv_call_kpi,
+        "breaks": _adv_breaks_section,
+        "sales_agent": _adv_sales_agent_section,
+        "sales_item": _adv_sales_item_section,
+        "sales_detail": _adv_sales_detail_section,
+        "complaints": _adv_complaints_section,
+        "staff_missed": _adv_staff_missed_section,
+        "permissions": _adv_permissions_section,
+        "charges": _adv_charges_section,
+    }.get(section, lambda x: "")(st)
+
+
+def _adv_render(report_type="center"):
+    st=_adv_get()
+    title=st.get("center_title") if report_type=="center" else st.get("upper_title")
+    sections_cfg=st.get("center_sections") if report_type=="center" else st.get("upper_sections")
+    order=list(sections_cfg.keys())
+    intro=st.get("center_intro") if report_type=="center" else st.get("upper_intro")
+    footer=st.get("center_footer") if report_type=="center" else st.get("upper_footer")
+    chunks=[]
+    if intro: chunks.append(f"<div class='note'>{_adv_escape(intro)}</div>")
+    for sec in order:
+        if _adv_bool(sections_cfg.get(sec), 0):
+            chunks.append(_adv_section_html(sec, st))
+    if footer: chunks.append(f"<div class='note'>{_adv_escape(footer)}</div>")
+    return {"success": True, "html": _adv_base(title or "تقرير", st, "".join(chunks)), "settings": st}
+
+
+@frappe.whitelist()
+def get_email_builder_settings():
+    if not (frappe.session.user == "Administrator" or "System Manager" in frappe.get_roles(frappe.session.user)):
+        return {"success": False, "message": "System Manager only"}
+    return {"success": True, "settings": _adv_get(), "available_call_metric_keys": list((_adv_get().get("calls", {}) or {}).keys())}
+
+
+@frappe.whitelist()
+def save_email_builder_settings(settings_json=None):
+    if not (frappe.session.user == "Administrator" or "System Manager" in frappe.get_roles(frappe.session.user)):
+        return {"success": False, "message": "System Manager only"}
+    try:
+        data = _adv_json.loads(settings_json or "{}")
+    except Exception as e:
+        return {"success": False, "message": "Invalid JSON: " + str(e)}
+    st=_adv_get(); st.update(data); _adv_save(st)
+    return {"success": True, "settings": st}
+
+
+@frappe.whitelist()
+def preview_email_report(report_type="center"):
+    return _adv_render(report_type or "center")
+
+
+# compatibility names used by previous page/buttons
+get_email_customizer_settings = get_email_builder_settings
+save_email_customizer_settings = save_email_builder_settings
+
+
+def _adv_recipients_for(settings_doc, report_type, st):
+    if report_type == "center":
+        override=st.get("center_recipients_override") or ""
+        fallback=getattr(settings_doc,"center_manager_recipients","") or getattr(settings_doc,"daily_report_recipients","") or "el.alfy@roshdy.com"
+    else:
+        override=st.get("upper_recipients_override") or ""
+        fallback=getattr(settings_doc,"upper_management_recipients","") or "admin@roshdy.com"
+    return _adv_recipients(override or fallback)
+
+
+def send_center_manager_report(settings) -> dict:
+    try:
+        st=_adv_get(); recipients=_adv_recipients_for(settings,"center",st)
+        if not recipients: return {"success": False, "message": "No center recipients"}
+        rendered=_adv_render("center"); subject=f"📋 {st.get('center_title')} — {today()}"
+        frappe.sendmail(recipients=recipients, subject=subject, message=rendered.get("html"), now=True)
+        return {"success": True, "message": f"sent to {len(recipients)}", "recipients": recipients}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
+def send_upper_management_report(settings) -> dict:
+    try:
+        st=_adv_get(); recipients=_adv_recipients_for(settings,"upper",st)
+        if not recipients: return {"success": False, "message": "No upper recipients"}
+        rendered=_adv_render("upper"); subject=f"📊 {st.get('upper_title')} — {today()}"
+        frappe.sendmail(recipients=recipients, subject=subject, message=rendered.get("html"), now=True)
+        return {"success": True, "message": f"sent to {len(recipients)}", "recipients": recipients}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
+def send_daily_shift_report() -> dict:
+    try:
+        settings=frappe.get_single("Call Center Settings")
+        if hasattr(settings,"daily_report_enabled") and not settings.daily_report_enabled:
+            return {"success": False, "message": "Daily report disabled"}
+        c=send_center_manager_report(settings); u=send_upper_management_report(settings)
+        return {"success": True, "message": f"Center: {c.get('message')} | Upper: {u.get('message')}", "center": c, "upper": u}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
+@frappe.whitelist()
+def send_report_now(report_type="both") -> dict:
+    try:
+        settings=frappe.get_single("Call Center Settings")
+        rt=(report_type or "both").lower()
+        if rt in ("center","service","manager"):
+            return send_center_manager_report(settings)
+        if rt in ("upper","management"):
+            return send_upper_management_report(settings)
+        return send_daily_shift_report()
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+# ===== ROSHDY ADVANCED EMAIL BUILDER END =====
+PY
+
+say "3) Rewrite /email-report-customizer as builder GUI"
+cat > "$WWW_DIR/email-report-customizer.py" <<'PY'
+import frappe
+no_cache=1
+
+def get_context(context):
+    if frappe.session.user == 'Guest':
+        frappe.local.flags.redirect_location='/login?redirect-to=/email-report-customizer'
+        raise frappe.Redirect
+    if frappe.session.user != 'Administrator' and 'System Manager' not in frappe.get_roles(frappe.session.user):
+        frappe.throw('System Manager only', frappe.PermissionError)
+    return context
+PY
+cat > "$WWW_DIR/email-report-customizer.html" <<'HTML'
+<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Email Builder</title><style>*{box-sizing:border-box;font-family:Tahoma,Arial}body{margin:0;background:#eef2f7;direction:rtl}.top{background:#20262d;color:white;padding:14px 22px;display:flex;justify-content:space-between}.top a{color:white;text-decoration:none;border:1px solid #64748b;border-radius:10px;padding:8px 12px}.wrap{padding:22px;max-width:1550px;margin:auto}.panel{background:#fff;border:1px solid #ddd;border-radius:16px;padding:16px;margin:12px 0}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}input,select,textarea{width:100%;padding:9px;border:1px solid #ccc;border-radius:8px}.btn{border:0;border-radius:9px;padding:10px 13px;background:#1F4E79;color:#fff;font-weight:bold;cursor:pointer;margin:3px}.green{background:#16a34a}.orange{background:#f97316}.red{background:#dc2626}.checks{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px}.checks label{border:1px solid #ddd;border-radius:10px;padding:8px;background:#f8fafc}.metric{display:grid;grid-template-columns:90px 70px 1fr 2fr 40px;gap:6px;margin:5px 0;align-items:center}.metric input{padding:6px}iframe{width:100%;height:650px;border:1px solid #ddd;border-radius:12px;background:#fff}pre{direction:ltr;text-align:left;background:#111827;color:#dcfce7;border-radius:10px;padding:10px;white-space:pre-wrap;max-height:280px;overflow:auto}.muted{color:#64748b;font-size:12px}@media(max-width:1000px){.grid,.grid3,.metric{grid-template-columns:1fr}}</style></head><body><div class="top"><b>📧 Email Report Builder — System Manager</b><div><a href="/settings">Settings</a><a href="/admin-desk">Admin Desk</a></div></div><div class="wrap"><div class="panel"><h3>عام وشكل التقرير</h3><div class="grid"><div><label>نوع المعاينة/الإرسال</label><select id="report_type"><option value="center">تقرير خدمة العملاء</option><option value="upper">تقرير الإدارة العليا</option><option value="both">الاتنين عند الإرسال</option></select></div><div><label>اسم المكان</label><input id="place_name"></div><div><label>لون أساسي</label><input id="primary_color"></div><div><label>لون هيدر الجدول</label><input id="table_header_bg"></div><div><label>لون نص هيدر الجدول</label><input id="table_header_text"></div><div><label>Border الجدول</label><input id="table_border"></div><div><label>Font Family</label><input id="font_family"></div><div><label>Font Size</label><input id="font_size"></div><div><label>Shift Start</label><input id="shift_start"></div><div><label>Shift End</label><input id="shift_end"></div><div><label>عنوان خدمة العملاء</label><input id="center_title"></div><div><label>عنوان الإدارة العليا</label><input id="upper_title"></div></div><br><div class="grid3"><div><label>Recipients override خدمة العملاء</label><input id="center_recipients_override"></div><div><label>Recipients override الإدارة العليا</label><input id="upper_recipients_override"></div><div><label>CSS متقدم</label><textarea id="custom_css" rows="2"></textarea></div></div></div><div class="panel"><h3>الأقسام</h3><div class="grid3"><div><h4>تقرير خدمة العملاء</h4><div id="center_sections" class="checks"></div><label>نص افتتاحي</label><textarea id="center_intro" rows="2"></textarea><label>نص ختامي</label><textarea id="center_footer" rows="2"></textarea></div><div><h4>تقرير الإدارة العليا</h4><div id="upper_sections" class="checks"></div><label>نص افتتاحي</label><textarea id="upper_intro" rows="2"></textarea><label>نص ختامي</label><textarea id="upper_footer" rows="2"></textarea></div><div><h4>عناوين الأقسام</h4><div id="section_titles"></div></div></div></div><div class="panel"><h3>تخصيص تفسير المكالمات</h3><p class="muted">اختار البنود التي تظهر، وعدّل النص والتفسير كما تحب. المفاتيح المتاحة: raw_total, queue_total, queue_answered, queue_not_answered, before_queue_or_technical, busy, short_abandon, staff_missed_raw, queue_reach_rate_of_all, answer_rate_of_queue</p><div id="metrics"></div><button class="btn" onclick="addMetric()">+ بند جديد</button><h4>أعمدة جدول تفسير المكالمات</h4><div id="call_columns" class="checks"></div></div><div class="panel"><h3>أعمدة الجداول</h3><div class="grid3"><div><h4>البريكات</h4><div id="break_columns" class="checks"></div></div><div><h4>مبيعات حسب الموظف</h4><div id="sales_agent_columns" class="checks"></div></div><div><h4>مبيعات حسب الصنف</h4><div id="sales_item_columns" class="checks"></div></div><div><h4>تفاصيل المبيعات</h4><div id="sales_detail_columns" class="checks"></div></div><div><h4>الشكاوى</h4><div id="complaint_columns" class="checks"></div></div></div></div><div class="panel"><button class="btn green" onclick="save()">حفظ التصميم</button><button class="btn orange" onclick="preview()">Preview</button><button class="btn" onclick="sendTest()">إرسال حسب النوع</button><button class="btn red" onclick="resetDefaults()">إرجاع افتراضي</button><pre id="out"></pre></div><div class="panel"><iframe id="frame"></iframe></div></div><script>function M(a){return a.join('')}async function api(m,args){let qs=new URLSearchParams();args=args||{};Object.keys(args).forEach(k=>{if(args[k]!==undefined&&args[k]!==null)qs.append(k,args[k])});let r=await fetch('/api/method/'+m+'?'+qs.toString(),{credentials:'same-origin',cache:'no-store'});let j=await r.json();return j.message}const sectionLabels={calls:'شرح المكالمات',call_kpi:'مؤشرات مختصرة',breaks:'البريكات',sales_agent:'المبيعات حسب الموظف',sales_item:'المبيعات حسب الصنف',sales_detail:'تفاصيل المبيعات',complaints:'الشكاوى',staff_missed:'محاولات فائتة',permissions:'الأذونات',charges:'الجزاءات'};const colLabels={label:'البند',count:'العدد',percent:'النسبة',note:'التفسير',employee_name:'الموظف',minutes:'الدقائق',total_formatted:'الوقت',orders:'عدد العمليات',quantity:'الكمية',item_name:'الصنف',name:'رقم',sale_date_text:'التاريخ',customer_name:'العميل',customer_phone:'الهاتف',notes:'ملاحظات',status:'الحالة',category:'الفئة',priority:'الأولوية'};let settings={};function id(x){return document.getElementById(x)}function val(x){return id(x).value}function setv(x,v){id(x).value=v==null?'':v}function checkboxList(container, selected, all){let c=id(container);c.innerHTML='';all.forEach(k=>{let lab=document.createElement('label');lab.innerHTML='<input type="checkbox" data-key="'+k+'" '+(selected&&selected.includes?selected.includes(k):(selected&&selected[k]?'checked':''))+' > '+(colLabels[k]||sectionLabels[k]||k);c.appendChild(lab)})}function getChecked(container){return Array.from(id(container).querySelectorAll('input[type=checkbox]')).filter(x=>x.checked).map(x=>x.dataset.key)}function getSectionMap(container){let o={};Array.from(id(container).querySelectorAll('input[type=checkbox]')).forEach(x=>o[x.dataset.key]=x.checked?1:0);return o}function renderSectionTitles(){let d=id('section_titles');d.innerHTML='';Object.keys(sectionLabels).forEach(k=>{let div=document.createElement('div');div.innerHTML='<label>'+(sectionLabels[k]||k)+'</label><input data-key="'+k+'" value="'+((settings.section_titles||{})[k]||sectionLabels[k]||k).replace(/"/g,'&quot;')+'">';d.appendChild(div)})}function renderMetrics(){let d=id('metrics');d.innerHTML='';(settings.call_metrics||[]).forEach((m,i)=>{let div=document.createElement('div');div.className='metric';div.innerHTML='<input data-f="key" value="'+(m.key||'')+'"><label><input type="checkbox" data-f="show" '+(Number(m.show)?'checked':'')+'> إظهار</label><input data-f="label" value="'+String(m.label||'').replace(/"/g,'&quot;')+'"><input data-f="note" value="'+String(m.note||'').replace(/"/g,'&quot;')+'"><button class="btn red" onclick="settings.call_metrics.splice('+i+',1);renderMetrics()">X</button>';d.appendChild(div)})}function collectMetrics(){return Array.from(id('metrics').querySelectorAll('.metric')).map(div=>{let o={};Array.from(div.querySelectorAll('input')).forEach(inp=>{let f=inp.dataset.f;if(!f)return;o[f]=inp.type==='checkbox'?(inp.checked?1:0):inp.value});return o})}function addMetric(){settings.call_metrics=settings.call_metrics||[];settings.call_metrics.push({key:'raw_total',show:1,label:'بند جديد',note:''});renderMetrics()}async function load(){let d=await api(M(['restaurant','_ops.api.email','_report.get_email_builder_settings']));settings=(d&&d.settings)||{};['place_name','primary_color','header_bg','header_text','table_header_bg','table_header_text','table_border','font_family','font_size','center_title','upper_title','shift_start','shift_end','center_recipients_override','upper_recipients_override','center_intro','center_footer','upper_intro','upper_footer','custom_css'].forEach(k=>setv(k,settings[k]));checkboxList('center_sections',settings.center_sections,Object.keys(sectionLabels));checkboxList('upper_sections',settings.upper_sections,Object.keys(sectionLabels));renderSectionTitles();renderMetrics();checkboxList('call_columns',settings.call_columns,['label','count','percent','note']);checkboxList('break_columns',settings.break_columns,['employee_name','count','minutes','total_formatted']);checkboxList('sales_agent_columns',settings.sales_agent_columns,['employee_name','orders','quantity']);checkboxList('sales_item_columns',settings.sales_item_columns,['item_name','orders','quantity']);checkboxList('sales_detail_columns',settings.sales_detail_columns,['name','sale_date_text','employee_name','item_name','quantity','customer_name','customer_phone','notes']);checkboxList('complaint_columns',settings.complaint_columns,['status','category','priority','count']);out.textContent=JSON.stringify({success:d&&d.success},null,2)}function collect(){let s={};['place_name','primary_color','header_bg','header_text','table_header_bg','table_header_text','table_border','font_family','font_size','center_title','upper_title','shift_start','shift_end','center_recipients_override','upper_recipients_override','center_intro','center_footer','upper_intro','upper_footer','custom_css'].forEach(k=>s[k]=val(k));s.center_sections=getSectionMap('center_sections');s.upper_sections=getSectionMap('upper_sections');s.section_titles={};Array.from(id('section_titles').querySelectorAll('input')).forEach(x=>s.section_titles[x.dataset.key]=x.value);s.call_metrics=collectMetrics();s.call_columns=getChecked('call_columns');s.break_columns=getChecked('break_columns');s.sales_agent_columns=getChecked('sales_agent_columns');s.sales_item_columns=getChecked('sales_item_columns');s.sales_detail_columns=getChecked('sales_detail_columns');s.complaint_columns=getChecked('complaint_columns');return s}async function save(){settings=collect();let d=await api(M(['restaurant','_ops.api.email','_report.save_email_builder_settings']),{settings_json:JSON.stringify(settings)});out.textContent=JSON.stringify(d,null,2);alert(d&&d.success?'تم حفظ التصميم':'فشل الحفظ')}async function preview(){await save();let rt=val('report_type');if(rt==='both')rt='center';let d=await api(M(['restaurant','_ops.api.email','_report.preview_email_report']),{report_type:rt});out.textContent=JSON.stringify({success:d&&d.success},null,2);if(d&&d.success)frame.srcdoc=d.html;else alert((d&&d.message)||'Error')}async function sendTest(){await save();let d=await api(M(['restaurant','_ops.api.email','_report.send_report_now']),{report_type:val('report_type')});out.textContent=JSON.stringify(d,null,2);alert(d&&d.success?'تم الإرسال':'فشل الإرسال')}function resetDefaults(){if(confirm('سيتم تجاهل التعديلات غير المحفوظة فقط وإعادة تحميل الافتراضي بعد حذف إعداداتك يحتاج سكريبت منفصل.')) location.reload()}load();</script></body></html>
+HTML
+
+say "4) Clear cache + restart"
+docker exec "$BACKEND" bash -lc "find /home/frappe/frappe-bench/apps/restaurant_ops -name '*.pyc' -delete; find /home/frappe/frappe-bench/apps/restaurant_ops -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true"
+docker exec "$BACKEND" bench --site "$SITE" clear-cache || true
+docker exec "$BACKEND" bench --site "$SITE" clear-website-cache || true
+docker compose restart backend frontend websocket queue-short queue-long scheduler
+sleep 10
+BACKEND="$(docker compose ps -q backend)"
+
+say "5) Validation"
+echo "--- builder settings ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.email_report.get_email_builder_settings || true
+
+echo "--- center preview ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.email_report.preview_email_report --kwargs '{"report_type":"center"}' || true
+
+echo "--- upper preview ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.email_report.preview_email_report --kwargs '{"report_type":"upper"}' || true
+
+echo "--- Page HTTP status ---"
+for page in email-report-customizer settings call-report break-admin sales-report admin-desk; do
+  code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$page" || true)"
+  echo "$page => $code"
+done
+
+say "6) Health Check مهم: Elastix/CDR/AMI + Queue + Call Report"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics || true
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.queue_api.get_queue_status || true
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' || true
+
+say "✅ Advanced Email Builder applied"
+echo "افتح /email-report-customizer. هتقدر تعدل نص تفسير كل بند وأعمدة الجداول والألوان والأقسام لكل نوع إيميل."
+echo "Backup: $BACKUP_DIR"

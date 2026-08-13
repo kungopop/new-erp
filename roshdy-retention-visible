@@ -1,0 +1,267 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# roshdy-retention-visible
+# Rescue/force visible Social Retention controls for Administrator/System Manager.
+# Adds a standalone System-Manager-only page: /social-retention-settings
+# Also injects a dynamic panel into /social-settings that shows only if API confirms System Manager.
+
+ROOT="/opt/frappe_crm"
+SITE="crm.local"
+APP_HOST="$ROOT/apps/restaurant_ops"
+APP_DIR="$APP_HOST/restaurant_ops"
+WWW_DIR="$APP_DIR/www"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/ROSHDY_RETENTION_VISIBLE_BEFORE_$TS"
+
+say(){ echo -e "\n============================================================\n$1\n============================================================"; }
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo "❌ شغّل كـ root: sudo -i ثم ./roshdy-retention-visible"
+  exit 1
+fi
+
+say "1) Backup"
+cd "$ROOT"
+BACKEND="$(docker compose ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ لم أجد backend container. شغّل: cd /opt/frappe_crm && docker compose up -d"
+  exit 1
+fi
+mkdir -p "$BACKUP_DIR"
+cp -a "$APP_HOST" "$BACKUP_DIR/restaurant_ops"
+echo "✅ Backup: $BACKUP_DIR"
+
+say "2) Ensure retention setup/API exists"
+mkdir -p "$APP_DIR/scripts" "$APP_DIR/api" "$WWW_DIR"
+cat > "$APP_DIR/scripts/social_retention_setup_force.py" <<'PY'
+import frappe
+MODULE="Restaurant Operations"
+
+def run():
+    dt="Social Inbox Retention Settings"
+    if not frappe.db.exists("DocType", dt):
+        frappe.get_doc({
+            "doctype":"DocType", "name":dt, "module":MODULE, "custom":0,
+            "autoname":"field:settings_name", "naming_rule":"By fieldname", "title_field":"settings_name", "track_changes":1,
+            "fields":[
+                {"fieldname":"settings_name","label":"Settings Name","fieldtype":"Data","reqd":1,"unique":1,"default":"Default"},
+                {"fieldname":"enable_auto_retention","label":"Enable Auto Retention","fieldtype":"Check","default":1},
+                {"fieldname":"auto_archive_after_days","label":"Auto Archive After Inactive Days","fieldtype":"Int","default":7},
+                {"fieldname":"delete_archived_after_days","label":"Delete Archived After Days","fieldtype":"Int","default":90},
+                {"fieldname":"last_retention_run","label":"Last Retention Run","fieldtype":"Datetime","read_only":1},
+                {"fieldname":"notes","label":"Notes","fieldtype":"Small Text"},
+            ],
+            "permissions":[{"role":"System Manager","read":1,"write":1,"create":1,"delete":1}],
+        }).insert(ignore_permissions=True)
+        print('✅ DocType created')
+    if frappe.db.exists("DocType", "Social Conversation"):
+        doc=frappe.get_doc("DocType","Social Conversation")
+        for df in doc.fields:
+            if df.fieldname=="status" and "Archived" not in (df.options or ""):
+                df.options="Open\nPending\nClosed\nArchived"
+                doc.save(ignore_permissions=True)
+                print('✅ Social Conversation status patched')
+                break
+    frappe.db.commit()
+    if not frappe.db.exists(dt,"Default"):
+        frappe.get_doc({"doctype":dt,"settings_name":"Default","enable_auto_retention":1,"auto_archive_after_days":7,"delete_archived_after_days":90,"notes":"System Manager only"}).insert(ignore_permissions=True)
+        frappe.db.commit()
+        print('✅ Default settings created')
+    print('✅ retention force setup complete')
+PY
+chmod 644 "$APP_DIR/scripts/social_retention_setup_force.py"
+
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.scripts.social_retention_setup_force.run
+
+cat >> "$APP_DIR/api/social_inbox_api.py" <<'PY'
+
+# ===== ROSHDY RETENTION VISIBLE FORCE API =====
+def _rv_is_system_manager():
+    try:
+        user=frappe.session.user
+        roles=set(frappe.get_roles(user))
+        return user=="Administrator" or "System Manager" in roles
+    except Exception:
+        return False
+
+def _rv_doc():
+    dt="Social Inbox Retention Settings"
+    if not frappe.db.exists("DocType",dt):
+        return None
+    if not frappe.db.exists(dt,"Default"):
+        doc=frappe.get_doc({"doctype":dt,"settings_name":"Default","enable_auto_retention":1,"auto_archive_after_days":7,"delete_archived_after_days":90}).insert(ignore_permissions=True)
+        frappe.db.commit()
+        return doc
+    return frappe.get_doc(dt,"Default")
+
+@frappe.whitelist(allow_guest=False)
+def retention_whoami():
+    return {"success": True, "user": frappe.session.user, "roles": frappe.get_roles(frappe.session.user), "is_system_manager": _rv_is_system_manager()}
+
+@frappe.whitelist(allow_guest=False)
+def get_retention_settings():
+    if not _rv_is_system_manager():
+        return {"success": False, "message": "System Manager only"}
+    doc=_rv_doc()
+    if not doc:
+        return {"success": False, "message": "Settings DocType not installed"}
+    return {"success": True, "settings": doc.as_dict()}
+
+@frappe.whitelist(allow_guest=False)
+def save_retention_settings(enable_auto_retention=1, auto_archive_after_days=7, delete_archived_after_days=90):
+    if not _rv_is_system_manager():
+        return {"success": False, "message": "System Manager only"}
+    doc=_rv_doc()
+    archive_days=max(1,int(auto_archive_after_days or 7))
+    delete_days=max(1,int(delete_archived_after_days or 90))
+    if delete_days <= archive_days:
+        return {"success": False, "message": "مدة حذف الأرشيف لازم تكون أكبر من مدة الأرشفة"}
+    doc.enable_auto_retention=1 if int(enable_auto_retention or 0) else 0
+    doc.auto_archive_after_days=archive_days
+    doc.delete_archived_after_days=delete_days
+    doc.save(ignore_permissions=True)
+    frappe.db.commit()
+    return {"success": True, "message": "تم حفظ إعدادات الأرشفة", "settings": doc.as_dict()}
+
+
+def _rv_run_internal(force=False):
+    doc=_rv_doc()
+    if not doc:
+        return {"success": False, "message": "Settings missing"}
+    if not int(doc.enable_auto_retention or 0) and not force:
+        return {"success": True, "message": "Auto retention disabled", "archived": 0, "deleted": 0}
+    from frappe.utils import add_to_date, now_datetime
+    archive_days=max(1,int(doc.auto_archive_after_days or 7))
+    delete_days=max(1,int(doc.delete_archived_after_days or 90))
+    archive_cutoff=add_to_date(now_datetime(), days=-archive_days)
+    delete_cutoff=add_to_date(now_datetime(), days=-delete_days)
+    archivable=frappe.db.sql("""
+        select name from `tabSocial Conversation`
+        where ifnull(status,'Open')!='Archived'
+          and coalesce(last_message_at, modified, creation) <= %s
+    """, (archive_cutoff,), as_dict=True)
+    archived=0
+    for r in archivable:
+        frappe.db.set_value("Social Conversation", r.name, "status", "Archived", update_modified=False)
+        archived+=1
+    deletable=frappe.db.sql("""
+        select name from `tabSocial Conversation`
+        where status='Archived'
+          and coalesce(last_message_at, modified, creation) <= %s
+    """, (delete_cutoff,), as_dict=True)
+    deleted=0
+    for r in deletable:
+        frappe.db.sql("delete from `tabSocial Message` where conversation=%s", (r.name,))
+        frappe.db.sql("delete from `tabSocial Conversation` where name=%s", (r.name,))
+        deleted+=1
+    doc.last_retention_run=now_datetime()
+    doc.save(ignore_permissions=True)
+    frappe.db.commit()
+    return {"success": True, "archived": archived, "deleted": deleted, "archive_cutoff": str(archive_cutoff), "delete_cutoff": str(delete_cutoff), "settings": doc.as_dict()}
+
+@frappe.whitelist(allow_guest=False)
+def run_social_retention_now():
+    if not _rv_is_system_manager():
+        return {"success": False, "message": "System Manager only"}
+    return _rv_run_internal(force=True)
+
+@frappe.whitelist(allow_guest=False)
+def clear_all_social_chats(confirm=""):
+    if not _rv_is_system_manager():
+        return {"success": False, "message": "System Manager only"}
+    if confirm != "DELETE_SOCIAL_CHATS":
+        return {"success": False, "message": "للتأكيد اكتب DELETE_SOCIAL_CHATS"}
+    before={}
+    for dt in ["Social Message","Social Conversation","Customer Lookup Cache"]:
+        try: before[dt]=frappe.db.count(dt)
+        except Exception: before[dt]=None
+    for table in ["tabSocial Message","tabSocial Conversation","tabCustomer Lookup Cache"]:
+        try: frappe.db.sql(f"delete from `{table}`")
+        except Exception: pass
+    frappe.db.commit()
+    after={}
+    for dt in ["Social Message","Social Conversation","Customer Lookup Cache"]:
+        try: after[dt]=frappe.db.count(dt)
+        except Exception: after[dt]=None
+    return {"success": True, "message": "تم حذف كل الشاتات والكاش", "before": before, "after": after}
+
+def daily_retention_job():
+    try: return _rv_run_internal(force=False)
+    except Exception as e:
+        try: frappe.log_error(str(e), "Social Inbox Retention Job Error")
+        except Exception: pass
+        return {"success": False, "message": str(e)}
+PY
+chmod 644 "$APP_DIR/api/social_inbox_api.py"
+
+say "3) Standalone page /social-retention-settings"
+cat > "$WWW_DIR/social-retention-settings.py" <<'PY'
+import frappe
+no_cache = 1
+
+def get_context(context):
+    user=frappe.session.user
+    roles=frappe.get_roles(user)
+    if user != "Administrator" and "System Manager" not in roles:
+        frappe.throw("System Manager only", frappe.PermissionError)
+    return context
+PY
+
+cat > "$WWW_DIR/social-retention-settings.html" <<'HTML'
+<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Social Retention Settings</title><style>*{box-sizing:border-box;font-family:'Segoe UI',Tahoma,Arial}body{margin:0;background:#eef2f7;color:#111827;direction:rtl}.top{background:#20262d;color:white;padding:14px 22px;display:flex;justify-content:space-between;border-bottom:4px solid #1F4E79}.top a{color:white;text-decoration:none;border:1px solid #64748b;border-radius:10px;padding:8px 12px;margin:2px}.wrap{padding:22px;max-width:1000px;margin:auto}.panel{background:white;border:1px solid #d8dee9;border-radius:16px;box-shadow:0 10px 28px #0001;margin-bottom:16px;overflow:hidden}.head{padding:14px 16px;border-bottom:1px solid #e5e7eb}.body{padding:16px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.field label{display:block;font-weight:800;color:#475569;font-size:13px;margin-bottom:6px}input,select{width:100%;border:1px solid #d1d5db;border-radius:11px;padding:10px}.btn{border:0;border-radius:11px;padding:10px 14px;background:#1F4E79;color:white;font-weight:800;cursor:pointer;margin:3px}.btn.green{background:#16a34a}.btn.orange{background:#f97316}.btn.red{background:#dc2626}.btn.light{background:#fff;color:#111827;border:1px solid #d1d5db}.note{background:#fff7ed;border:1px solid #fed7aa;border-right:5px solid #f97316;border-radius:14px;padding:12px;line-height:1.7}.muted{color:#64748b;font-size:12px}pre{background:#0f172a;color:#dcfce7;border-radius:12px;padding:12px;white-space:pre-wrap;max-height:420px;overflow:auto;direction:ltr;text-align:left}@media(max-width:900px){.grid{grid-template-columns:1fr}.top{display:block}}</style></head><body><div class="top"><b>🧹 Social Retention Settings — System Manager Only</b><div><a href="/social-settings">Social Settings</a><a href="/social-inbox">Social Inbox</a><a href="/admin-desk">Admin Desk</a></div></div><div class="wrap"><div class="note"><b>تنبيه:</b> الإعدادات دي تمسح/تؤرشف محادثات ورسائل Social Inbox فقط. لا تمس حسابات واتساب، ولا Quick Replies، ولا GOWA Session، ولا CDR/Elastix.</div><br><div class="panel"><div class="head"><b>إعدادات الأرشفة والتنظيف</b></div><div class="body"><div class="grid"><div class="field"><label>تفعيل الأرشفة التلقائية</label><select id="enable"><option value="1">مفعل</option><option value="0">متوقف</option></select></div><div class="field"><label>أرشفة بعد كام يوم بدون رسائل</label><input id="archive" value="7"></div><div class="field"><label>حذف المؤرشف بعد كام يوم</label><input id="del" value="90"></div></div><br><button class="btn green" onclick="save()">حفظ الإعدادات</button><button class="btn orange" onclick="runNow()">تشغيل الأرشفة الآن</button><button class="btn red" onclick="clearAll()">حذف كل الشاتات الآن</button><button class="btn light" onclick="load()">Refresh</button><pre id="out"></pre></div></div></div><script>function M(a){return a.join('')}async function api(method,args){let qs=new URLSearchParams();args=args||{};Object.keys(args).forEach(k=>{if(args[k]!==undefined&&args[k]!==null)qs.append(k,args[k])});let r=await fetch('/api/method/'+method+(qs.toString()?'?'+qs.toString():''),{credentials:'same-origin',cache:'no-store'});let j=await r.json();return j.message}function show(o){out.textContent=JSON.stringify(o,null,2)}async function load(){let d=await api(M(['restaurant','_ops.api.social_inbox','_api.get_retention_settings']));show(d);if(d&&d.success){let s=d.settings||{};enable.value=String(s.enable_auto_retention?1:0);archive.value=s.auto_archive_after_days||7;del.value=s.delete_archived_after_days||90}}async function save(){let d=await api(M(['restaurant','_ops.api.social_inbox','_api.save_retention_settings']),{enable_auto_retention:enable.value,auto_archive_after_days:archive.value,delete_archived_after_days:del.value});show(d)}async function runNow(){if(!confirm('تشغيل الأرشفة والحذف حسب المدد الحالية؟'))return;let d=await api(M(['restaurant','_ops.api.social_inbox','_api.run_social_retention_now']));show(d)}async function clearAll(){let c=prompt('تحذير: سيتم حذف كل الشاتات والرسائل والكاش. اكتب DELETE_SOCIAL_CHATS للتأكيد');let d=await api(M(['restaurant','_ops.api.social_inbox','_api.clear_all_social_chats']),{confirm:c||''});show(d)}load();</script></body></html>
+HTML
+
+say "4) Inject dynamic link/panel into social-settings"
+python3 - <<'PY'
+from pathlib import Path
+import re
+p=Path('/opt/frappe_crm/apps/restaurant_ops/restaurant_ops/www/social-settings.html')
+if p.exists():
+    s=p.read_text(errors='ignore')
+    s=re.sub(r'<!-- ROSHDY_RETENTION_VISIBLE_LINK_START -->[\s\S]*?<!-- ROSHDY_RETENTION_VISIBLE_LINK_END -->','',s)
+    block='''\n<!-- ROSHDY_RETENTION_VISIBLE_LINK_START -->\n<script id="retention-visible-link-script">(async function(){function M(a){return a.join('')}try{let r=await fetch('/api/method/'+M(['restaurant','_ops.api.social_inbox','_api.retention_whoami']),{credentials:'same-origin',cache:'no-store'});let j=await r.json();let d=j.message||{};if(d.is_system_manager){let wrap=document.querySelector('.wrap')||document.body;let div=document.createElement('div');div.className='panel';div.innerHTML='<div class="head"><b>🧹 أرشفة وتنظيف الشاتات — System Manager فقط</b></div><div class="body"><a class="btn orange" href="/social-retention-settings">فتح إعدادات الأرشفة والتنظيف</a><span class="muted">  أرشفة تلقائية وحذف مؤرشف ومسح كل الشاتات عند الحاجة.</span></div>';wrap.appendChild(div);}}catch(e){}})();</script>\n<!-- ROSHDY_RETENTION_VISIBLE_LINK_END -->\n'''
+    if '</body>' in s:
+        s=s.replace('</body>', block+'\n</body>',1)
+    else:
+        s+=block
+    p.write_text(s)
+    print('✅ social-settings dynamic retention link injected')
+PY
+
+say "5) Migrate/Clear/Restart"
+docker exec "$BACKEND" bash -lc "find /home/frappe/frappe-bench/apps/restaurant_ops -name '*.pyc' -delete; find /home/frappe/frappe-bench/apps/restaurant_ops -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true"
+docker exec "$BACKEND" bench --site "$SITE" migrate
+docker exec "$BACKEND" bench --site "$SITE" clear-cache || true
+docker exec "$BACKEND" bench --site "$SITE" clear-website-cache || true
+docker compose restart backend frontend websocket queue-short queue-long scheduler
+sleep 10
+BACKEND="$(docker compose ps -q backend)"
+
+say "6) Validation"
+echo "--- whoami retention ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.social_inbox_api.retention_whoami || true
+
+echo "--- retention settings ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.social_inbox_api.get_retention_settings || true
+
+echo "--- page status ---"
+for page in social-retention-settings social-settings social-inbox admin-desk call-report; do
+  code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$page" || true)"
+  echo "$page => $code"
+done
+
+say "7) Health Check مهم: Elastix/CDR/AMI + Queue + Call Report"
+echo "--- Asterisk/Elastix diagnostics ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics || true
+
+echo "--- Queue status ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.queue_api.get_queue_status || true
+
+echo "--- Calls report admin sample ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' || true
+
+say "✅ Retention visible fix done يا زعيم"
+echo "افتح كـ Administrator/System Manager: http://$(hostname -I | awk '{print $1}')/social-retention-settings"
+echo "ولو فتحت /social-settings هتلاقي لينك لإعدادات الأرشفة تحت الصفحة فقط للـ System Manager."
+echo "Backup: $BACKUP_DIR"

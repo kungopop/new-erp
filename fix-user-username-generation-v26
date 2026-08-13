@@ -1,0 +1,370 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Roshdy V26: Fix User.username generation and repair existing bad usernames
+# ----------------------------------------------------------------------
+# Problem:
+#   ERPNext User form shows wrong Username like "MR" when the user email is hesham@roshdy.com.
+# Cause:
+#   User creation/edit flow may derive username from first name/title instead of email local-part.
+# Fix:
+#   1) Override admin_api.create_agent so new users get username from email local-part.
+#      Example: hesham@roshdy.com -> username: hesham
+#   2) Repair existing non-system @roshdy.com users where username is wrong.
+#   3) Validate duplicates.
+# Safety:
+#   - Backup first.
+#   - Does NOT touch report_api.py / Elastix / CDR / AMI.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+FIX_DOMAIN="${FIX_DOMAIN:-roshdy.com}"
+REPAIR_EXISTING="${REPAIR_EXISTING:-1}"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "❌ docker compose/docker-compose مش موجود"
+  exit 1
+fi
+
+APP_DIR="$ROOT/apps/$APP"
+PKG_DIR="$APP_DIR/$APP"
+API_DIR="$PKG_DIR/api"
+ADMIN_API="$API_DIR/admin_api.py"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/FIX_USER_USERNAME_GENERATION_V26_BEFORE_$TS"
+mkdir -p "$BACKUP_DIR"
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend container مش شغال أو مش لاقيه"
+  exit 1
+fi
+
+bench_exec() {
+  "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"
+}
+
+echo "============================================================"
+echo "🔧 Roshdy V26: Fix User.username generation"
+echo "📦 Backup: $BACKUP_DIR"
+echo "🌐 Domain: $FIX_DOMAIN"
+echo "============================================================"
+
+if [[ ! -f "$ADMIN_API" ]]; then
+  echo "❌ مش لاقي admin_api.py: $ADMIN_API"
+  exit 1
+fi
+
+echo "🧯 Step 1: Backup files + bench backup"
+cp -a "$ADMIN_API" "$BACKUP_DIR/admin_api.py.before"
+bench_exec backup --with-files | tee "$BACKUP_DIR/bench_backup_output.txt"
+
+echo "🧩 Step 2: Patch admin_api.py username logic"
+export ADMIN_API FIX_DOMAIN
+python3 - <<'PY'
+# -*- coding: utf-8 -*-
+from pathlib import Path
+import os
+
+p = Path(os.environ["ADMIN_API"])
+fix_domain = os.environ.get("FIX_DOMAIN", "roshdy.com")
+s = p.read_text(encoding="utf-8", errors="ignore")
+start = "# BEGIN ROSHDY USERNAME GENERATION V26"
+end = "# END ROSHDY USERNAME GENERATION V26"
+patch = r'''
+# BEGIN ROSHDY USERNAME GENERATION V26
+# Fix User.username generation: use email local-part, never title/first-name like MR.
+try:
+    import frappe
+    import re as _v26_re
+    from frappe.utils import cstr, cint
+except Exception:
+    frappe = None
+
+
+def _v26_admin_allowed():
+    try:
+        if frappe.session.user == "Administrator":
+            return True
+        roles = set(frappe.get_roles(frappe.session.user))
+        return bool(roles.intersection({"System Manager", "Call Center Admin", "Restaurant Manager"}))
+    except Exception:
+        return False
+
+
+def _v26_clean_email(email):
+    return cstr(email or "").strip().lower()
+
+
+def _v26_username_base_from_email(email):
+    email = _v26_clean_email(email)
+    local = email.split("@", 1)[0]
+    local = local.strip().lower()
+    # Keep common safe username characters. Frappe accepts Data, dots are fine.
+    local = _v26_re.sub(r"[^a-z0-9._-]+", ".", local)
+    local = _v26_re.sub(r"\.+", ".", local).strip("._-")
+    return local or "user"
+
+
+def _v26_username_taken(username, current_user=None):
+    try:
+        rows = frappe.db.sql(
+            "select name from `tabUser` where username=%s and name<>%s limit 1",
+            (username, current_user or ""),
+            as_dict=True,
+        )
+        return bool(rows)
+    except Exception:
+        return False
+
+
+def _v26_unique_username(email, current_user=None):
+    base = _v26_username_base_from_email(email)
+    candidate = base
+    i = 2
+    while _v26_username_taken(candidate, current_user=current_user):
+        candidate = f"{base}{i}"
+        i += 1
+        if i > 999:
+            break
+    return candidate
+
+
+def _v26_bad_username(username, email):
+    username = cstr(username or "").strip()
+    desired = _v26_username_base_from_email(email)
+    if not username:
+        return True
+    if username.lower() == desired.lower():
+        return False
+    # Titles / initials / generated from first-name instead of email.
+    if username.lower() in ("mr", "mrs", "ms", "miss", "dr", "eng", "admin", "user"):
+        return True
+    if len(username) <= 3:
+        return True
+    # Spaces or weird chars.
+    if _v26_re.search(r"\s", username):
+        return True
+    # For Roshdy emails we standardize to email local-part for predictability.
+    if "@" in cstr(email or "") and cstr(email).lower().endswith("@roshdy.com"):
+        return True
+    return False
+
+
+def _v26_split_name(full_name, email=None):
+    full_name = cstr(full_name or "").strip()
+    if not full_name and email:
+        full_name = _v26_username_base_from_email(email).replace(".", " ").title()
+    parts = [p for p in full_name.split() if p]
+    if not parts:
+        return full_name or "User", "", ""
+    if len(parts) == 1:
+        return parts[0], "", ""
+    return parts[0], " ".join(parts[1:-1]), parts[-1]
+
+
+def _v26_set_user_username(user, email=None, force=False):
+    email = _v26_clean_email(email or user)
+    if user in ("Administrator", "Guest"):
+        return {"user": user, "skipped": True, "reason": "system user"}
+    try:
+        current = frappe.db.get_value("User", user, "username")
+    except Exception:
+        current = ""
+    if not force and not _v26_bad_username(current, email):
+        return {"user": user, "old_username": current, "new_username": current, "changed": False}
+    new_username = _v26_unique_username(email, current_user=user)
+    if cstr(current or "") == new_username:
+        return {"user": user, "old_username": current, "new_username": new_username, "changed": False}
+    frappe.db.set_value("User", user, "username", new_username, update_modified=True)
+    return {"user": user, "old_username": current, "new_username": new_username, "changed": True}
+
+
+@frappe.whitelist()
+def create_agent(email=None, full_name=None, password=None, role=None, **kwargs):
+    """Create a user with correct username based on email local-part.
+
+    Called by /user-management.
+    """
+    if not _v26_admin_allowed():
+        frappe.throw("غير مسموح")
+    email = _v26_clean_email(email or kwargs.get("user_id") or kwargs.get("user") or "")
+    if not email or "@" not in email:
+        return {"success": False, "message": "الإيميل مطلوب وصحيح"}
+    full_name = cstr(full_name or kwargs.get("fullName") or kwargs.get("name") or "").strip()
+    role = cstr(role or kwargs.get("role") or "Restaurant Agent").strip() or "Restaurant Agent"
+    password = cstr(password or kwargs.get("new_password") or "").strip()
+
+    first, middle, last = _v26_split_name(full_name, email=email)
+    username = _v26_unique_username(email, current_user=email)
+
+    try:
+        if frappe.db.exists("User", email):
+            user = frappe.get_doc("User", email)
+            user.enabled = 1
+            user.email = email
+            user.username = username
+            user.first_name = first
+            user.middle_name = middle
+            user.last_name = last
+            user.full_name = full_name or " ".join([x for x in (first, middle, last) if x])
+            user.save(ignore_permissions=True)
+        else:
+            user = frappe.get_doc({
+                "doctype": "User",
+                "email": email,
+                "username": username,
+                "first_name": first,
+                "middle_name": middle,
+                "last_name": last,
+                "full_name": full_name or " ".join([x for x in (first, middle, last) if x]),
+                "enabled": 1,
+                "send_welcome_email": 0,
+                "user_type": "System User",
+                "time_zone": "Africa/Cairo",
+            })
+            user.insert(ignore_permissions=True)
+        if role and frappe.db.exists("Role", role):
+            user.add_roles(role)
+        if password:
+            try:
+                user.new_password = password
+                user.save(ignore_permissions=True)
+            except Exception:
+                try:
+                    from frappe.utils.password import update_password
+                    update_password(email, password)
+                except Exception:
+                    pass
+        frappe.db.commit()
+        _v26_set_user_username(email, email=email, force=True)
+        return {"success": True, "message": "تم إنشاء/تحديث المستخدم", "user": email, "username": frappe.db.get_value("User", email, "username")}
+    except Exception as e:
+        frappe.db.rollback()
+        return {"success": False, "message": cstr(e)}
+
+
+@frappe.whitelist()
+def repair_roshdy_usernames(domain="roshdy.com", dry_run=0):
+    if not _v26_admin_allowed():
+        frappe.throw("غير مسموح")
+    dry_run = cint(dry_run or 0)
+    domain = cstr(domain or "roshdy.com").lower().strip()
+    users = frappe.get_all("User", filters={"name": ["like", "%@" + domain]}, fields=["name", "email", "username", "full_name"], limit_page_length=5000)
+    changes = []
+    for u in users:
+        user = u.get("name")
+        if user in ("Administrator", "Guest"):
+            continue
+        email = _v26_clean_email(u.get("email") or user)
+        old = cstr(u.get("username") or "")
+        desired = _v26_unique_username(email, current_user=user)
+        needs = _v26_bad_username(old, email) or old.lower() != desired.lower()
+        if not needs:
+            continue
+        item = {"user": user, "email": email, "old_username": old, "new_username": desired}
+        if not dry_run:
+            frappe.db.set_value("User", user, "username", desired, update_modified=True)
+            item["changed"] = True
+        else:
+            item["changed"] = False
+            item["dry_run"] = True
+        changes.append(item)
+    if not dry_run:
+        frappe.db.commit()
+    return {"success": True, "domain": domain, "dry_run": dry_run, "changes_count": len(changes), "changes": changes[:500]}
+
+
+@frappe.whitelist()
+def debug_username_generation_v26(domain="roshdy.com"):
+    rows = frappe.get_all("User", filters={"name": ["like", "%@" + cstr(domain or "roshdy.com")]}, fields=["name", "email", "username", "full_name", "enabled"], order_by="name", limit_page_length=5000)
+    bad = []
+    for r in rows:
+        desired = _v26_username_base_from_email(r.get("email") or r.get("name"))
+        if _v26_bad_username(r.get("username"), r.get("email") or r.get("name")) or cstr(r.get("username") or "").lower() != desired.lower():
+            bad.append({"user": r.get("name"), "email": r.get("email"), "username": r.get("username"), "desired": desired, "full_name": r.get("full_name")})
+    # username duplicates
+    dupes = frappe.db.sql("""
+        select username, count(*) cnt, group_concat(name order by name separator ', ') users
+        from `tabUser`
+        where ifnull(username,'')!=''
+        group by username
+        having count(*) > 1
+    """, as_dict=True)
+    return {"success": True, "total": len(rows), "bad_count": len(bad), "bad_sample": bad[:100], "duplicate_usernames": dupes}
+# END ROSHDY USERNAME GENERATION V26
+'''
+if start in s and end in s:
+    i = s.index(start)
+    j = s.index(end, i) + len(end)
+    s = s[:i] + patch.strip() + s[j:]
+else:
+    s = s.rstrip() + "\n\n" + patch.strip() + "\n"
+compile(s, str(admin_api), "exec")
+admin_api.write_text(s, encoding="utf-8")
+PY
+
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+[[ -n "$APP_OWNER" ]] && chown "$APP_OWNER" "$ADMIN_API" 2>/dev/null || true
+
+echo "🛠️ Repair existing usernames"
+if [[ "$REPAIR_EXISTING" == "1" ]]; then
+  bench_exec execute restaurant_ops.api.admin_api.repair_roshdy_usernames --kwargs "{\"domain\":\"$FIX_DOMAIN\",\"dry_run\":0}" | tee "$BACKUP_DIR/repair_roshdy_usernames_v26.txt"
+else
+  echo "ℹ️ REPAIR_EXISTING=0, dry run only"
+  bench_exec execute restaurant_ops.api.admin_api.repair_roshdy_usernames --kwargs "{\"domain\":\"$FIX_DOMAIN\",\"dry_run\":1}" | tee "$BACKUP_DIR/repair_roshdy_usernames_dry_run_v26.txt"
+fi
+
+echo "🧹 Clear cache + restart app services"
+bench_exec clear-cache || true
+"${COMPOSE[@]}" restart backend frontend websocket queue-short queue-long scheduler >/dev/null
+sleep 8
+bench_exec clear-cache || true
+
+echo "🧪 Validation"
+set +e
+bench_exec execute restaurant_ops.api.admin_api.debug_username_generation_v26 --kwargs "{\"domain\":\"$FIX_DOMAIN\"}" | tee "$BACKUP_DIR/debug_username_generation_v26.txt"
+V1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.admin_api.debug_duplicate_users_check | tee "$BACKUP_DIR/debug_duplicate_users_check_after_username_v26.txt"
+V2=${PIPESTATUS[0]}
+for p in user-management admin-desk; do
+  code="$(curl -k -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$p" 2>/dev/null || echo 000)"
+  echo "$p => $code" | tee -a "$BACKUP_DIR/page_smoke_checks_v26.txt"
+done
+set -e
+
+if [[ $V1 -ne 0 ]]; then
+  echo "❌ Username validation failed. راجع: $BACKUP_DIR/debug_username_generation_v26.txt"
+  exit 1
+fi
+
+echo "🏥 Health Check - Elastix/CDR/AMI + Queue + Call Report"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$BACKUP_DIR/health_asterisk_bridge.txt"
+H1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status | tee "$BACKUP_DIR/health_queue_status.txt"
+H2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' | tee "$BACKUP_DIR/health_call_report.txt"
+H3=${PIPESTATUS[0]}
+set -e
+
+if [[ $H1 -ne 0 || $H2 -ne 0 || $H3 -ne 0 ]]; then
+  echo "⚠️ Health returned non-zero. راجع: $BACKUP_DIR"
+else
+  echo "✅ Health checks OK"
+fi
+
+echo "============================================================"
+echo "✅ DONE V26"
+echo "📦 Backup folder: $BACKUP_DIR"
+echo "👤 User.username is now standardized from email local-part"
+echo "مثال: hesham@roshdy.com -> hesham"
+echo "🛡️ report_api.py / Elastix / CDR / AMI untouched"
+echo "============================================================"

@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Roshdy V21: Fix Queue Journey LIVE source (SSH fetch from Elastix)
+# Problem:
+#   /queue-journey-report shows "Fallback source: missing"
+# Meaning:
+#   ERP has no queue_journey JSON cache yet, so it falls back to old CDR missed-attempt source.
+# This script:
+#   1) Tests SSH access from ERP -> Elastix.
+#   2) Creates/copies SSH key if needed (interactive password prompt may appear once).
+#   3) Runs the queue journey fetch/parser now.
+#   4) Installs/repairs cron if key-based SSH works.
+#   5) Validates ERP API and email integration.
+# Safety:
+#   - Does NOT edit report_api.py.
+#   - Does NOT touch Elastix/Asterisk configs, CDR, AMI.
+#   - Reads /var/log/asterisk/queue_log only over SSH.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+ELASTIX_SSH="${ELASTIX_SSH:-root@10.11.1.253}"
+QUEUE_LOG="${QUEUE_LOG:-/var/log/asterisk/queue_log}"
+DATE_FROM="${DATE_FROM:-$(date +%F)}"
+DATE_TO="${DATE_TO:-$DATE_FROM}"
+QUEUES="${QUEUES:-1234,123}"
+THRESHOLD="${THRESHOLD:-15}"
+MAX_LINES="${MAX_LINES:-500000}"
+CRON_MINUTES="${CRON_MINUTES:-5}"
+INSTALL_CRON="${INSTALL_CRON:-1}"
+SSH_KEY="${SSH_KEY:-/root/.ssh/id_ed25519}"
+TS="$(date +%Y%m%d_%H%M%S)"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "❌ docker compose/docker-compose مش موجود"
+  exit 1
+fi
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend container مش شغال أو مش لاقيه"
+  exit 1
+fi
+
+bench_exec() {
+  "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"
+}
+
+HOST_FETCH_SCRIPT="$ROOT/scripts/roshdy_queue_journey_fetch_parse"
+CONF_FILE="$ROOT/queue_journey.conf"
+JOURNEY_DIR="$ROOT/sites/$SITE/private/files/queue_journey"
+LOG_DIR="$ROOT/logs"
+OUT_DIR="$ROOT/backups/FIX_QUEUE_JOURNEY_SSH_FETCH_V21_$TS"
+mkdir -p "$OUT_DIR" "$JOURNEY_DIR" "$LOG_DIR"
+
+echo "============================================================"
+echo "🔧 Roshdy V21: Queue Journey SSH fetch fix"
+echo "📦 Output: $OUT_DIR"
+echo "🔐 Elastix: $ELASTIX_SSH"
+echo "📄 Remote queue_log: $QUEUE_LOG"
+echo "📅 Date: $DATE_FROM to $DATE_TO"
+echo "☎️ Queues: $QUEUES"
+echo "============================================================"
+
+if [[ ! -x "$HOST_FETCH_SCRIPT" ]]; then
+  echo "❌ Host fetch script missing/not executable: $HOST_FETCH_SCRIPT"
+  echo "شغّل install-queue-journey-live-v20 الأول أو ابعتلي ناتجه."
+  exit 1
+fi
+
+# Update config so future fetches use these values.
+cat > "$CONF_FILE" <<EOF
+# Roshdy Queue Journey config
+ROOT="$ROOT"
+SITE="$SITE"
+ELASTIX_SSH="$ELASTIX_SSH"
+QUEUE_LOG="$QUEUE_LOG"
+QUEUES="$QUEUES"
+THRESHOLD="$THRESHOLD"
+MAX_LINES="$MAX_LINES"
+EOF
+chmod 0644 "$CONF_FILE"
+
+echo "🔎 Step 1: Test TCP/SSH basic access"
+set +e
+ssh -o BatchMode=yes -o ConnectTimeout=8 "$ELASTIX_SSH" "test -r '$QUEUE_LOG' && echo SSH_KEY_OK_QUEUELOG_READABLE" > "$OUT_DIR/ssh_batch_test.txt" 2>&1
+SSH_BATCH_RC=$?
+set -e
+cat "$OUT_DIR/ssh_batch_test.txt" || true
+
+if [[ $SSH_BATCH_RC -ne 0 ]]; then
+  echo "⚠️ SSH بدون باسورد مش جاهز. هنجهز SSH key ونحاول ننسخه على Elastix."
+  mkdir -p /root/.ssh
+  chmod 700 /root/.ssh
+  if [[ ! -f "$SSH_KEY" ]]; then
+    echo "🔑 Creating SSH key: $SSH_KEY"
+    ssh-keygen -t ed25519 -f "$SSH_KEY" -N "" -C "roshdy-erp-queue-journey" | tee "$OUT_DIR/ssh_keygen.txt"
+  else
+    echo "ℹ️ SSH key already exists: $SSH_KEY"
+  fi
+
+  if command -v ssh-copy-id >/dev/null 2>&1; then
+    echo "🔐 Now copying SSH key to $ELASTIX_SSH"
+    echo "لو طلب باسورد، اكتب باسورد root بتاع Elastix مرة واحدة."
+    set +e
+    ssh-copy-id -i "${SSH_KEY}.pub" "$ELASTIX_SSH" | tee "$OUT_DIR/ssh_copy_id.txt"
+    COPY_RC=${PIPESTATUS[0]}
+    set -e
+    if [[ $COPY_RC -ne 0 ]]; then
+      echo "⚠️ ssh-copy-id فشل. هاطبعلك المفتاح العام تضيفه يدويًا في Elastix:"
+      echo "================ PUBLIC KEY ================"
+      cat "${SSH_KEY}.pub"
+      echo "============================================"
+      echo "على Elastix نفذ:"
+      echo "mkdir -p /root/.ssh && chmod 700 /root/.ssh"
+      echo "echo 'PASTE_PUBLIC_KEY_HERE' >> /root/.ssh/authorized_keys"
+      echo "chmod 600 /root/.ssh/authorized_keys"
+    fi
+  else
+    echo "⚠️ ssh-copy-id مش موجود. أضف المفتاح يدويًا على Elastix:"
+    cat "${SSH_KEY}.pub"
+  fi
+else
+  echo "✅ SSH key access already works."
+fi
+
+echo "🔎 Step 2: Retest SSH key access"
+set +e
+ssh -o BatchMode=yes -o ConnectTimeout=8 "$ELASTIX_SSH" "test -r '$QUEUE_LOG' && echo SSH_KEY_OK_QUEUELOG_READABLE && tail -n 1 '$QUEUE_LOG'" > "$OUT_DIR/ssh_batch_retest.txt" 2>&1
+SSH_BATCH_RC2=$?
+set -e
+cat "$OUT_DIR/ssh_batch_retest.txt" || true
+
+if [[ $SSH_BATCH_RC2 -ne 0 ]]; then
+  echo "⚠️ SSH key لسه مش شغال بدون باسورد."
+  echo "هنحاول نشغل fetch يدوي، وقد يطلب باسورد Elastix الآن."
+else
+  echo "✅ SSH key confirmed. Cron can be installed."
+fi
+
+echo "▶️ Step 3: Run queue journey fetch now"
+set +e
+DATE_FROM="$DATE_FROM" DATE_TO="$DATE_TO" QUEUES="$QUEUES" THRESHOLD="$THRESHOLD" MAX_LINES="$MAX_LINES" "$HOST_FETCH_SCRIPT" > "$OUT_DIR/fetch_now.txt" 2>&1
+FETCH_RC=$?
+set -e
+cat "$OUT_DIR/fetch_now.txt"
+
+if [[ $FETCH_RC -ne 0 ]]; then
+  echo "❌ Fetch failed. غالبًا SSH/password أو صلاحية قراءة queue_log."
+  echo "راجع: $OUT_DIR/fetch_now.txt"
+  exit 1
+fi
+
+chmod -R a+rX "$JOURNEY_DIR" || true
+
+echo "📁 Step 4: Check generated JSON cache"
+ls -lah "$JOURNEY_DIR" | tee "$OUT_DIR/journey_dir_listing.txt"
+if [[ -f "$JOURNEY_DIR/latest_summary.txt" ]]; then
+  echo "================ latest_summary.txt ================"
+  cat "$JOURNEY_DIR/latest_summary.txt" | tee "$OUT_DIR/latest_summary.txt"
+fi
+
+if [[ ! -f "$JOURNEY_DIR/latest.json" ]]; then
+  echo "❌ latest.json was not created. Fetch output above should explain why."
+  exit 1
+fi
+
+if [[ "$INSTALL_CRON" == "1" ]]; then
+  echo "🕒 Step 5: Install/repair cron if key-based SSH works"
+  if [[ $SSH_BATCH_RC2 -eq 0 ]]; then
+    cat > /etc/cron.d/roshdy_queue_journey <<EOF
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+*/$CRON_MINUTES * * * * root /bin/bash -lc 'DATE_FROM=\$(date +\%F) DATE_TO=\$(date +\%F) QUEUES="$QUEUES" THRESHOLD="$THRESHOLD" MAX_LINES="$MAX_LINES" "$HOST_FETCH_SCRIPT" >> "$LOG_DIR/roshdy_queue_journey_cron.log" 2>&1'
+EOF
+    chmod 0644 /etc/cron.d/roshdy_queue_journey
+    echo "✅ Cron installed: /etc/cron.d/roshdy_queue_journey"
+  else
+    echo "⚠️ Cron not installed because key-based SSH is not ready."
+    echo "بعد ما تضبط المفتاح، شغل السكريبت تاني."
+  fi
+else
+  echo "ℹ️ INSTALL_CRON=0, skipped cron."
+fi
+
+echo "🧹 Step 6: Clear ERP cache + restart app services"
+bench_exec clear-cache || true
+"${COMPOSE[@]}" restart backend frontend websocket queue-short queue-long scheduler >/dev/null
+sleep 8
+bench_exec clear-cache || true
+
+echo "🧪 Step 7: Validate ERP API/page/email"
+set +e
+for p in queue-journey-report admin-desk email-report-customizer call-report; do
+  code="$(curl -k -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$p" 2>/dev/null || echo 000)"
+  echo "$p => $code" | tee -a "$OUT_DIR/page_smoke_checks.txt"
+done
+bench_exec execute restaurant_ops.api.queue_journey_api.debug_queue_journey_status | tee "$OUT_DIR/debug_queue_journey_status.txt"
+V1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_journey_api.get_queue_journey_report | tee "$OUT_DIR/get_queue_journey_report.txt"
+V2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.upper_management_email_api.verify_queue_journey_in_upper_email | tee "$OUT_DIR/verify_queue_journey_in_upper_email.txt"
+V3=${PIPESTATUS[0]}
+set -e
+
+if [[ $V1 -ne 0 || $V2 -ne 0 || $V3 -ne 0 ]]; then
+  echo "❌ ERP validation failed. راجع: $OUT_DIR"
+  exit 1
+fi
+
+echo "🏥 Step 8: Health Check - Elastix/CDR/AMI + Queue + Call Report"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$OUT_DIR/health_asterisk_bridge.txt"
+H1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status | tee "$OUT_DIR/health_queue_status.txt"
+H2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' | tee "$OUT_DIR/health_call_report.txt"
+H3=${PIPESTATUS[0]}
+set -e
+
+if [[ $H1 -ne 0 || $H2 -ne 0 || $H3 -ne 0 ]]; then
+  echo "⚠️ Health returned non-zero. راجع: $OUT_DIR"
+else
+  echo "✅ Health checks OK"
+fi
+
+echo "============================================================"
+echo "✅ DONE V21"
+echo "📁 Output: $OUT_DIR"
+echo "📁 Journey cache: $JOURNEY_DIR"
+echo "🌐 افتح: /queue-journey-report"
+echo "لو الصفحة لسه كاتبة Fallback بعد Ctrl+F5، ابعتلي:"
+echo "  $OUT_DIR/debug_queue_journey_status.txt"
+echo "  $OUT_DIR/get_queue_journey_report.txt"
+echo "============================================================"

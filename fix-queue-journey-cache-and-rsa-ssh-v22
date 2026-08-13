@@ -1,0 +1,400 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Roshdy V22: fix queue journey source/cache + Elastix SSH key compatibility
+# Fixes:
+# 1) ERP page says "Fallback source: missing" because JSON was written on host path,
+#    not inside the backend container site private/files path.
+# 2) Ed25519 key may not work with old Elastix OpenSSH, so use RSA key.
+# 3) Rewrites the host fetch script to:
+#    - pull /var/log/asterisk/queue_log via SSH
+#    - parse journey JSON on ERP host
+#    - sync JSON into backend container where Frappe can read it
+#    - support cron safely after key-based SSH works
+# Safety:
+# - Backup first.
+# - Does NOT edit report_api.py.
+# - Does NOT touch Elastix/Asterisk configs, CDR, AMI.
+# - Reads queue_log only.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+ELASTIX_SSH="${ELASTIX_SSH:-root@10.11.1.253}"
+QUEUE_LOG="${QUEUE_LOG:-/var/log/asterisk/queue_log}"
+QUEUES="${QUEUES:-1234,123}"
+THRESHOLD="${THRESHOLD:-15}"
+MAX_LINES="${MAX_LINES:-500000}"
+CRON_MINUTES="${CRON_MINUTES:-5}"
+INSTALL_CRON="${INSTALL_CRON:-1}"
+RSA_KEY="${RSA_KEY:-/root/.ssh/id_rsa_roshdy_queue_journey}"
+TS="$(date +%Y%m%d_%H%M%S)"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "❌ docker compose/docker-compose مش موجود"
+  exit 1
+fi
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend container مش شغال أو مش لاقيه"
+  exit 1
+fi
+
+bench_exec() {
+  "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"
+}
+
+HOST_FETCH_SCRIPT="$ROOT/scripts/roshdy_queue_journey_fetch_parse"
+CONF_FILE="$ROOT/queue_journey.conf"
+HOST_JOURNEY_DIR="$ROOT/sites/$SITE/private/files/queue_journey"
+CONTAINER_JOURNEY_DIR="/home/frappe/frappe-bench/sites/$SITE/private/files/queue_journey"
+LOG_DIR="$ROOT/logs"
+OUT_DIR="$ROOT/backups/FIX_QUEUE_JOURNEY_CACHE_RSA_V22_$TS"
+mkdir -p "$OUT_DIR" "$HOST_JOURNEY_DIR" "$LOG_DIR" "$ROOT/scripts"
+
+echo "============================================================"
+echo "🔧 Roshdy V22: Queue Journey cache + RSA SSH fix"
+echo "📦 Output: $OUT_DIR"
+echo "🔐 Elastix: $ELASTIX_SSH"
+echo "🔑 RSA key: $RSA_KEY"
+echo "📄 Remote queue_log: $QUEUE_LOG"
+echo "📅 Date: $(date +%F)"
+echo "============================================================"
+
+# Backup current scripts/config/api results.
+for f in "$HOST_FETCH_SCRIPT" "$CONF_FILE"; do
+  [[ -e "$f" ]] && cp -a "$f" "$OUT_DIR/$(basename "$f").before" || true
+done
+
+# ----------------------------------------------------------------------------
+# Step 1: RSA key for old Elastix compatibility
+# ----------------------------------------------------------------------------
+echo "🔑 Step 1: Ensure RSA SSH key"
+mkdir -p /root/.ssh
+chmod 700 /root/.ssh
+if [[ ! -f "$RSA_KEY" ]]; then
+  ssh-keygen -t rsa -b 4096 -f "$RSA_KEY" -N "" -C "roshdy-erp-queue-journey-rsa" | tee "$OUT_DIR/ssh_keygen_rsa.txt"
+else
+  echo "ℹ️ RSA key already exists: $RSA_KEY"
+fi
+chmod 600 "$RSA_KEY"
+chmod 644 "$RSA_KEY.pub"
+
+SSH_BASE_OPTS=(-i "$RSA_KEY" -o IdentitiesOnly=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/root/.ssh/known_hosts -o PubkeyAcceptedAlgorithms=+ssh-rsa -o HostkeyAlgorithms=+ssh-rsa)
+
+echo "🔎 Testing RSA key access..."
+set +e
+ssh "${SSH_BASE_OPTS[@]}" -o BatchMode=yes "$ELASTIX_SSH" "test -r '$QUEUE_LOG' && echo RSA_KEY_OK" > "$OUT_DIR/ssh_rsa_batch_test.txt" 2>&1
+RSA_OK=$?
+set -e
+cat "$OUT_DIR/ssh_rsa_batch_test.txt" || true
+
+if [[ $RSA_OK -ne 0 ]]; then
+  echo "⚠️ RSA key not installed/accepted yet. هنحاول ننسخه، ممكن يطلب باسورد root بتاع Elastix مرة واحدة."
+  if command -v ssh-copy-id >/dev/null 2>&1; then
+    set +e
+    ssh-copy-id -i "$RSA_KEY.pub" -o StrictHostKeyChecking=no "$ELASTIX_SSH" | tee "$OUT_DIR/ssh_copy_id_rsa.txt"
+    COPY_RC=${PIPESTATUS[0]}
+    set -e
+    if [[ $COPY_RC -ne 0 ]]; then
+      echo "⚠️ ssh-copy-id failed. Public key to add manually on Elastix:"
+      cat "$RSA_KEY.pub" | tee "$OUT_DIR/rsa_public_key_to_add.txt"
+    fi
+  else
+    echo "⚠️ ssh-copy-id not found. Add this public key manually on Elastix:"
+    cat "$RSA_KEY.pub" | tee "$OUT_DIR/rsa_public_key_to_add.txt"
+  fi
+fi
+
+echo "🔎 Retesting RSA key access..."
+set +e
+ssh "${SSH_BASE_OPTS[@]}" -o BatchMode=yes "$ELASTIX_SSH" "test -r '$QUEUE_LOG' && echo RSA_KEY_OK && tail -n 1 '$QUEUE_LOG'" > "$OUT_DIR/ssh_rsa_batch_retest.txt" 2>&1
+RSA_OK2=$?
+set -e
+cat "$OUT_DIR/ssh_rsa_batch_retest.txt" || true
+
+if [[ $RSA_OK2 -ne 0 ]]; then
+  echo "⚠️ RSA key still not working without password."
+  echo "السكريبت سيحاول السحب الآن، وقد يطلب باسورد Elastix."
+  echo "للـ cron لازم نحل SSH key بعدين."
+fi
+
+# ----------------------------------------------------------------------------
+# Step 2: Write config and fetch parser with container sync
+# ----------------------------------------------------------------------------
+echo "🧩 Step 2: Write queue_journey.conf and fetch parser"
+cat > "$CONF_FILE" <<EOF
+ROOT="$ROOT"
+SITE="$SITE"
+ELASTIX_SSH="$ELASTIX_SSH"
+QUEUE_LOG="$QUEUE_LOG"
+QUEUES="$QUEUES"
+THRESHOLD="$THRESHOLD"
+MAX_LINES="$MAX_LINES"
+SSH_KEY="$RSA_KEY"
+EOF
+chmod 0644 "$CONF_FILE"
+
+cat > "$HOST_FETCH_SCRIPT" <<'PYHOST'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+CONF_FILE="${CONF_FILE:-/opt/frappe_crm/queue_journey.conf}"
+[[ -f "$CONF_FILE" ]] && source "$CONF_FILE"
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+ELASTIX_SSH="${ELASTIX_SSH:-root@10.11.1.253}"
+QUEUE_LOG="${QUEUE_LOG:-/var/log/asterisk/queue_log}"
+QUEUES="${QUEUES:-1234,123}"
+THRESHOLD="${THRESHOLD:-15}"
+MAX_LINES="${MAX_LINES:-500000}"
+SSH_KEY="${SSH_KEY:-}"
+DATE_FROM="${DATE_FROM:-$(date +%F)}"
+DATE_TO="${DATE_TO:-$DATE_FROM}"
+HOST_OUT_BASE="$ROOT/sites/$SITE/private/files/queue_journey"
+CONTAINER_OUT_BASE="/home/frappe/frappe-bench/sites/$SITE/private/files/queue_journey"
+RUN_ID="$(date +%Y%m%d_%H%M%S)"
+RUN_DIR="$HOST_OUT_BASE/runs/$RUN_ID"
+TMP_LOG="$RUN_DIR/queue_log_tail.txt"
+mkdir -p "$RUN_DIR" "$HOST_OUT_BASE"
+
+cd "$ROOT"
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "docker compose not found" >&2
+  exit 1
+fi
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "backend container not found" >&2
+  exit 1
+fi
+
+SSH_OPTS=(-o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/root/.ssh/known_hosts)
+if [[ -n "$SSH_KEY" && -f "$SSH_KEY" ]]; then
+  SSH_OPTS=(-i "$SSH_KEY" -o IdentitiesOnly=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/root/.ssh/known_hosts -o PubkeyAcceptedAlgorithms=+ssh-rsa -o HostkeyAlgorithms=+ssh-rsa)
+fi
+
+echo "[$(date '+%F %T')] Fetching $ELASTIX_SSH:$QUEUE_LOG date=$DATE_FROM..$DATE_TO queues=$QUEUES threshold=$THRESHOLD max_lines=$MAX_LINES"
+
+if [[ -n "${LOCAL_QUEUE_LOG:-}" && -f "$LOCAL_QUEUE_LOG" ]]; then
+  if [[ "$MAX_LINES" == "0" ]]; then cat "$LOCAL_QUEUE_LOG" > "$TMP_LOG"; else tail -n "$MAX_LINES" "$LOCAL_QUEUE_LOG" > "$TMP_LOG"; fi
+else
+  if [[ "$MAX_LINES" == "0" ]]; then
+    ssh "${SSH_OPTS[@]}" "$ELASTIX_SSH" "cat '$QUEUE_LOG'" > "$TMP_LOG"
+  else
+    ssh "${SSH_OPTS[@]}" "$ELASTIX_SSH" "tail -n '$MAX_LINES' '$QUEUE_LOG'" > "$TMP_LOG"
+  fi
+fi
+
+python3 - "$TMP_LOG" "$DATE_FROM" "$DATE_TO" "$QUEUES" "$THRESHOLD" "$RUN_DIR" <<'PY'
+import sys, os, re, json, csv, datetime, time
+from collections import defaultdict, Counter
+
+log_path, date_from, date_to, queues_s, threshold_s, run_dir = sys.argv[1:7]
+queues = {q.strip() for q in queues_s.split(',') if q.strip()}
+threshold = float(threshold_s or 15)
+start = int(time.mktime(datetime.datetime.strptime(date_from+' 00:00:00','%Y-%m-%d %H:%M:%S').timetuple()))
+end = int(time.mktime(datetime.datetime.strptime(date_to+' 23:59:59','%Y-%m-%d %H:%M:%S').timetuple()))
+interesting={'DID','ENTERQUEUE','RINGNOANSWER','RINGCANCELED','AGENTDUMP','CONNECT','COMPLETECALLER','COMPLETEAGENT','ABANDON','EXITWITHTIMEOUT','EXITEMPTY','EXITWITHKEY','TRANSFER'}
+
+def ext_from_agent(agent):
+    agent=str(agent or '')
+    for pat in (r'(?:Local|SIP|PJSIP|Agent)/(\d{3,6})', r'^(\d{3,6})$', r'\b(\d{3,6})\b'):
+        m=re.search(pat,agent,re.I)
+        if m and m.group(1) not in ('123','1234'): return m.group(1)
+    return ''
+
+def ts_text(t): return datetime.datetime.fromtimestamp(int(t)).strftime('%Y-%m-%d %H:%M:%S')
+
+def caller_from(evs):
+    for e in evs:
+        if e['event']=='ENTERQUEUE':
+            for d in e.get('data') or []:
+                if re.search(r'\d{5,}', d or ''): return d
+    return ''
+
+rows=[]; counts=Counter(); by_queue=defaultdict(Counter)
+with open(log_path,'r',errors='ignore') as f:
+    for line in f:
+        line=line.rstrip('\n')
+        if not line: continue
+        parts=line.split('|')
+        if len(parts)<5: continue
+        try: t=int(float(parts[0]))
+        except Exception: continue
+        if not (start<=t<=end): continue
+        callid,queue,agent,event=parts[1],parts[2],parts[3],parts[4]
+        if queues and queue not in queues: continue
+        counts[event]+=1; by_queue[queue][event]+=1
+        if event not in interesting: continue
+        rows.append({'time_epoch':t,'time_text':ts_text(t),'callid':callid,'queue':queue,'agent':agent,'agent_ext':ext_from_agent(agent),'event':event,'data':parts[5:],'raw':line})
+
+by_call=defaultdict(list)
+for r in rows: by_call[r['callid']].append(r)
+for cid in by_call: by_call[cid].sort(key=lambda x:x['time_epoch'])
+attempts=[]; call_summaries=[]
+for cid,evs in by_call.items():
+    caller=caller_from(evs)
+    connects=[e for e in evs if e['event']=='CONNECT']; abandons=[e for e in evs if e['event']=='ABANDON']; completes=[e for e in evs if e['event'] in ('COMPLETECALLER','COMPLETEAGENT')]
+    if connects: final='answered'; final_ext=connects[-1].get('agent_ext') or ''
+    elif abandons: final='customer_abandoned_before_answer'; final_ext=''
+    elif completes: final='completed_but_connect_missing'; final_ext=''
+    else: final='unknown_or_still_in_queue'; final_ext=''
+    call_summaries.append({'callid':cid,'caller':caller,'queue':evs[0]['queue'] if evs else '','events_count':len(evs),'events':[e['event'] for e in evs],'final_outcome':final,'final_extension':final_ext})
+    for i,e in enumerate(evs):
+        if e['event'] not in ('RINGNOANSWER','RINGCANCELED','AGENTDUMP'): continue
+        missed_ext=e.get('agent_ext') or ''
+        if not missed_ext: continue
+        raw=(e.get('data') or [''])[0] if e.get('data') else ''
+        try: ring_seconds=round(float(raw or 0)/1000.0,1)
+        except Exception: ring_seconds=0
+        if ring_seconds < threshold: continue
+        later=evs[i+1:]
+        conn=next((x for x in later if x['event']=='CONNECT'),None); aban=next((x for x in later if x['event']=='ABANDON'),None); comp=next((x for x in later if x['event'] in ('COMPLETECALLER','COMPLETEAGENT')),None); tout=next((x for x in later if x['event'] in ('EXITWITHTIMEOUT','EXITEMPTY','EXITWITHKEY')),None)
+        if conn:
+            ans_ext=conn.get('agent_ext') or ''; fate='answered_later_same_extension' if ans_ext==missed_ext else 'answered_later_other_extension'; fate_time=conn['time_text']
+        elif aban: ans_ext=''; fate='customer_abandoned_after_attempt'; fate_time=aban['time_text']
+        elif comp: ans_ext=''; fate='completed_after_attempt_connect_missing'; fate_time=comp['time_text']
+        elif tout: ans_ext=''; fate='timeout_after_attempt_no_final_connect_seen'; fate_time=tout['time_text']
+        else: ans_ext=''; fate='unknown_after_attempt'; fate_time=''
+        attempts.append({'attempt_time':e['time_text'],'callid':cid,'queue':e['queue'],'caller':caller,'missed_extension':missed_ext,'missed_event':e['event'],'ring_seconds':ring_seconds,'fate':fate,'fate_time':fate_time,'answered_extension':ans_ext,'final_outcome_for_call':final,'raw_data':e.get('data') or []})
+
+by_ext=defaultdict(lambda:{'extension':'','attempts':0,'answered_later_same_extension':0,'answered_later_other_extension':0,'customer_abandoned_after_attempt':0,'timeout_no_final_connect':0,'unknown':0})
+for a in attempts:
+    row=by_ext[a['missed_extension']]; row['extension']=a['missed_extension']; row['attempts']+=1
+    if a['fate'] in ('answered_later_same_extension','answered_later_other_extension'): row[a['fate']]+=1
+    elif a['fate']=='customer_abandoned_after_attempt': row['customer_abandoned_after_attempt']+=1
+    elif a['fate']=='timeout_after_attempt_no_final_connect_seen': row['timeout_no_final_connect']+=1
+    else: row['unknown']+=1
+attempts_by_fate=dict(Counter(a['fate'] for a in attempts)); answered_later=sum(v for k,v in attempts_by_fate.items() if k.startswith('answered_later'))
+summary={'success':True,'generated_at':datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),'date_from':date_from,'date_to':date_to,'queues':sorted(queues),'threshold_seconds':threshold,'events_loaded':len(rows),'event_counts':dict(counts),'event_counts_by_queue':{q:dict(c) for q,c in by_queue.items()},'calls_seen':len(by_call),'attempts_total':len(attempts),'answered_later_total':answered_later,'customer_abandoned_after_attempt':attempts_by_fate.get('customer_abandoned_after_attempt',0),'unknown_or_timeout':attempts_by_fate.get('unknown_after_attempt',0)+attempts_by_fate.get('timeout_after_attempt_no_final_connect_seen',0)+attempts_by_fate.get('completed_after_attempt_connect_missing',0),'attempts_by_fate':attempts_by_fate,'attempts_by_missed_extension':sorted(by_ext.values(),key=lambda x:x['attempts'],reverse=True),'attempts':attempts,'call_journey_samples':call_summaries[:300],'can_determine_journey':True}
+json_path=os.path.join(run_dir,'queue_journey_result.json'); open(json_path,'w',encoding='utf-8').write(json.dumps(summary,ensure_ascii=False,indent=2))
+with open(os.path.join(run_dir,'queue_journey_attempts.csv'),'w',newline='',encoding='utf-8-sig') as f:
+    headers=['attempt_time','queue','caller','missed_extension','ring_seconds','fate','answered_extension','fate_time','callid','final_outcome_for_call']; w=csv.DictWriter(f,fieldnames=headers); w.writeheader(); [w.writerow({k:a.get(k,'') for k in headers}) for a in attempts]
+with open(os.path.join(run_dir,'queue_journey_summary.txt'),'w',encoding='utf-8') as f:
+    f.write('Date: %s to %s\nThreshold seconds: %s\nQueues: %s\nEvents loaded: %s\nEvent counts: %s\nCalls seen: %s\nAttempts total: %s\nAnswered later total: %s\nCustomer abandoned after attempt: %s\nUnknown/timeout: %s\nAttempts by fate: %s\n\nBy missed extension:\n' % (date_from,date_to,threshold,','.join(sorted(queues)),len(rows),dict(counts),len(by_call),len(attempts),answered_later,attempts_by_fate.get('customer_abandoned_after_attempt',0),summary['unknown_or_timeout'],attempts_by_fate))
+    for r in summary['attempts_by_missed_extension']: f.write(str(r)+'\n')
+print(json_path)
+PY
+
+EXACT="queue_journey_${DATE_FROM}_${DATE_TO}.json"
+cp "$RUN_DIR/queue_journey_result.json" "$HOST_OUT_BASE/$EXACT"
+cp "$RUN_DIR/queue_journey_result.json" "$HOST_OUT_BASE/latest.json"
+cp "$RUN_DIR/queue_journey_summary.txt" "$HOST_OUT_BASE/latest_summary.txt"
+chmod -R a+rX "$HOST_OUT_BASE" || true
+
+# Sync into backend container, where frappe.get_site_path() can read it.
+"${COMPOSE[@]}" exec -T backend mkdir -p "$CONTAINER_OUT_BASE"
+"${COMPOSE[@]}" cp "$HOST_OUT_BASE/$EXACT" "backend:$CONTAINER_OUT_BASE/$EXACT" 2>/dev/null || docker cp "$HOST_OUT_BASE/$EXACT" "$BACKEND:$CONTAINER_OUT_BASE/$EXACT"
+"${COMPOSE[@]}" cp "$HOST_OUT_BASE/latest.json" "backend:$CONTAINER_OUT_BASE/latest.json" 2>/dev/null || docker cp "$HOST_OUT_BASE/latest.json" "$BACKEND:$CONTAINER_OUT_BASE/latest.json"
+"${COMPOSE[@]}" cp "$HOST_OUT_BASE/latest_summary.txt" "backend:$CONTAINER_OUT_BASE/latest_summary.txt" 2>/dev/null || docker cp "$HOST_OUT_BASE/latest_summary.txt" "$BACKEND:$CONTAINER_OUT_BASE/latest_summary.txt"
+"${COMPOSE[@]}" exec -T backend chmod -R a+rX "$CONTAINER_OUT_BASE" || true
+
+echo "[$(date '+%F %T')] Done. Host JSON: $HOST_OUT_BASE/$EXACT"
+echo "[$(date '+%F %T')] Synced to container: $CONTAINER_OUT_BASE/$EXACT"
+cat "$HOST_OUT_BASE/latest_summary.txt"
+PYHOST
+chmod +x "$HOST_FETCH_SCRIPT"
+
+# ----------------------------------------------------------------------------
+# Step 3: Fetch now
+# ----------------------------------------------------------------------------
+echo "▶️ Step 3: Run fetch now and sync to container"
+set +e
+DATE_FROM="$(date +%F)" DATE_TO="$(date +%F)" QUEUES="$QUEUES" THRESHOLD="$THRESHOLD" MAX_LINES="$MAX_LINES" "$HOST_FETCH_SCRIPT" > "$OUT_DIR/fetch_now.txt" 2>&1
+FETCH_RC=$?
+set -e
+cat "$OUT_DIR/fetch_now.txt"
+
+if [[ $FETCH_RC -ne 0 ]]; then
+  echo "❌ Fetch failed. If it asked for password, run again and enter Elastix root password, or fix SSH key."
+  echo "راجع: $OUT_DIR/fetch_now.txt"
+  exit 1
+fi
+
+# ----------------------------------------------------------------------------
+# Step 4: Cron if RSA key works
+# ----------------------------------------------------------------------------
+echo "🕒 Step 4: Install/repair cron if RSA key works"
+set +e
+ssh "${SSH_BASE_OPTS[@]}" -o BatchMode=yes "$ELASTIX_SSH" "test -r '$QUEUE_LOG'" >/dev/null 2>&1
+CRON_SSH_OK=$?
+set -e
+if [[ "$INSTALL_CRON" == "1" && $CRON_SSH_OK -eq 0 ]]; then
+  cat > /etc/cron.d/roshdy_queue_journey <<EOF
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+*/$CRON_MINUTES * * * * root /bin/bash -lc 'source "$CONF_FILE"; DATE_FROM=\$(date +\%F) DATE_TO=\$(date +\%F) "$HOST_FETCH_SCRIPT" >> "$LOG_DIR/roshdy_queue_journey_cron.log" 2>&1'
+EOF
+  chmod 0644 /etc/cron.d/roshdy_queue_journey
+  echo "✅ Cron installed: /etc/cron.d/roshdy_queue_journey"
+elif [[ "$INSTALL_CRON" == "1" ]]; then
+  echo "⚠️ Cron not installed because passwordless SSH still not ready."
+  echo "لكن fetch اليدوي نجح وسنصلح الصفحة الآن."
+else
+  echo "ℹ️ INSTALL_CRON=0; cron skipped."
+fi
+
+# ----------------------------------------------------------------------------
+# Step 5: Restart/cache and validate
+# ----------------------------------------------------------------------------
+echo "🧹 Step 5: Clear cache + restart ERP services"
+bench_exec clear-cache || true
+"${COMPOSE[@]}" restart backend frontend websocket queue-short queue-long scheduler >/dev/null
+sleep 8
+bench_exec clear-cache || true
+
+echo "🧪 Step 6: Validate API/page/email"
+set +e
+for p in queue-journey-report admin-desk email-report-customizer call-report; do
+  code="$(curl -k -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$p" 2>/dev/null || echo 000)"
+  echo "$p => $code" | tee -a "$OUT_DIR/page_smoke_checks.txt"
+done
+bench_exec execute restaurant_ops.api.queue_journey_api.debug_queue_journey_status | tee "$OUT_DIR/debug_queue_journey_status.txt"
+V1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_journey_api.get_queue_journey_report | tee "$OUT_DIR/get_queue_journey_report.txt"
+V2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.upper_management_email_api.verify_queue_journey_in_upper_email | tee "$OUT_DIR/verify_queue_journey_in_upper_email.txt"
+V3=${PIPESTATUS[0]}
+set -e
+
+if [[ $V1 -ne 0 || $V2 -ne 0 || $V3 -ne 0 ]]; then
+  echo "❌ ERP validation failed. راجع: $OUT_DIR"
+  exit 1
+fi
+
+echo "🏥 Step 7: Health Check - Elastix/CDR/AMI + Queue + Call Report"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$OUT_DIR/health_asterisk_bridge.txt"
+H1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status | tee "$OUT_DIR/health_queue_status.txt"
+H2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' | tee "$OUT_DIR/health_call_report.txt"
+H3=${PIPESTATUS[0]}
+set -e
+
+if [[ $H1 -ne 0 || $H2 -ne 0 || $H3 -ne 0 ]]; then
+  echo "⚠️ Health returned non-zero. راجع: $OUT_DIR"
+else
+  echo "✅ Health checks OK"
+fi
+
+echo "============================================================"
+echo "✅ DONE V22"
+echo "📁 Output: $OUT_DIR"
+echo "📁 Host journey cache: $HOST_JOURNEY_DIR"
+echo "📁 Container journey cache: $CONTAINER_JOURNEY_DIR"
+echo "🌐 افتح /queue-journey-report واعمل Ctrl+F5"
+echo "لازم تشوف Journey source بدل Fallback source."
+echo "============================================================"

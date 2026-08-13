@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# fix-sales-agent-name
+# Small safe patch:
+# - Fix /sales-report employee names by joining Sales Entry.agent to Employee.name OR Employee.user_id.
+# - Fix employee filter values in /sales-report to use Employee.name, because Sales Entry.agent currently stores HR-EMP-xxxxx.
+# - Does NOT touch report_api.py / CDR / Elastix.
+
+ROOT="/opt/frappe_crm"
+SITE="crm.local"
+APP_HOST="$ROOT/apps/restaurant_ops"
+APP_DIR="$APP_HOST/restaurant_ops"
+API_FILE="$APP_DIR/api/ops_reports_api.py"
+SALES_PAGE="$APP_DIR/www/sales-report.html"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/FIX_SALES_AGENT_NAME_BEFORE_$TS"
+
+say(){ echo -e "\n============================================================\n$1\n============================================================"; }
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo "❌ شغّل كـ root: sudo -i ثم ./fix-sales-agent-name"
+  exit 1
+fi
+
+say "1) Backup"
+cd "$ROOT"
+BACKEND="$(docker compose ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ لم أجد backend container. شغّل: cd /opt/frappe_crm && docker compose up -d"
+  exit 1
+fi
+mkdir -p "$BACKUP_DIR"
+cp -a "$API_FILE" "$BACKUP_DIR/ops_reports_api.py.bak" 2>/dev/null || true
+cp -a "$SALES_PAGE" "$BACKUP_DIR/sales-report.html.bak" 2>/dev/null || true
+echo "✅ Backup: $BACKUP_DIR"
+
+say "2) Patch ops_reports_api.get_sales_report with final override"
+cat >> "$API_FILE" <<'PY'
+
+# ===== ROSHDY SALES AGENT NAME FINAL OVERRIDE START =====
+@frappe.whitelist(allow_guest=False)
+def get_sales_report(date_from=None, date_to=None, start_time="00:00", end_time="23:59", agent="", item=""):
+    if not _allowed(): return _deny()
+    start_dt,end_dt=_period(date_from,date_to,start_time,end_time)
+    where=["s.sale_date >= %s", "s.sale_date <= %s"]
+    vals=[start_dt,end_dt]
+    if agent:
+        where.append("(s.agent=%s OR e.name=%s OR e.user_id=%s)")
+        vals += [agent, agent, agent]
+    if item:
+        where.append("(s.item=%s OR i.item_name like %s)")
+        vals += [item, '%'+item+'%']
+    sql=f"""
+        SELECT s.name,s.agent,e.employee_name,s.sale_date,s.item,COALESCE(i.item_name,s.item) item_name,COALESCE(i.item_category,i.category,'') item_category,
+               s.quantity,s.customer_name,s.customer_phone,s.notes,s.owner,s.creation
+        FROM `tabSales Entry` s
+        LEFT JOIN `tabSales Item` i ON s.item=i.name
+        LEFT JOIN `tabEmployee` e ON (s.agent=e.name OR s.agent=e.user_id)
+        WHERE {' AND '.join(where)} ORDER BY s.sale_date DESC,s.creation DESC
+    """
+    rows=frappe.db.sql(sql, vals, as_dict=True)
+    for r in rows:
+        r['quantity']=int(r.get('quantity') or 0)
+        r['sale_date_text']=_dtstr(r.get('sale_date'))
+        r['employee_name']=r.get('employee_name') or r.get('agent') or 'غير محدد'
+    by_agent={}; by_item={}
+    for r in rows:
+        ag=r.get('employee_name') or r.get('agent') or 'غير محدد'
+        it=r.get('item_name') or r.get('item') or 'غير محدد'
+        qty=int(r.get('quantity') or 0)
+        by_agent.setdefault(ag, {'agent':r.get('agent'), 'employee_name':ag, 'orders':0, 'quantity':0})
+        by_agent[ag]['orders'] += 1
+        by_agent[ag]['quantity'] += qty
+        by_item.setdefault(it, {'item_name':it, 'orders':0, 'quantity':0})
+        by_item[it]['orders'] += 1
+        by_item[it]['quantity'] += qty
+    return {"success":True,"period":{"start":_dtstr(start_dt),"end":_dtstr(end_dt)},"summary":{"total_operations":len(rows),"total_quantity":sum(int(r.get('quantity') or 0) for r in rows),"unique_agents":len(by_agent),"unique_items":len(by_item)},"by_agent":list(by_agent.values()),"by_item":list(by_item.values()),"rows":rows,"csv":_csv(rows)}
+# ===== ROSHDY SALES AGENT NAME FINAL OVERRIDE END =====
+PY
+chmod 644 "$API_FILE"
+
+say "3) Patch /sales-report employee dropdown values"
+python3 - <<'PY'
+from pathlib import Path
+p=Path('/opt/frappe_crm/apps/restaurant_ops/restaurant_ops/www/sales-report.html')
+s=p.read_text(errors='ignore')
+# In previous page code, employee dropdown option value used e.user_id. Sales Entry.agent stores Employee.name.
+s=s.replace("'<option value=\"'+e.user_id+'\">'+e.employee_name+'</option>'", "'<option value=\"'+e.name+'\">'+e.employee_name+'</option>'")
+s=s.replace('"<option value=\\""+e.user_id+"\\">"+e.employee_name+"</option>"', '"<option value=\\""+e.name+"\\">"+e.employee_name+"</option>"')
+# Best-effort generic replacement for compact JS.
+s=s.replace("value=\"'+e.user_id+'\"", "value=\"'+e.name+'\"")
+p.write_text(s)
+print('✅ sales-report dropdown patched')
+PY
+
+say "4) Clear cache/restart"
+docker exec "$BACKEND" bash -lc "find /home/frappe/frappe-bench/apps/restaurant_ops -name '*.pyc' -delete; find /home/frappe/frappe-bench/apps/restaurant_ops -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true"
+docker exec "$BACKEND" bench --site "$SITE" clear-cache || true
+docker exec "$BACKEND" bench --site "$SITE" clear-website-cache || true
+docker compose restart backend frontend websocket
+sleep 8
+BACKEND="$(docker compose ps -q backend)"
+
+say "5) Validation"
+echo "--- sales API ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.ops_reports_api.get_sales_report --kwargs '{"date_from":"2026-08-06","date_to":"2026-08-06"}' || true
+
+echo "--- page status ---"
+for page in sales-report break-admin call-report admin-desk; do
+  code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$page" || true)"
+  echo "$page => $code"
+done
+
+say "6) Health Check"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics || true
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.queue_api.get_queue_status || true
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' || true
+
+say "✅ Sales employee name fixed"
+echo "افتح /sales-report واعمل Ctrl+F5. المفروض يظهر Omar Elboghdady بدل HR-EMP-00003."
+echo "Backup: $BACKUP_DIR"

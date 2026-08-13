@@ -1,0 +1,323 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Roshdy V36: Fix Center Manager email send error: 'str' object has no attribute 'get'
+# -----------------------------------------------------------------------------
+# Cause:
+#   A previous feedback wrapper made _adv_render('center') return an HTML string,
+#   while send_center_manager_report expected a dict with {'html': ...}.
+# Fix:
+#   Add final robust wrappers in email_report.py:
+#   - _adv_render preserves dict return type
+#   - send_center_manager_report handles dict OR string safely
+#   - send_report_now('both') sends center + upper independently
+# Safety:
+#   - Backup first.
+#   - Does NOT edit report_api.py.
+#   - Does NOT touch Elastix/CDR/AMI.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+RUN_SEND_TEST="${RUN_SEND_TEST:-0}"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "❌ docker compose/docker-compose مش موجود"
+  exit 1
+fi
+
+APP_DIR="$ROOT/apps/$APP"
+PKG_DIR="$APP_DIR/$APP"
+API_DIR="$PKG_DIR/api"
+EMAIL_REPORT="$API_DIR/email_report.py"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/FIX_CENTER_EMAIL_SEND_STR_OBJECT_V36_BEFORE_$TS"
+mkdir -p "$BACKUP_DIR"
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend container مش شغال أو مش لاقيه"
+  exit 1
+fi
+
+bench_exec() { "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"; }
+
+echo "============================================================"
+echo "🔧 Roshdy V36: Fix Center email send str/dict compatibility"
+echo "📦 Backup: $BACKUP_DIR"
+echo "============================================================"
+
+if [[ ! -f "$EMAIL_REPORT" ]]; then
+  echo "❌ مش لاقي email_report.py: $EMAIL_REPORT"
+  exit 1
+fi
+
+echo "🧯 Step 1: Backup file + bench backup"
+cp -a "$EMAIL_REPORT" "$BACKUP_DIR/email_report.py.before"
+bench_exec backup --with-files | tee "$BACKUP_DIR/bench_backup_output.txt"
+
+echo "🧩 Step 2: Patch email_report.py final robust center sender"
+export EMAIL_REPORT
+python3 - <<'PY'
+# -*- coding: utf-8 -*-
+from pathlib import Path
+import os
+p = Path(os.environ['EMAIL_REPORT'])
+s = p.read_text(encoding='utf-8', errors='ignore')
+start = '# BEGIN ROSHDY CENTER EMAIL SEND FIX V36'
+end = '# END ROSHDY CENTER EMAIL SEND FIX V36'
+patch = r'''
+# BEGIN ROSHDY CENTER EMAIL SEND FIX V36
+# Final compatibility fix for center manager email.
+# Some previous wrappers returned HTML string while sender expected dict.get('html').
+try:
+    import frappe
+    from frappe.utils import today, cstr
+except Exception:
+    frappe = None
+
+# Capture available base renderers before overriding.
+try:
+    _v36_base_adv_render = _fbc28_prev_adv_render
+except Exception:
+    try:
+        _v36_base_adv_render = _fbc27_prev_adv_render
+    except Exception:
+        try:
+            _v36_base_adv_render = _adv_render
+        except Exception:
+            _v36_base_adv_render = None
+
+try:
+    _v36_base_center_build = _fbc28_prev_build_center_manager_report
+except Exception:
+    try:
+        _v36_base_center_build = _fbc27_prev_build_center_manager_report
+    except Exception:
+        try:
+            _v36_base_center_build = build_center_manager_report
+        except Exception:
+            _v36_base_center_build = None
+
+
+def _v36_inject_feedback_if_needed(html, date_from=None, date_to=None):
+    html = cstr(html or "")
+    if "ROSHDY_FEEDBACK_EMAIL_SECTION_V28" in html or "ROSHDY_FEEDBACK_EMAIL_SECTION_V27" in html:
+        return html
+    section = ""
+    try:
+        if '_fbc28_section' in globals() and callable(_fbc28_section):
+            section = _fbc28_section(date_from or today(), date_to or date_from or today())
+        elif '_fbc27_section' in globals() and callable(_fbc27_section):
+            section = _fbc27_section(date_from or today(), date_to or date_from or today())
+    except Exception:
+        section = ""
+    if not section:
+        return html
+    if "</body>" in html:
+        return html.replace("</body>", section + "</body>")
+    return html + section
+
+
+def _v36_render_any_to_dict(rendered, report_type="center"):
+    if isinstance(rendered, dict):
+        out = dict(rendered)
+        html = cstr(out.get("html") or "")
+        if cstr(report_type).lower() in ("center", "manager", "customer_service", "service", "مدير خدمة العملاء"):
+            html = _v36_inject_feedback_if_needed(html, today(), today())
+        out["html"] = html
+        out.setdefault("success", True if html else False)
+        return out
+    html = cstr(rendered or "")
+    if cstr(report_type).lower() in ("center", "manager", "customer_service", "service", "مدير خدمة العملاء"):
+        html = _v36_inject_feedback_if_needed(html, today(), today())
+    return {"success": True if html else False, "html": html}
+
+
+def _adv_render(report_type="center"):
+    """Final renderer preserving dict return type."""
+    rt = cstr(report_type or "center")
+    rendered = None
+    errors = []
+    for fn in (_v36_base_adv_render,):
+        if callable(fn):
+            try:
+                rendered = fn(rt)
+                return _v36_render_any_to_dict(rendered, rt)
+            except Exception as e:
+                errors.append(cstr(e))
+    # Fallback to standard/custom renderer if available.
+    try:
+        if '_er_render_report' in globals() and callable(_er_render_report):
+            rendered = _er_render_report(rt)
+            return _v36_render_any_to_dict(rendered, rt)
+    except Exception as e:
+        errors.append(cstr(e))
+    # Fallback to legacy center build for center only.
+    if rt.lower() in ("center", "manager", "customer_service", "service", "مدير خدمة العملاء") and callable(_v36_base_center_build):
+        try:
+            rendered = _v36_base_center_build()
+            return _v36_render_any_to_dict(rendered, rt)
+        except Exception as e:
+            errors.append(cstr(e))
+    return {"success": False, "html": "", "message": "Render failed: " + " | ".join(errors)}
+
+
+def _v36_recipients_for_center(settings=None):
+    settings = settings or frappe.get_single("Call Center Settings")
+    st = {}
+    try:
+        st = _adv_get()
+    except Exception:
+        st = {}
+    # Prefer existing helper.
+    try:
+        if '_adv_recipients_for' in globals() and callable(_adv_recipients_for):
+            rec = _adv_recipients_for(settings, "center", st)
+            if rec:
+                return rec
+    except Exception:
+        pass
+    raw = ""
+    for field in ("center_manager_recipients", "customer_service_manager_recipients", "daily_report_recipients", "report_recipients"):
+        try:
+            val = getattr(settings, field, None)
+            if val:
+                raw = val
+                break
+        except Exception:
+            pass
+    if not raw:
+        raw = st.get("center_recipients_override") or ""
+    try:
+        if '_adv_recipients' in globals() and callable(_adv_recipients):
+            return _adv_recipients(raw)
+    except Exception:
+        pass
+    import re
+    return re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", cstr(raw))
+
+
+def send_center_manager_report(settings=None) -> dict:
+    try:
+        settings = settings or frappe.get_single("Call Center Settings")
+        recipients = _v36_recipients_for_center(settings)
+        if not recipients:
+            return {"success": False, "message": "No center recipients"}
+        rendered = _adv_render("center")
+        html = rendered.get("html") if isinstance(rendered, dict) else cstr(rendered or "")
+        if not html:
+            return {"success": False, "message": "Center report rendered empty", "rendered": rendered}
+        try:
+            st = _adv_get()
+            title = st.get("center_title") or "تقرير مدير خدمة العملاء"
+        except Exception:
+            title = "تقرير مدير خدمة العملاء"
+        subject = f"📋 {title} — {today()}"
+        frappe.sendmail(recipients=recipients, subject=subject, message=html, now=True)
+        return {"success": True, "message": f"sent to {len(recipients)}", "recipients": recipients, "subject": subject}
+    except Exception as e:
+        return {"success": False, "message": cstr(e)}
+
+
+@frappe.whitelist()
+def send_report_now(report_type="both", **kwargs) -> dict:
+    try:
+        settings = frappe.get_single("Call Center Settings")
+        rt = cstr(report_type or kwargs.get("report_type") or "both").lower()
+        if rt in ("center", "service", "manager", "customer_service"):
+            return send_center_manager_report(settings)
+        if rt in ("upper", "management", "upper_management"):
+            from restaurant_ops.api.upper_management_email_api import send_upper_management_report
+            return send_upper_management_report(**kwargs)
+        center = send_center_manager_report(settings)
+        try:
+            from restaurant_ops.api.upper_management_email_api import send_upper_management_report
+            upper = send_upper_management_report(**kwargs)
+        except Exception as e:
+            upper = {"success": False, "message": cstr(e)}
+        ok = bool(center.get("success")) and bool(upper.get("success"))
+        return {"success": ok, "message": f"Center: {center.get('message')} | Upper: {upper.get('message')}", "center": center, "upper": upper}
+    except Exception as e:
+        return {"success": False, "message": cstr(e)}
+
+
+@frappe.whitelist()
+def debug_center_email_v36():
+    settings = frappe.get_single("Call Center Settings")
+    rec = _v36_recipients_for_center(settings)
+    rendered = _adv_render("center")
+    html = rendered.get("html") if isinstance(rendered, dict) else cstr(rendered or "")
+    return {"success": True, "recipients": rec, "recipients_count": len(rec), "render_type": type(rendered).__name__, "html_len": len(html), "has_feedback": "ROSHDY_FEEDBACK_EMAIL_SECTION" in html, "has_journey": "رحلة محاولات" in html or "محاولات الرن" in html, "render_success": rendered.get("success") if isinstance(rendered, dict) else True}
+# END ROSHDY CENTER EMAIL SEND FIX V36
+'''
+if start in s and end in s:
+    i = s.index(start)
+    j = s.index(end, i) + len(end)
+    s = s[:i] + patch.strip() + s[j:]
+else:
+    s = s.rstrip() + "\n\n" + patch.strip() + "\n"
+compile(s, str(p), "exec")
+p.write_text(s, encoding="utf-8")
+PY
+
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+[[ -n "$APP_OWNER" ]] && chown "$APP_OWNER" "$EMAIL_REPORT" 2>/dev/null || true
+
+echo "🧹 Step 3: Clear cache + restart app services"
+bench_exec clear-cache || true
+"${COMPOSE[@]}" restart backend frontend websocket queue-short queue-long scheduler >/dev/null
+sleep 8
+bench_exec clear-cache || true
+
+echo "🧪 Step 4: Validation"
+set +e
+bench_exec execute restaurant_ops.api.email_report.debug_center_email_v36 | tee "$BACKUP_DIR/debug_center_email_v36.txt"
+V1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.email_report.preview_email_report --kwargs '{"report_type":"center"}' > "$BACKUP_DIR/preview_center_v36.txt" 2>&1
+V2=$?
+head -c 1000 "$BACKUP_DIR/preview_center_v36.txt" | tee "$BACKUP_DIR/preview_center_v36_head.txt"
+echo
+if [[ "$RUN_SEND_TEST" == "1" ]]; then
+  bench_exec execute restaurant_ops.api.email_report.send_report_now --kwargs '{"report_type":"both"}' | tee "$BACKUP_DIR/send_report_now_both_v36.txt"
+  V3=${PIPESTATUS[0]}
+else
+  echo "ℹ️ RUN_SEND_TEST=0, skipped real email send."
+  V3=0
+fi
+set -e
+
+if [[ $V1 -ne 0 || $V2 -ne 0 || $V3 -ne 0 ]]; then
+  echo "❌ Validation failed. راجع: $BACKUP_DIR"
+  exit 1
+fi
+
+echo "🏥 Step 5: Health Check - Elastix/CDR/AMI + Queue + Call Report"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$BACKUP_DIR/health_asterisk_bridge.txt"
+H1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status | tee "$BACKUP_DIR/health_queue_status.txt"
+H2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' | tee "$BACKUP_DIR/health_call_report.txt"
+H3=${PIPESTATUS[0]}
+set -e
+
+if [[ $H1 -ne 0 || $H2 -ne 0 || $H3 -ne 0 ]]; then
+  echo "⚠️ Health returned non-zero. راجع: $BACKUP_DIR"
+else
+  echo "✅ Health checks OK"
+fi
+
+echo "============================================================"
+echo "✅ DONE V36"
+echo "📦 Backup folder: $BACKUP_DIR"
+echo "📧 Center email send str/dict issue fixed"
+echo "لتجربة إرسال فعلي: RUN_SEND_TEST=1 ./fix-center-email-send-str-object-v36"
+echo "🛡️ report_api.py / Elastix / CDR / AMI untouched"
+echo "============================================================"

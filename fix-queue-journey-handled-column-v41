@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Roshdy V41: Queue Journey handled-by column polish
+# ----------------------------------------------------------------------
+# User feedback:
+# - Rename "مصير المحاولة بعد الرن" to "تم الرد من خلال".
+# - Remove duplicated column "تم التعامل لاحقًا بواسطة".
+# Applies to:
+# - /queue-journey-report
+# - Upper Management email
+# - Customer Service Manager email
+# Safety:
+# - Backup first.
+# - Does NOT edit report_api.py.
+# - Does NOT touch Elastix / CDR / AMI config.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "❌ docker compose/docker-compose مش موجود"
+  exit 1
+fi
+
+APP_DIR="$ROOT/apps/$APP"
+PKG_DIR="$APP_DIR/$APP"
+API_DIR="$PKG_DIR/api"
+WWW_DIR="$PKG_DIR/www"
+QUEUE_API="$API_DIR/queue_journey_api.py"
+UPPER_API="$API_DIR/upper_management_email_api.py"
+EMAIL_REPORT="$API_DIR/email_report.py"
+PAGE_HTML="$WWW_DIR/queue-journey-report.html"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/FIX_QUEUE_JOURNEY_HANDLED_COLUMN_V41_BEFORE_$TS"
+mkdir -p "$BACKUP_DIR/files"
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend container مش شغال أو مش لاقيه"
+  exit 1
+fi
+
+bench_exec() { "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"; }
+
+echo "============================================================"
+echo "🔧 Roshdy V41: Queue Journey handled-by column polish"
+echo "📦 Backup: $BACKUP_DIR"
+echo "============================================================"
+
+echo "🧯 Step 1: Backup files + bench backup"
+for f in "$QUEUE_API" "$UPPER_API" "$EMAIL_REPORT" "$PAGE_HTML"; do
+  [[ -e "$f" ]] && cp -a "$f" "$BACKUP_DIR/files/$(basename "$f").before" || true
+done
+bench_exec backup --with-files | tee "$BACKUP_DIR/bench_backup_output.txt"
+
+# -----------------------------------------------------------------------------
+# 2) API enrich field: handled_by_text
+# -----------------------------------------------------------------------------
+echo "🧩 Step 2: Patch queue_journey_api.py"
+cat >> "$QUEUE_API" <<'PYAPI'
+
+# BEGIN ROSHDY QUEUE JOURNEY HANDLED COLUMN V41
+try:
+    import frappe
+    from frappe.utils import cstr, today
+except Exception:
+    pass
+
+try:
+    _qj41_prev_get_queue_journey_report = get_queue_journey_report
+except Exception:
+    _qj41_prev_get_queue_journey_report = None
+
+
+def _qj41_handled_by_text(row):
+    row = row or {}
+    fate = cstr(row.get("fate") or "")
+    missed_ext = cstr(row.get("missed_extension") or "")
+    ans_ext = cstr(row.get("answered_extension") or "")
+    ans_emp = cstr(row.get("answered_employee") or "")
+    if fate == "answered_later_same_extension":
+        if ans_emp:
+            return ans_emp + " (نفس التحويلة)"
+        if ans_ext:
+            return "نفس التحويلة " + ans_ext
+        if missed_ext:
+            return "نفس التحويلة " + missed_ext
+        return "تم الرد لاحقًا من نفس التحويلة"
+    if fate == "answered_later_other_extension":
+        if ans_emp:
+            return ans_emp
+        if ans_ext:
+            return "تحويلة " + ans_ext
+        return "تم الرد لاحقًا"
+    if fate == "customer_abandoned_after_attempt":
+        return "العميل أغلق بعد المحاولة"
+    if fate in ("timeout_after_attempt_no_final_connect_seen", "completed_after_attempt_connect_missing", "unknown_after_attempt"):
+        return "مصير غير محسوم"
+    if fate == "journey_unavailable":
+        return "مصير غير متاح"
+    return cstr(row.get("fate_label") or "مصير غير محسوم")
+
+
+@frappe.whitelist()
+def get_queue_journey_report(date_from=None, date_to=None, threshold=15, queues=None, mask_phones=0, limit_rows=500):
+    if not _qj41_prev_get_queue_journey_report:
+        return {"success": False, "message": "Base queue journey report missing"}
+    data = _qj41_prev_get_queue_journey_report(date_from=date_from, date_to=date_to, threshold=threshold, queues=queues, mask_phones=mask_phones, limit_rows=limit_rows)
+    try:
+        rows = []
+        for r in data.get("rows") or []:
+            r = dict(r)
+            r["handled_by_text"] = _qj41_handled_by_text(r)
+            rows.append(r)
+        data["rows"] = rows
+        if data.get("attempt_rows_sample"):
+            data["attempt_rows_sample"] = [dict(r, handled_by_text=_qj41_handled_by_text(r)) for r in data.get("attempt_rows_sample")]
+    except Exception as e:
+        data["handled_column_error"] = cstr(e)
+    return data
+
+
+@frappe.whitelist()
+def debug_queue_journey_handled_column_v41(date_from=None, date_to=None):
+    d = get_queue_journey_report(date_from=date_from or today(), date_to=date_to or date_from or today(), threshold=15, limit_rows=20)
+    return {"success": True, "summary": d.get("summary"), "rows_sample": d.get("rows", [])[:10]}
+# END ROSHDY QUEUE JOURNEY HANDLED COLUMN V41
+PYAPI
+
+# -----------------------------------------------------------------------------
+# 3) Patch existing page/email source text to remove duplicated column.
+# -----------------------------------------------------------------------------
+echo "🧩 Step 3: Patch page and email templates"
+export PAGE_HTML UPPER_API EMAIL_REPORT
+python3 - <<'PY'
+from pathlib import Path
+import os, re
+
+page = Path(os.environ['PAGE_HTML'])
+upper = Path(os.environ['UPPER_API'])
+center = Path(os.environ['EMAIL_REPORT'])
+
+# Page HTML replacements.
+if page.exists():
+    s = page.read_text(encoding='utf-8', errors='ignore')
+    # Header labels.
+    s = s.replace('مصير المحاولة بعد الرن', 'تم الرد من خلال')
+    s = s.replace('تم التعامل لاحقًا بواسطة', '')
+    # Specific V40 header row: remove the duplicate answered-by header.
+    s = s.replace(
+        "<th>بداية الرن التقريبية</th><th>انتهاء الرن بدون رد</th><th>الطابور</th><th>رقم العميل</th><th>لم يرد على الرن</th><th>التحويلة</th><th>مدة الرن</th><th>تم الرد من خلال</th><th></th><th>وقت الرد اللاحق</th><th>المدة حتى الرد</th>",
+        "<th>بداية الرن التقريبية</th><th>انتهاء الرن بدون رد</th><th>الطابور</th><th>رقم العميل</th><th>لم يرد على الرن</th><th>التحويلة</th><th>مدة الرن</th><th>تم الرد من خلال</th><th>وقت الرد اللاحق</th><th>المدة حتى الرد</th>"
+    )
+    # If old literal still exists.
+    s = s.replace(
+        "<th>بداية الرن التقريبية</th><th>انتهاء الرن بدون رد</th><th>الطابور</th><th>رقم العميل</th><th>لم يرد على الرن</th><th>التحويلة</th><th>مدة الرن</th><th>مصير المحاولة بعد الرن</th><th>تم التعامل لاحقًا بواسطة</th><th>وقت الرد اللاحق</th><th>المدة حتى الرد</th>",
+        "<th>بداية الرن التقريبية</th><th>انتهاء الرن بدون رد</th><th>الطابور</th><th>رقم العميل</th><th>لم يرد على الرن</th><th>التحويلة</th><th>مدة الرن</th><th>تم الرد من خلال</th><th>وقت الرد اللاحق</th><th>المدة حتى الرد</th>"
+    )
+    # Row rendering: replace fate + answered column with handled_by_text only.
+    s = s.replace(
+        "+'<td>'+esc(r.fate_label)+'</td><td>'+esc(r.answered_employee||r.answered_extension)+'</td><td>'+esc(r.response_time)+'</td><td>'+esc(r.response_after_text)+'</td></tr>'",
+        "+'<td>'+esc(r.handled_by_text||r.fate_label)+'</td><td>'+esc(r.response_time)+'</td><td>'+esc(r.response_after_text)+'</td></tr>'"
+    )
+    s = s.replace(
+        "+'<td>'+esc(r.fate_label)+'</td><td>'+esc(r.answered_employee||r.answered_extension)+'</td><td>'+esc(r.fate_time)+'</td></tr>'",
+        "+'<td>'+esc(r.handled_by_text||r.fate_label)+'</td><td>'+esc(r.fate_time)+'</td></tr>'"
+    )
+    # CSV headers/rows.
+    s = s.replace("'fate','answered_by','fate_time'", "'handled_by','fate_time'")
+    s = s.replace("'fate','answered_by','fate_time','callid'", "'handled_by','fate_time','callid'")
+    s = s.replace("r.fate_label,r.answered_employee||r.answered_extension,r.fate_time", "r.handled_by_text||r.fate_label,r.fate_time")
+    s = s.replace("r.fate_label,r.answered_employee||r.answered_extension,r.response_time,r.response_after_text", "r.handled_by_text||r.fate_label,r.response_time,r.response_after_text")
+    page.write_text(s, encoding='utf-8')
+
+# Python modules: patch source text in appended V40/V23 blocks.
+for p in (upper, center):
+    if not p.exists():
+        continue
+    s = p.read_text(encoding='utf-8', errors='ignore')
+    s = s.replace('مصير المحاولة بعد الرن', 'تم الرد من خلال')
+    s = s.replace('تم التعامل لاحقًا بواسطة', '')
+    # Header arrays: remove duplicate empty/answered-by column.
+    s = s.replace(
+        "['بداية الرن التقريبية','انتهاء الرن بدون رد','رقم العميل','لم يرد على الرن','التحويلة','مدة الرن','تم الرد من خلال','تم التعامل لاحقًا بواسطة','وقت الرد اللاحق','المدة حتى الرد']",
+        "['بداية الرن التقريبية','انتهاء الرن بدون رد','رقم العميل','لم يرد على الرن','التحويلة','مدة الرن','تم الرد من خلال','وقت الرد اللاحق','المدة حتى الرد']"
+    )
+    s = s.replace(
+        "['بداية الرن التقريبية','انتهاء الرن بدون رد','رقم العميل','لم يرد على الرن','التحويلة','مدة الرن','تم الرد من خلال','','وقت الرد اللاحق','المدة حتى الرد']",
+        "['بداية الرن التقريبية','انتهاء الرن بدون رد','رقم العميل','لم يرد على الرن','التحويلة','مدة الرن','تم الرد من خلال','وقت الرد اللاحق','المدة حتى الرد']"
+    )
+    s = s.replace(
+        "['بداية الرن التقريبية','انتهاء الرن بدون رد','رقم العميل','لم يرد على الرن','التحويلة','مدة الرن','مصير المحاولة بعد الرن','تم التعامل لاحقًا بواسطة','وقت الرد اللاحق','المدة حتى الرد']",
+        "['بداية الرن التقريبية','انتهاء الرن بدون رد','رقم العميل','لم يرد على الرن','التحويلة','مدة الرن','تم الرد من خلال','وقت الرد اللاحق','المدة حتى الرد']"
+    )
+    # Row f-strings in upper V40.
+    s = s.replace(
+        "{_uj40_td(r.get('fate_label'),True)}{_uj40_td(r.get('answered_employee') or r.get('answered_extension'))}{_uj40_td(r.get('response_time'))}{_uj40_td(r.get('response_after_text'))}",
+        "{_uj40_td(r.get('handled_by_text') or r.get('fate_label'),True)}{_uj40_td(r.get('response_time'))}{_uj40_td(r.get('response_after_text'))}"
+    )
+    # Row list in center V40.
+    s = s.replace(
+        "r.get('fate_label'), r.get('answered_employee') or r.get('answered_extension'), r.get('response_time'), r.get('response_after_text')",
+        "r.get('handled_by_text') or r.get('fate_label'), r.get('response_time'), r.get('response_after_text')"
+    )
+    # V23 center/upper older row list.
+    s = s.replace(
+        "r.get('fate_label'), r.get('answered_employee') or r.get('answered_extension')",
+        "r.get('handled_by_text') or r.get('fate_label')"
+    )
+    p.write_text(s, encoding='utf-8')
+PY
+
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+[[ -n "$APP_OWNER" ]] && chown "$APP_OWNER" "$QUEUE_API" "$UPPER_API" "$EMAIL_REPORT" "$PAGE_HTML" 2>/dev/null || true
+
+echo "🧹 Step 4: Clear cache + restart app services"
+bench_exec clear-cache || true
+"${COMPOSE[@]}" restart backend frontend websocket queue-short queue-long scheduler >/dev/null
+sleep 8
+bench_exec clear-cache || true
+
+echo "🧪 Step 5: Validation"
+set +e
+bench_exec execute restaurant_ops.api.queue_journey_api.debug_queue_journey_handled_column_v41 | tee "$BACKUP_DIR/debug_queue_journey_handled_column_v41.txt"
+V1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.upper_management_email_api.preview_upper_management_report > "$BACKUP_DIR/preview_upper_v41.txt" 2>&1
+V2=$?
+bench_exec execute restaurant_ops.api.email_report.debug_center_journey_time_columns_v40 | tee "$BACKUP_DIR/debug_center_journey_time_columns_after_v41.txt"
+V3=${PIPESTATUS[0]}
+for p in queue-journey-report email-report-customizer call-report; do
+  code="$(curl -k -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$p" 2>/dev/null || echo 000)"
+  echo "$p => $code" | tee -a "$BACKUP_DIR/page_smoke_checks_v41.txt"
+done
+set -e
+
+if [[ $V1 -ne 0 || $V2 -ne 0 || $V3 -ne 0 ]]; then
+  echo "❌ Validation failed. راجع: $BACKUP_DIR"
+  exit 1
+fi
+
+if grep -q "تم التعامل لاحقًا بواسطة" "$BACKUP_DIR/preview_upper_v41.txt" 2>/dev/null; then
+  echo "⚠️ لسه عبارة تم التعامل لاحقًا بواسطة موجودة في preview. راجع: $BACKUP_DIR/preview_upper_v41.txt"
+else
+  echo "✅ Upper preview no longer has duplicate handled-by column text"
+fi
+
+echo "🏥 Step 6: Health Check - Elastix/CDR/AMI + Queue + Call Report"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$BACKUP_DIR/health_asterisk_bridge.txt"
+H1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status | tee "$BACKUP_DIR/health_queue_status.txt"
+H2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' | tee "$BACKUP_DIR/health_call_report.txt"
+H3=${PIPESTATUS[0]}
+set -e
+
+if [[ $H1 -ne 0 || $H2 -ne 0 || $H3 -ne 0 ]]; then
+  echo "⚠️ Health returned non-zero. راجع: $BACKUP_DIR"
+else
+  echo "✅ Health checks OK"
+fi
+
+echo "============================================================"
+echo "✅ DONE V41"
+echo "📦 Backup folder: $BACKUP_DIR"
+echo "📌 Column renamed to: تم الرد من خلال"
+echo "📌 Duplicate column removed: تم التعامل لاحقًا بواسطة"
+echo "🛡️ report_api.py / Elastix / CDR / AMI untouched"
+echo "============================================================"

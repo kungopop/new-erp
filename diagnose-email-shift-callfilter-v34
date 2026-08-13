@@ -1,0 +1,339 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Roshdy V34 DIAGNOSTIC ONLY
+# ----------------------------------------------------------------------
+# Purpose: safely diagnose before fixing:
+# 1) Test email: why Upper Management may not send while Center Manager sends.
+# 2) Email call metrics: why calls ignore shift time and count from 00:00.
+# 3) Call Report UI: how to add employee filter without touching report_api.py.
+#
+# READ ONLY except it creates a temporary diagnostic module and removes it.
+# It takes snapshots of relevant files and runs bench backup first.
+# It DOES NOT edit report_api.py / Elastix / CDR / AMI.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+DATE_FROM="${DATE_FROM:-$(date +%F)}"
+DATE_TO="${DATE_TO:-$DATE_FROM}"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "❌ docker compose/docker-compose مش موجود"
+  exit 1
+fi
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend container مش شغال أو مش لاقيه"
+  exit 1
+fi
+
+APP_DIR="$ROOT/apps/$APP"
+PKG_DIR="$APP_DIR/$APP"
+API_DIR="$PKG_DIR/api"
+WWW_DIR="$PKG_DIR/www"
+SCRIPTS_DIR="$PKG_DIR/scripts"
+TS="$(date +%Y%m%d_%H%M%S)"
+OUT_DIR="$ROOT/backups/DIAG_EMAIL_SHIFT_CALLFILTER_V34_$TS"
+mkdir -p "$OUT_DIR/files" "$SCRIPTS_DIR"
+
+bench_exec() { "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"; }
+
+echo "============================================================"
+echo "🔎 Roshdy V34 diagnostic only: email/shift/callfilter"
+echo "📦 Output: $OUT_DIR"
+echo "📅 Period: $DATE_FROM to $DATE_TO"
+echo "============================================================"
+
+echo "🧯 Step 1: Snapshot relevant files + bench backup"
+for f in \
+  "$API_DIR/report_api.py" \
+  "$API_DIR/email_report.py" \
+  "$API_DIR/upper_management_email_api.py" \
+  "$API_DIR/queue_journey_api.py" \
+  "$API_DIR/admin_api.py" \
+  "$WWW_DIR/email-report-customizer.html" \
+  "$WWW_DIR/call-report.html" \
+  "$WWW_DIR/settings.html" \
+  "$WWW_DIR/admin-desk.html"; do
+  [[ -e "$f" ]] && cp -a "$f" "$OUT_DIR/files/$(basename "$f").snapshot" || true
+done
+bench_exec backup --with-files | tee "$OUT_DIR/bench_backup_output.txt"
+
+# Grep relevant code references.
+{
+  echo "===== email customizer method calls ====="
+  grep -RIn --exclude='*.pyc' --exclude-dir='__pycache__' \
+    -e "send_report" -e "send.*email" -e "preview" -e "frappe.call" -e "/api/method" \
+    "$WWW_DIR/email-report-customizer.html" "$API_DIR/email_report.py" "$API_DIR/upper_management_email_api.py" 2>/dev/null || true
+  echo
+  echo "===== call report filters/html references ====="
+  grep -RIn --exclude='*.pyc' --exclude-dir='__pycache__' \
+    -e "search" -e "actual_ext" -e "agent" -e "extension" -e "get_calls_report" -e "date_from" -e "smart_category" \
+    "$WWW_DIR/call-report.html" "$API_DIR/report_api.py" 2>/dev/null || true
+  echo
+  echo "===== shift/time settings references ====="
+  grep -RIn --exclude='*.pyc' --exclude-dir='__pycache__' \
+    -e "shift" -e "start_time" -e "end_time" -e "report_start" -e "report_end" -e "daily" \
+    "$WWW_DIR/settings.html" "$WWW_DIR/email-report-customizer.html" "$API_DIR/email_report.py" "$API_DIR/upper_management_email_api.py" 2>/dev/null || true
+} | tee "$OUT_DIR/grep_relevant.txt"
+
+# Temporary Frappe diagnostic module.
+DIAG_MOD="$SCRIPTS_DIR/diagnose_email_shift_callfilter_v34.py"
+cat > "$DIAG_MOD" <<'PY'
+# -*- coding: utf-8 -*-
+import re
+import json
+from datetime import datetime, time, timedelta
+
+import frappe
+from frappe.utils import cstr, cint, flt, getdate, get_datetime, today, now_datetime
+
+
+def _safe(v):
+    try:
+        return cstr(v)
+    except Exception:
+        return str(v)
+
+
+def _parse_time(v):
+    s = cstr(v or "").strip()
+    if not s:
+        return None
+    # Accept HH:MM, HH:MM:SS, timedelta-like, datetime-like
+    m = re.search(r"(\d{1,2}):(\d{2})(?::(\d{2}))?", s)
+    if m:
+        hh, mm, ss = int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            return time(hh, mm, ss)
+    return None
+
+
+def _scan_singles_for_shift():
+    rows=[]
+    try:
+        data = frappe.db.sql("select doctype, field, value from `tabSingles` where value is not null and value!=''", as_dict=True)
+    except Exception as e:
+        return {"error": cstr(e), "rows": []}
+    for r in data:
+        hay = (cstr(r.doctype)+" "+cstr(r.field)).lower()
+        val = cstr(r.value)
+        t = _parse_time(val)
+        score = 0
+        if "shift" in hay: score += 5
+        if "email" in hay or "report" in hay: score += 3
+        if "start" in hay or "from" in hay or "begin" in hay or "بداية" in hay: score += 2
+        if "end" in hay or "to" in hay or "finish" in hay or "نهاية" in hay: score += 2
+        if t: score += 5
+        if score >= 5 and (t or any(x in hay for x in ("shift","report","email"))):
+            rows.append({"doctype": r.doctype, "field": r.field, "value": val, "parsed_time": t.isoformat() if t else None, "score": score})
+    rows.sort(key=lambda x: x["score"], reverse=True)
+    return {"rows": rows[:100]}
+
+
+def _resolve_shift_window(date_from=None, date_to=None):
+    scan = _scan_singles_for_shift().get("rows", [])
+    start_candidates=[]; end_candidates=[]
+    for r in scan:
+        t = _parse_time(r.get("value"))
+        if not t: continue
+        hay = (cstr(r.get("doctype"))+" "+cstr(r.get("field"))).lower()
+        score = r.get("score",0)
+        if any(x in hay for x in ("start", "from", "begin", "بداية")):
+            start_candidates.append((score, r, t))
+        if any(x in hay for x in ("end", "to", "finish", "نهاية")):
+            end_candidates.append((score, r, t))
+    start_candidates.sort(key=lambda x:x[0], reverse=True)
+    end_candidates.sort(key=lambda x:x[0], reverse=True)
+    sd=getdate(date_from or today())
+    ed=getdate(date_to or date_from or today())
+    if start_candidates and end_candidates:
+        st=start_candidates[0][2]; et=end_candidates[0][2]
+        start_dt=datetime.combine(sd, st)
+        end_dt=datetime.combine(ed, et)
+        if end_dt <= start_dt:
+            end_dt += timedelta(days=1)
+        return {"found": True, "start_dt": start_dt.strftime('%Y-%m-%d %H:%M:%S'), "end_dt": end_dt.strftime('%Y-%m-%d %H:%M:%S'), "start_source": start_candidates[0][1], "end_source": end_candidates[0][1], "scan_sample": scan[:20]}
+    return {"found": False, "start_dt": datetime.combine(sd, time.min).strftime('%Y-%m-%d %H:%M:%S'), "end_dt": datetime.combine(ed, time.max).strftime('%Y-%m-%d %H:%M:%S'), "scan_sample": scan[:20], "reason": "No confident shift start/end time found in tabSingles"}
+
+
+def _call_report_page(page=1, page_size=1000, **kwargs):
+    try:
+        from restaurant_ops.api import report_api
+        base={"page": page, "page_size": page_size, "view_mode": "admin"}
+        base.update(kwargs)
+        res=report_api.get_calls_report(**base)
+        return res.get("message") if isinstance(res,dict) and isinstance(res.get("message"),dict) else res
+    except Exception as e:
+        return {"success": False, "error": cstr(e)}
+
+
+def _rows(obj):
+    if isinstance(obj,dict):
+        for k in ("calls","rows","data","records","items","result"):
+            if isinstance(obj.get(k),list): return obj.get(k)
+    return []
+
+
+def _fetch_call_rows(date_from=None, date_to=None, max_pages=10):
+    first=_call_report_page(1,1000,date_from=date_from or today(),date_to=date_to or date_from or today())
+    rows=list(_rows(first)); summary=first.get("summary") if isinstance(first,dict) else {}
+    pagination=first.get("pagination") if isinstance(first,dict) else {}
+    pages=min(cint((pagination or {}).get("total_pages") or 1), max_pages)
+    for p in range(2,pages+1):
+        res=_call_report_page(p,1000,date_from=date_from or today(),date_to=date_to or date_from or today())
+        more=_rows(res)
+        if not more: break
+        rows.extend(more)
+    return {"summary": summary, "pagination": pagination, "rows": rows, "first_error": first.get("error") if isinstance(first,dict) else None}
+
+
+def _filter_rows_by_dt(rows, start_dt, end_dt):
+    out=[]
+    s=get_datetime(start_dt); e=get_datetime(end_dt)
+    for r in rows:
+        cd=r.get("calldate") or r.get("call_time") or r.get("time")
+        if not cd: continue
+        try:
+            d=get_datetime(cd)
+        except Exception:
+            continue
+        if s <= d <= e:
+            out.append(r)
+    return out
+
+
+def _employee_map():
+    out=[]
+    try:
+        if not frappe.db.exists("DocType","Employee"):
+            return out
+        meta=frappe.get_meta("Employee")
+        fields=["name","employee_name","user_id","status"]
+        for df in meta.fields:
+            fn=cstr(df.fieldname).lower()
+            if any(x in fn for x in ("extension","ext","sip")) and df.fieldname not in fields:
+                fields.append(df.fieldname)
+        # Use SQL-safe actual existing columns only by get_all; if custom meta mismatch, fallback.
+        rows=frappe.get_all("Employee", fields=fields, limit_page_length=1000)
+        for r in rows:
+            exts=[]
+            for k,v in r.items():
+                if k not in ("name","employee_name","user_id","status") and v:
+                    exts.append({"field": k, "value": cstr(v)})
+            out.append({"employee": r.get("name"), "employee_name": r.get("employee_name"), "user_id": r.get("user_id"), "status": r.get("status"), "extensions": exts})
+    except Exception as e:
+        out.append({"error": cstr(e)})
+    return out
+
+
+def _email_debug():
+    out={}
+    try:
+        from restaurant_ops.api import upper_management_email_api as up
+        if hasattr(up,"debug_email_send_config"):
+            out["upper_debug_email_send_config"]=up.debug_email_send_config()
+        if hasattr(up,"verify_queue_journey_in_upper_email"):
+            out["upper_verify_queue_journey"]=up.verify_queue_journey_in_upper_email()
+        if hasattr(up,"verify_feedback_in_upper_email"):
+            out["upper_verify_feedback"]=up.verify_feedback_in_upper_email()
+    except Exception as e:
+        out["upper_error"]=cstr(e)
+    try:
+        from restaurant_ops.api import email_report as er
+        funcs=["send_report_now","preview_email_report","send_upper_management_report","debug_center_journey_email_section_v23","debug_center_feedback_email_section"]
+        out["email_report_functions"]={fn: hasattr(er,fn) for fn in funcs}
+        if hasattr(er,"debug_center_journey_email_section_v23"):
+            out["center_journey_debug"]=er.debug_center_journey_email_section_v23()
+        if hasattr(er,"debug_center_feedback_email_section"):
+            out["center_feedback_debug"]=er.debug_center_feedback_email_section()
+    except Exception as e:
+        out["center_error"]=cstr(e)
+    return out
+
+
+def execute(date_from=None, date_to=None):
+    date_from=date_from or today(); date_to=date_to or date_from
+    shift=_resolve_shift_window(date_from,date_to)
+    calls=_fetch_call_rows(date_from,date_to,max_pages=10)
+    rows=calls.get("rows") or []
+    filtered=_filter_rows_by_dt(rows, shift.get("start_dt"), shift.get("end_dt"))
+    def count_answered(rs):
+        return sum(1 for r in rs if cstr(r.get("smart_category") or "").lower()=="answered" or cstr(r.get("disposition") or "").upper()=="ANSWERED")
+    return {
+        "success": True,
+        "generated_at": now_datetime().strftime('%Y-%m-%d %H:%M:%S'),
+        "period": {"date_from": cstr(date_from), "date_to": cstr(date_to)},
+        "shift_window_resolution": shift,
+        "call_report_full_day": {"summary": calls.get("summary"), "pagination": calls.get("pagination"), "loaded_rows": len(rows), "answered_loaded": count_answered(rows), "first_error": calls.get("first_error")},
+        "call_report_shift_filtered_loaded_rows": len(filtered),
+        "call_report_shift_filtered_answered": count_answered(filtered),
+        "call_report_shift_filtered_sample": filtered[:10],
+        "employee_extension_map_sample": _employee_map()[:100],
+        "email_debug": _email_debug(),
+    }
+PY
+
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+[[ -n "$APP_OWNER" ]] && chown "$APP_OWNER" "$DIAG_MOD" 2>/dev/null || true
+
+echo "▶️ Running Frappe diagnostic module"
+set +e
+bench_exec execute restaurant_ops.scripts.diagnose_email_shift_callfilter_v34.execute --kwargs "{\"date_from\":\"$DATE_FROM\",\"date_to\":\"$DATE_TO\"}" | tee "$OUT_DIR/diagnostic_result.json"
+RC=${PIPESTATUS[0]}
+set -e
+rm -f "$DIAG_MOD" 2>/dev/null || true
+rm -rf "$SCRIPTS_DIR/__pycache__" 2>/dev/null || true
+
+if [[ $RC -ne 0 ]]; then
+  echo "❌ Diagnostic module failed. راجع: $OUT_DIR/diagnostic_result.json"
+  exit 1
+fi
+
+# Compact summary
+python3 - <<PY | tee "$OUT_DIR/summary.txt"
+import json, pathlib
+p=pathlib.Path('$OUT_DIR/diagnostic_result.json')
+try:
+    d=json.loads(p.read_text())
+except Exception as e:
+    print('Could not parse json',e); print(p.read_text()[:2000]); raise SystemExit(0)
+print('Generated:', d.get('generated_at'))
+print('Shift found:', d.get('shift_window_resolution',{}).get('found'))
+print('Shift start:', d.get('shift_window_resolution',{}).get('start_dt'))
+print('Shift end:', d.get('shift_window_resolution',{}).get('end_dt'))
+print('Shift start source:', d.get('shift_window_resolution',{}).get('start_source'))
+print('Shift end source:', d.get('shift_window_resolution',{}).get('end_source'))
+print('Full-day summary:', d.get('call_report_full_day',{}).get('summary'))
+print('Loaded rows:', d.get('call_report_full_day',{}).get('loaded_rows'))
+print('Shift-filtered loaded rows:', d.get('call_report_shift_filtered_loaded_rows'))
+print('Shift-filtered answered:', d.get('call_report_shift_filtered_answered'))
+print('Email debug keys:', list((d.get('email_debug') or {}).keys()))
+print('Email report funcs:', (d.get('email_debug') or {}).get('email_report_functions'))
+print('Upper recipients/debug:', (d.get('email_debug') or {}).get('upper_debug_email_send_config'))
+print('Employee extension map sample count:', len(d.get('employee_extension_map_sample') or []))
+PY
+
+echo "🏥 Health check"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$OUT_DIR/health_asterisk_bridge.json"
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status | tee "$OUT_DIR/health_queue_status.json"
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' | tee "$OUT_DIR/health_call_report.json"
+set -e
+
+echo "============================================================"
+echo "✅ DIAGNOSTIC DONE"
+echo "📁 Output folder: $OUT_DIR"
+echo "📄 summary.txt"
+echo "📄 diagnostic_result.json"
+echo "📄 grep_relevant.txt"
+echo "ابعتلي summary.txt و diagnostic_result.json لو عايزني أعمل fix نهائي بعده."
+echo "============================================================"

@@ -1,0 +1,360 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Roshdy V44 DIAGNOSTIC/SNAPSHOT ONLY
+# ----------------------------------------------------------------------
+# Diagnoses the current issues without changing business logic:
+# 1) /user-management returns 417
+# 2) Some counters reset after 00:00 instead of using Call Center shift window
+# 3) quality-desk should show only food-quality complaints
+# 4) automatic emails should send 2 hours after shift end and use shift window data
+#
+# This script:
+# - Takes fresh bench backup + file snapshots
+# - Captures page HTTP statuses + backend logs
+# - Collects Call Center Settings and shift-window counts
+# - Collects complaint category/status schema and samples
+# - Collects scheduled email jobs/hooks info
+# - Greps date/filter/quality/user-management relevant code
+#
+# It DOES NOT modify app code, report_api.py, DB business data, Elastix, CDR, or AMI.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+DATE_FROM="${DATE_FROM:-$(date +%F)}"
+DATE_TO="${DATE_TO:-$DATE_FROM}"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "❌ docker compose/docker-compose مش موجود"
+  exit 1
+fi
+
+APP_DIR="$ROOT/apps/$APP"
+PKG_DIR="$APP_DIR/$APP"
+API_DIR="$PKG_DIR/api"
+WWW_DIR="$PKG_DIR/www"
+SCRIPTS_DIR="$PKG_DIR/scripts"
+TS="$(date +%Y%m%d_%H%M%S)"
+OUT_DIR="$ROOT/backups/DIAG_V44_USER_SHIFT_QUALITY_EMAIL_$TS"
+mkdir -p "$OUT_DIR/files" "$SCRIPTS_DIR"
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend container مش شغال أو مش لاقيه"
+  exit 1
+fi
+
+bench_exec(){ "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"; }
+
+echo "============================================================"
+echo "🔎 Roshdy V44 diagnostic/snapshot only"
+echo "📁 Output: $OUT_DIR"
+echo "📅 Date: $DATE_FROM to $DATE_TO"
+echo "============================================================"
+
+# -----------------------------------------------------------------------------
+# 1) Bench backup + file snapshots
+# -----------------------------------------------------------------------------
+echo "🧯 Step 1: Bench backup + file snapshots"
+bench_exec backup --with-files | tee "$OUT_DIR/bench_backup_output.txt" || true
+
+FILES=(
+  "$WWW_DIR/user-management.html" "$WWW_DIR/user-management.py"
+  "$WWW_DIR/admin-desk.html" "$WWW_DIR/admin-desk.py"
+  "$WWW_DIR/feedback.html" "$WWW_DIR/feedback.py"
+  "$WWW_DIR/feedback-admin.html" "$WWW_DIR/feedback-admin.py"
+  "$WWW_DIR/order-cancellations-report.html" "$WWW_DIR/order-cancellations-report.py"
+  "$WWW_DIR/queue-journey-report.html" "$WWW_DIR/queue-journey-report.py"
+  "$WWW_DIR/quality-desk.html" "$WWW_DIR/quality-desk.py"
+  "$WWW_DIR/quality-complaint.html" "$WWW_DIR/quality-complaint.py"
+  "$WWW_DIR/settings.html" "$WWW_DIR/settings.py"
+  "$WWW_DIR/email-report-customizer.html" "$WWW_DIR/email-report-customizer.py"
+  "$WWW_DIR/call-report.html" "$WWW_DIR/call-report.py"
+  "$WWW_DIR/_context.py"
+  "$API_DIR/admin_api.py"
+  "$API_DIR/security_api.py"
+  "$API_DIR/feedback_api.py"
+  "$API_DIR/upper_management_email_api.py"
+  "$API_DIR/email_report.py"
+  "$API_DIR/queue_journey_api.py"
+  "$API_DIR/quality_api.py"
+  "$API_DIR/complaint_permissions.py"
+  "$API_DIR/report_api.py"
+  "$API_DIR/queue_api.py"
+  "$API_DIR/asterisk_bridge.py"
+  "$PKG_DIR/hooks.py"
+)
+for f in "${FILES[@]}"; do
+  if [[ -e "$f" ]]; then
+    rel="${f#$ROOT/}"
+    mkdir -p "$OUT_DIR/files/$(dirname "$rel")"
+    cp -a "$f" "$OUT_DIR/files/$rel"
+  fi
+done
+
+# -----------------------------------------------------------------------------
+# 2) Docker/page statuses/logs
+# -----------------------------------------------------------------------------
+echo "🌐 Step 2: Page smoke checks and backend logs"
+"${COMPOSE[@]}" ps | tee "$OUT_DIR/docker_compose_ps.txt" || true
+for p in user-management admin-desk feedback feedback-admin quality-desk quality-complaint settings email-report-customizer call-report queue-journey-report order-cancellations-report; do
+  code="$(curl -k -s -o "$OUT_DIR/curl_${p//\//_}.html" -w '%{http_code}' "http://127.0.0.1/$p" 2>/dev/null || echo 000)"
+  echo "$p => $code" | tee -a "$OUT_DIR/page_smoke_checks.txt"
+done
+"${COMPOSE[@]}" logs --tail=400 backend > "$OUT_DIR/backend_logs_tail_after_page_checks.txt" 2>&1 || true
+
+# -----------------------------------------------------------------------------
+# 3) Grep relevant code
+# -----------------------------------------------------------------------------
+echo "🔍 Step 3: Grep relevant code"
+{
+  echo "===== user-management / security / roles ====="
+  grep -RIn --exclude='*.pyc' --exclude-dir='__pycache__' \
+    -e "list_all_users" -e "debug_duplicate" -e "security_api" -e "ADMIN_ROLES" -e "protect" -e "user-management" \
+    "$API_DIR" "$WWW_DIR" "$PKG_DIR/hooks.py" 2>/dev/null || true
+  echo
+  echo "===== shift/date filters/counters ====="
+  grep -RIn --exclude='*.pyc' --exclude-dir='__pycache__' \
+    -e "shift_start" -e "shift_end" -e "shift_start_hour" -e "shift_end_hour" -e "00:00:00" -e "23:59:59" -e "today()" -e "feedback_date" -e "cancellation_time" -e "complaint_datetime" -e "date_from" -e "date_to" \
+    "$API_DIR" "$WWW_DIR" 2>/dev/null || true
+  echo
+  echo "===== quality / complaint category filters ====="
+  grep -RIn --exclude='*.pyc' --exclude-dir='__pycache__' \
+    -e "quality" -e "جودة" -e "طعام" -e "food" -e "complaint_category" -e "category" -e "assigned_quality" -e "quality-desk" \
+    "$API_DIR" "$WWW_DIR" 2>/dev/null || true
+  echo
+  echo "===== scheduled/email jobs ====="
+  grep -RIn --exclude='*.pyc' --exclude-dir='__pycache__' \
+    -e "scheduler_events" -e "cron" -e "send_daily" -e "send_report" -e "daily_shift" -e "send_upper" -e "send_center" \
+    "$API_DIR" "$PKG_DIR/hooks.py" "$WWW_DIR" 2>/dev/null || true
+} | tee "$OUT_DIR/grep_relevant.txt"
+
+# -----------------------------------------------------------------------------
+# 4) Temporary Frappe diagnostic module
+# -----------------------------------------------------------------------------
+DIAG_MOD="$SCRIPTS_DIR/diag_v44_user_shift_quality_email.py"
+cat > "$DIAG_MOD" <<'PY'
+# -*- coding: utf-8 -*-
+import json
+import re
+from datetime import datetime, time, timedelta
+from collections import Counter, defaultdict
+
+import frappe
+from frappe.utils import today, now_datetime, getdate, get_datetime, cstr, cint, flt
+
+
+def _has_dt(dt):
+    try: return bool(frappe.db.exists("DocType", dt))
+    except Exception: return False
+
+
+def _cols(dt):
+    try:
+        meta=frappe.get_meta(dt)
+        return [d.fieldname for d in meta.fields] + ["name","owner","creation","modified","modified_by","docstatus"]
+    except Exception: return []
+
+
+def _table_cols(table):
+    try: return [r.get("Field") for r in frappe.db.sql("describe `%s`"%table, as_dict=True)]
+    except Exception as e: return ["ERROR: "+cstr(e)]
+
+
+def _single_doc_values(dt):
+    out={}
+    try:
+        if frappe.db.exists("DocType", dt):
+            rows=frappe.db.sql("select field,value from `tabSingles` where doctype=%s order by field", (dt,), as_dict=True)
+            out={r.field:r.value for r in rows}
+    except Exception as e:
+        out={"error":cstr(e)}
+    return out
+
+
+def _parse_hour(v, default=0):
+    try:
+        if v is None or v == "": return default
+        if isinstance(v, (int,float)): return int(v)
+        s=cstr(v).strip()
+        if s.isdigit(): return int(s)
+        m=re.search(r"(\d{1,2}):(\d{2})", s)
+        if m: return int(m.group(1))
+    except Exception: pass
+    return default
+
+
+def _shift_window(date_from=None):
+    d=getdate(date_from or today())
+    settings=_single_doc_values("Call Center Settings")
+    start_h=_parse_hour(settings.get("shift_start_hour"), 10)
+    end_h=_parse_hour(settings.get("shift_end_hour"), 5)
+    start=datetime.combine(d, time(start_h,0))
+    end=datetime.combine(d, time(end_h,0))
+    if end <= start: end += timedelta(days=1)
+    return {"start_dt":start.strftime('%Y-%m-%d %H:%M:%S'), "end_dt":end.strftime('%Y-%m-%d %H:%M:%S'), "shift_start_hour":start_h, "shift_end_hour":end_h, "settings":settings}
+
+
+def _count_doctype_between(dt, field, start_dt, end_dt, extra=None):
+    if not _has_dt(dt): return {"exists":False,"count":0}
+    try:
+        filters={field:["between",[start_dt,end_dt]]}
+        if extra: filters.update(extra)
+        return {"exists":True,"count":frappe.db.count(dt,filters)}
+    except Exception as e:
+        return {"exists":True,"error":cstr(e),"count":None}
+
+
+def _feedback_counts(start_dt,end_dt):
+    dt="Call Center Feedback"; out={"exists":_has_dt(dt)}
+    if not out["exists"]: return out
+    for field in ("feedback_date","creation","completed_at"):
+        out[field]=_count_doctype_between(dt, field, start_dt[:10] if field=="feedback_date" else start_dt, end_dt[:10] if field=="feedback_date" else end_dt)
+    try:
+        rows=frappe.get_all(dt, fields=["name","feedback_date","shift_number","status","is_active","rating","satisfaction","agent_user","agent_employee_name","creation","completed_at"], order_by="modified desc", limit_page_length=20)
+        out["sample"]=rows
+    except Exception as e: out["sample_error"]=cstr(e)
+    return out
+
+
+def _cancellation_counts(start_dt,end_dt):
+    dt="Call Center Order Cancellation"; out={"exists":_has_dt(dt)}
+    if not out["exists"]: return out
+    out["cancellation_time"]= _count_doctype_between(dt,"cancellation_time",start_dt,end_dt)
+    out["creation"]= _count_doctype_between(dt,"creation",start_dt,end_dt)
+    try:
+        fields=["name","order_no","cancellation_time","shift","branch","customer_name","reason","logged_by","creation"]
+        if "shift_number" in _cols(dt): fields.insert(3,"shift_number")
+        out["sample"]=frappe.get_all(dt,fields=fields,order_by="modified desc",limit_page_length=20)
+    except Exception as e: out["sample_error"]=cstr(e)
+    return out
+
+
+def _complaint_info(start_dt,end_dt):
+    dt="Call Center Complaint"; out={"exists":_has_dt(dt),"fields":_cols(dt)}
+    if not out["exists"]: return out
+    fields=out["fields"]
+    cat_fields=[f for f in fields if any(x in f.lower() for x in ("category","type","reason","issue"))]
+    status_field="status" if "status" in fields else ("workflow_state" if "workflow_state" in fields else None)
+    out["category_candidate_fields"]=cat_fields
+    out["status_field"]=status_field
+    for f in cat_fields[:8]:
+        try:
+            rows=frappe.db.sql("select `%s` val, count(*) cnt from `tabCall Center Complaint` group by `%s` order by cnt desc limit 30"%(f,f), as_dict=True)
+            out["distinct_"+f]=rows
+        except Exception as e: out["distinct_"+f+"_error"]=cstr(e)
+    try:
+        wanted=["name","creation","modified"]
+        if status_field: wanted.append(status_field)
+        for f in cat_fields[:3]:
+            if f not in wanted: wanted.append(f)
+        if "assigned_quality_inspector" in fields: wanted.append("assigned_quality_inspector")
+        if "customer_name" in fields: wanted.append("customer_name")
+        out["recent_sample"]=frappe.get_all(dt, fields=wanted, order_by="modified desc", limit_page_length=30)
+    except Exception as e: out["recent_sample_error"]=cstr(e)
+    out["created_in_shift"]=_count_doctype_between(dt,"creation",start_dt,end_dt)
+    return out
+
+
+def _email_jobs():
+    out={}
+    try:
+        out["scheduled_job_types"] = frappe.get_all("Scheduled Job Type", filters={"method":["like","%email%"]}, fields=["name","method","frequency","cron_format","stopped"], limit_page_length=200)
+    except Exception as e: out["scheduled_job_types_error"]=cstr(e)
+    try:
+        out["scheduler_events_hook_snippet"] = "See grep_relevant.txt"
+    except Exception: pass
+    return out
+
+
+def _api_outputs(date_from=None,date_to=None):
+    out={}
+    for name, dotted in [
+        ("admin_stats","restaurant_ops.api.admin_api.get_admin_dashboard_stats"),
+        ("feedback_summary","restaurant_ops.api.feedback_api.get_feedback_email_summary"),
+        ("upper_data","restaurant_ops.api.upper_management_email_api.get_upper_management_report_data"),
+        ("queue_journey","restaurant_ops.api.queue_journey_api.get_queue_journey_report"),
+    ]:
+        try:
+            fn=frappe.get_attr(dotted)
+            try: out[name]=fn(date_from=date_from,date_to=date_to)
+            except TypeError: out[name]=fn()
+        except Exception as e: out[name+"_error"]=cstr(e)
+    return out
+
+
+def execute(date_from=None,date_to=None):
+    date_from=date_from or today(); date_to=date_to or date_from
+    sw=_shift_window(date_from)
+    start_dt,end_dt=sw["start_dt"],sw["end_dt"]
+    return {
+        "success":True,
+        "generated_at":now_datetime().strftime('%Y-%m-%d %H:%M:%S'),
+        "period":{"date_from":cstr(date_from),"date_to":cstr(date_to)},
+        "shift_window":sw,
+        "doctype_schemas":{
+            "Call Center Feedback":_cols("Call Center Feedback"),
+            "Call Center Order Cancellation":_cols("Call Center Order Cancellation"),
+            "Call Center Complaint":_cols("Call Center Complaint"),
+            "User":_cols("User"),
+        },
+        "db_columns":{
+            "tabEmployee":_table_cols("tabEmployee"),
+            "tabSessions":_table_cols("tabSessions"),
+        },
+        "counts_calendar_vs_shift":{
+            "feedback":_feedback_counts(start_dt,end_dt),
+            "cancellations":_cancellation_counts(start_dt,end_dt),
+            "complaints":_complaint_info(start_dt,end_dt),
+        },
+        "email_jobs":_email_jobs(),
+        "api_outputs":_api_outputs(date_from,date_to),
+    }
+PY
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+[[ -n "$APP_OWNER" ]] && chown "$APP_OWNER" "$DIAG_MOD" 2>/dev/null || true
+
+set +e
+bench_exec execute restaurant_ops.scripts.diag_v44_user_shift_quality_email.execute --kwargs "{\"date_from\":\"$DATE_FROM\",\"date_to\":\"$DATE_TO\"}" | tee "$OUT_DIR/diagnostic_result.json"
+RC=${PIPESTATUS[0]}
+set -e
+rm -f "$DIAG_MOD" 2>/dev/null || true
+rm -rf "$SCRIPTS_DIR/__pycache__" 2>/dev/null || true
+if [[ $RC -ne 0 ]]; then echo "❌ Diagnostic failed"; exit 1; fi
+
+python3 - <<PY | tee "$OUT_DIR/summary.txt"
+import json, pathlib
+p=pathlib.Path('$OUT_DIR/diagnostic_result.json')
+d=json.loads(p.read_text())
+print('Generated:', d.get('generated_at'))
+print('Shift window:', d.get('shift_window'))
+print('Feedback counts:', d.get('counts_calendar_vs_shift',{}).get('feedback'))
+print('Cancellation counts:', d.get('counts_calendar_vs_shift',{}).get('cancellations'))
+ci=d.get('counts_calendar_vs_shift',{}).get('complaints') or {}
+print('Complaint category fields:', ci.get('category_candidate_fields'))
+for k,v in ci.items():
+    if k.startswith('distinct_'): print(k, v[:10] if isinstance(v,list) else v)
+print('Email jobs:', d.get('email_jobs'))
+print('API output keys:', list((d.get('api_outputs') or {}).keys()))
+PY
+
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$OUT_DIR/health_asterisk_bridge.json"
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status | tee "$OUT_DIR/health_queue_status.json"
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' | tee "$OUT_DIR/health_call_report.json"
+set -e
+
+echo "============================================================"
+echo "✅ DIAGNOSTIC DONE"
+echo "📁 Output folder: $OUT_DIR"
+echo "📄 summary.txt"
+echo "📄 diagnostic_result.json"
+echo "📄 grep_relevant.txt"
+echo "============================================================"

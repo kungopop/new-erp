@@ -1,0 +1,329 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Roshdy READ-ONLY audit: find Queue Log source on Elastix/Asterisk
+# Goal:
+# - Confirm if full call journey data exists outside CDR, especially /var/log/asterisk/queue_log.
+# - If found, sample RINGNOANSWER / CONNECT / ABANDON events so we can later add journey classification.
+# - Does NOT edit ERP, report_api.py, Elastix, CDR, AMI, or any config.
+#
+# Usage on ERP server:
+#   cd /opt/frappe_crm
+#   chmod +x audit-elastix-queue-log-source
+#   ./audit-elastix-queue-log-source
+#
+# Optional SSH audit from ERP server if you have SSH access to Elastix:
+#   ELASTIX_SSH='root@10.11.1.253' ./audit-elastix-queue-log-source
+#
+# Or copy to Elastix and run locally:
+#   bash audit-elastix-queue-log-source --elastix-local
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+ELASTIX_HOST="${ELASTIX_HOST:-10.11.1.253}"
+ELASTIX_SSH="${ELASTIX_SSH:-}"
+DATE_FROM="${DATE_FROM:-$(date +%F)}"
+DATE_TO="${DATE_TO:-$DATE_FROM}"
+QUEUES="${QUEUES:-1234,123}"
+MODE="${1:-erp}"
+TS="$(date +%Y%m%d_%H%M%S)"
+
+# -----------------------------------------------------------------------------
+# Local Elastix read-only audit. This can run directly on the Elastix box.
+# -----------------------------------------------------------------------------
+elastix_local_audit() {
+  local OUT_DIR="${OUT_DIR:-/tmp/ROSHDY_ELASTIX_QUEUELOG_AUDIT_$TS}"
+  mkdir -p "$OUT_DIR"
+  echo "============================================================" | tee "$OUT_DIR/summary.txt"
+  echo "🔎 Elastix local queue_log audit - READ ONLY" | tee -a "$OUT_DIR/summary.txt"
+  echo "📁 Output: $OUT_DIR" | tee -a "$OUT_DIR/summary.txt"
+  echo "📅 Date: $DATE_FROM to $DATE_TO" | tee -a "$OUT_DIR/summary.txt"
+  echo "☎️ Queues: $QUEUES" | tee -a "$OUT_DIR/summary.txt"
+  echo "============================================================" | tee -a "$OUT_DIR/summary.txt"
+
+  {
+    echo "===== host/date ====="
+    hostname || true
+    date || true
+    echo
+    echo "===== asterisk processes ====="
+    ps aux | grep -i '[a]sterisk' || true
+    echo
+    echo "===== possible queue_log files ====="
+    ls -lah /var/log/asterisk/queue_log* 2>/dev/null || true
+    ls -lah /var/log/asterisk/full* 2>/dev/null || true
+    echo
+    echo "===== asterisk logger config mentions queue_log ====="
+    grep -RIn "queue_log\|queue" /etc/asterisk/logger* /etc/asterisk/*.conf 2>/dev/null | head -200 || true
+  } | tee "$OUT_DIR/system_queue_log_audit.txt"
+
+  local qfile=""
+  for f in /var/log/asterisk/queue_log /var/log/asterisk/queue_log.0 /var/log/asterisk/queue_log.1; do
+    if [[ -f "$f" ]]; then qfile="$f"; break; fi
+  done
+
+  if [[ -z "$qfile" ]]; then
+    echo "❌ No /var/log/asterisk/queue_log file found." | tee -a "$OUT_DIR/summary.txt"
+    echo "can_determine_journey=false" | tee -a "$OUT_DIR/summary.txt"
+    return 0
+  fi
+
+  echo "✅ Found queue_log file: $qfile" | tee -a "$OUT_DIR/summary.txt"
+
+  # Queue log standard format often: epoch|callid|queuename|agent|event|data1|data2|...
+  # We do simple read-only parsing with awk/python.
+  cp -a "$qfile" "$OUT_DIR/queue_log.sample_source_copy.headtail.txt" 2>/dev/null || true
+  {
+    echo "===== head ====="
+    head -50 "$qfile" || true
+    echo
+    echo "===== tail ====="
+    tail -200 "$qfile" || true
+  } > "$OUT_DIR/queue_log_head_tail.txt"
+
+  python3 - "$qfile" "$DATE_FROM" "$DATE_TO" "$QUEUES" "$OUT_DIR" <<'PY'
+import sys, os, time, datetime, json, re
+from collections import Counter, defaultdict
+qfile, date_from, date_to, queues, out_dir = sys.argv[1:6]
+queues = {q.strip() for q in queues.split(',') if q.strip()}
+start = int(datetime.datetime.strptime(date_from + ' 00:00:00', '%Y-%m-%d %H:%M:%S').timestamp())
+end = int(datetime.datetime.strptime(date_to + ' 23:59:59', '%Y-%m-%d %H:%M:%S').timestamp())
+interesting = {'ENTERQUEUE','RINGNOANSWER','RINGCANCELED','AGENTDUMP','CONNECT','COMPLETECALLER','COMPLETEAGENT','ABANDON','EXITWITHTIMEOUT','EXITEMPTY','EXITWITHKEY','TRANSFER'}
+
+def ext_from_agent(agent):
+    agent = agent or ''
+    pats = [r'(?:Local|SIP|PJSIP|Agent)/(\d{3,6})', r'^(\d{3,6})$', r'\b(\d{3,6})\b']
+    for p in pats:
+        m = re.search(p, agent, re.I)
+        if m and m.group(1) not in ('123','1234'):
+            return m.group(1)
+    return ''
+
+rows=[]
+counts=Counter(); by_queue=defaultdict(Counter)
+with open(qfile, 'r', errors='ignore') as f:
+    for line in f:
+        line=line.strip('\n')
+        if not line: continue
+        parts=line.split('|')
+        if len(parts) < 5: continue
+        try:
+            t=int(float(parts[0]))
+        except Exception:
+            continue
+        if not (start <= t <= end): continue
+        callid, queue, agent, event = parts[1], parts[2], parts[3], parts[4]
+        if queues and queue not in queues: continue
+        counts[event]+=1; by_queue[queue][event]+=1
+        if event in interesting:
+            rows.append({
+                'time_epoch': t,
+                'time_text': datetime.datetime.fromtimestamp(t).strftime('%Y-%m-%d %H:%M:%S'),
+                'callid': callid,
+                'queue': queue,
+                'agent': agent,
+                'agent_ext': ext_from_agent(agent),
+                'event': event,
+                'data': parts[5:],
+                'raw': line,
+            })
+
+# Build simple journey attempts.
+by_call=defaultdict(list)
+for r in rows:
+    by_call[r['callid']].append(r)
+for v in by_call.values(): v.sort(key=lambda x:x['time_epoch'])
+final_events={'ABANDON','EXITWITHTIMEOUT','EXITEMPTY','EXITWITHKEY'}
+attempts=[]
+for cid, evs in by_call.items():
+    caller=''
+    for e in evs:
+        if e['event']=='ENTERQUEUE':
+            for d in e.get('data') or []:
+                if re.search(r'\d{5,}', d or ''):
+                    caller=d; break
+        if caller: break
+    for i,e in enumerate(evs):
+        if e['event'] not in ('RINGNOANSWER','RINGCANCELED','AGENTDUMP'): continue
+        ext=e.get('agent_ext') or ''
+        if not ext: continue
+        later=evs[i+1:]
+        conn=next((x for x in later if x['event']=='CONNECT'), None)
+        aban=next((x for x in later if x['event'] in final_events), None)
+        comp=next((x for x in later if x['event'] in ('COMPLETECALLER','COMPLETEAGENT')), None)
+        if conn:
+            fate='answered_later'
+            answered_ext=conn.get('agent_ext') or ''
+            answered_agent=conn.get('agent') or ''
+        elif aban:
+            fate='customer_abandoned_after_attempt'
+            answered_ext=answered_agent=''
+        elif comp:
+            fate='completed_after_attempt_connect_missing'
+            answered_ext=answered_agent=''
+        else:
+            fate='unknown_after_attempt'
+            answered_ext=answered_agent=''
+        attempts.append({
+            'attempt_time': e['time_text'], 'callid': cid, 'queue': e['queue'], 'caller': caller,
+            'missed_agent': e['agent'], 'missed_extension': ext, 'event': e['event'],
+            'fate': fate, 'answered_agent': answered_agent, 'answered_extension': answered_ext,
+            'raw_data': e.get('data'),
+        })
+
+summary={
+    'success': True,
+    'queue_log_file': qfile,
+    'date_from': date_from,
+    'date_to': date_to,
+    'queues': sorted(queues),
+    'events_loaded': len(rows),
+    'event_counts': dict(counts),
+    'event_counts_by_queue': {q:dict(c) for q,c in by_queue.items()},
+    'attempts_total': len(attempts),
+    'attempts_by_fate': dict(Counter(a['fate'] for a in attempts)),
+    'attempt_rows_sample': attempts[:200],
+    'queue_log_sample_events': rows[:200],
+    'can_determine_journey': len(attempts) > 0,
+}
+open(os.path.join(out_dir,'local_queue_log_journey_result.json'),'w',encoding='utf-8').write(json.dumps(summary,ensure_ascii=False,indent=2))
+with open(os.path.join(out_dir,'local_queue_log_journey_summary.txt'),'w',encoding='utf-8') as f:
+    f.write('queue_log_file: %s\n' % qfile)
+    f.write('events_loaded: %s\n' % len(rows))
+    f.write('event_counts: %s\n' % dict(counts))
+    f.write('attempts_total: %s\n' % len(attempts))
+    f.write('attempts_by_fate: %s\n' % dict(Counter(a['fate'] for a in attempts)))
+    f.write('\nfirst attempts:\n')
+    for a in attempts[:20]: f.write(str(a)+'\n')
+print(json.dumps(summary, ensure_ascii=False)[:5000])
+PY
+
+  cat "$OUT_DIR/local_queue_log_journey_summary.txt" | tee -a "$OUT_DIR/summary.txt"
+  echo "✅ Local Elastix audit complete: $OUT_DIR" | tee -a "$OUT_DIR/summary.txt"
+}
+
+if [[ "$MODE" == "--elastix-local" ]]; then
+  elastix_local_audit
+  exit 0
+fi
+
+# -----------------------------------------------------------------------------
+# ERP-side audit.
+# -----------------------------------------------------------------------------
+cd "$ROOT"
+OUT_DIR="$ROOT/backups/ELASTIX_QUEUELOG_SOURCE_AUDIT_$TS"
+mkdir -p "$OUT_DIR"
+
+echo "============================================================"
+echo "🔎 ERP-side Elastix queue_log source audit - READ ONLY"
+echo "📁 Output: $OUT_DIR"
+echo "📅 Date: $DATE_FROM to $DATE_TO"
+echo "☎️ Queues: $QUEUES"
+echo "============================================================"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "❌ docker compose/docker-compose مش موجود"
+  exit 1
+fi
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend container مش شغال أو مش لاقيه"
+  exit 1
+fi
+bench_exec() { "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"; }
+
+# Existing ERP DB/bridge inspection.
+cat > "$PKG_DIR/scripts/audit_asterisk_db_tables_v1.py" <<'PY'
+import frappe
+from frappe.utils import cstr, now_datetime
+
+def q(sql):
+    try:
+        from restaurant_ops.api.asterisk_bridge import query_asterisk_cdr
+        res = query_asterisk_cdr(sql)
+        return {"success": True, "rows": res if isinstance(res, list) else res}
+    except Exception as e:
+        return {"success": False, "error": cstr(e)}
+
+def execute():
+    out = {"generated_at": now_datetime().strftime("%Y-%m-%d %H:%M:%S")}
+    out["tables_like_queue"] = q("show tables like '%queue%'")
+    out["tables_like_log"] = q("show tables like '%log%'")
+    out["queue_log_exists"] = q("show tables like 'queue_log'")
+    out["queue_log_desc"] = q("describe queue_log")
+    out["queue_log_tail"] = q("select * from queue_log order by time desc limit 20")
+    return out
+PY
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+[[ -n "$APP_OWNER" ]] && chown "$APP_OWNER" "$PKG_DIR/scripts/audit_asterisk_db_tables_v1.py" 2>/dev/null || true
+
+set +e
+bench_exec execute restaurant_ops.scripts.audit_asterisk_db_tables_v1.execute | tee "$OUT_DIR/asterisk_db_tables_audit.json"
+set -e
+rm -f "$PKG_DIR/scripts/audit_asterisk_db_tables_v1.py" 2>/dev/null || true
+rm -rf "$PKG_DIR/scripts/__pycache__" 2>/dev/null || true
+
+# Existing health, read only.
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$OUT_DIR/health_asterisk_bridge.json"
+bench_exec execute restaurant_ops.api.report_api.get_staff_missed_attempts --kwargs "{\"date_from\":\"$DATE_FROM\",\"date_to\":\"$DATE_TO\",\"threshold\":15}" | tee "$OUT_DIR/existing_staff_missed_attempts.json"
+set -e
+
+# SSH optional.
+if [[ -n "$ELASTIX_SSH" ]]; then
+  echo "🔐 SSH mode enabled: $ELASTIX_SSH"
+  REMOTE_SCRIPT="/tmp/roshdy_elastix_queue_audit_$TS.sh"
+  # Copy this same script to remote then run local mode.
+  scp -o StrictHostKeyChecking=no -o ConnectTimeout=8 "$0" "$ELASTIX_SSH:$REMOTE_SCRIPT" | tee "$OUT_DIR/ssh_scp.log"
+  ssh -o StrictHostKeyChecking=no -o ConnectTimeout=8 "$ELASTIX_SSH" "DATE_FROM='$DATE_FROM' DATE_TO='$DATE_TO' QUEUES='$QUEUES' OUT_DIR='/tmp/ROSHDY_ELASTIX_QUEUELOG_AUDIT_$TS' bash '$REMOTE_SCRIPT' --elastix-local" | tee "$OUT_DIR/ssh_elastix_local_audit_output.txt"
+  echo "ℹ️ Remote output is on Elastix under: /tmp/ROSHDY_ELASTIX_QUEUELOG_AUDIT_$TS"
+else
+  cat > "$OUT_DIR/how_to_check_elastix_directly.txt" <<EOF
+queue_log table is not visible from the current Asterisk DB connection.
+To know call journey, run this script directly on the Elastix server or via SSH.
+
+Option A - from ERP server if SSH works:
+  cd /opt/frappe_crm
+  ELASTIX_SSH='root@$ELASTIX_HOST' ./audit-elastix-queue-log-source
+
+Option B - copy script to Elastix and run there:
+  scp audit-elastix-queue-log-source root@$ELASTIX_HOST:/root/
+  ssh root@$ELASTIX_HOST
+  chmod +x /root/audit-elastix-queue-log-source
+  DATE_FROM=$DATE_FROM DATE_TO=$DATE_TO QUEUES=$QUEUES /root/audit-elastix-queue-log-source --elastix-local
+
+What we need to find on Elastix:
+  /var/log/asterisk/queue_log
+  or rotated files: /var/log/asterisk/queue_log.*
+
+If those files exist and contain RINGNOANSWER / CONNECT / ABANDON events, then live journey classification is feasible.
+EOF
+fi
+
+# Compact ERP summary.
+python3 - <<PY | tee "$OUT_DIR/erp_side_summary.txt"
+import json, pathlib
+base=pathlib.Path('$OUT_DIR')
+print('ERP-side audit folder:', base)
+for name in ['asterisk_db_tables_audit.json','existing_staff_missed_attempts.json']:
+    p=base/name
+    print('\n====',name,'====')
+    if not p.exists():
+        print('missing'); continue
+    txt=p.read_text(errors='ignore').strip()
+    print(txt[:3000])
+print('\nNext step if DB queue_log missing: run local/SSH Elastix check for /var/log/asterisk/queue_log')
+PY
+
+echo "============================================================"
+echo "✅ ERP-side audit finished"
+echo "📁 Output folder: $OUT_DIR"
+echo "📄 Summary: $OUT_DIR/erp_side_summary.txt"
+echo "📄 Direct Elastix instructions: $OUT_DIR/how_to_check_elastix_directly.txt"
+echo "============================================================"

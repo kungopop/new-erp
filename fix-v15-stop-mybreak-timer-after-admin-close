@@ -1,0 +1,278 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Roshdy V15: Stop /my-break timer immediately when admin closes the break.
+# Problem fixed:
+# - Backend closes break and alert may arrive, but /my-break keeps showing the old active timer.
+# Solution:
+# - Add a front-end guard to /my-break and /agent-desk:
+#   1) Poll get_my_break_admin_alert every 2 sec.
+#   2) If admin alert exists: replace active timer UI, show full-screen red alert, and reload after acknowledgement.
+#   3) Also poll get_break_page_data while timer exists; if server says no active break and employee did NOT click End, show full-screen admin/system-close alert and reload.
+#   4) Wrap employee endBreak() so employee self-close does not trigger false admin alert.
+# Safety:
+# - Backup first.
+# - Does NOT touch report_api.py / Elastix / CDR / AMI.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "❌ docker compose/docker-compose مش موجود"
+  exit 1
+fi
+
+APP_DIR="$ROOT/apps/$APP"
+PKG_DIR="$APP_DIR/$APP"
+WWW_DIR="$PKG_DIR/www"
+MY_BREAK_HTML="$WWW_DIR/my-break.html"
+AGENT_HTML="$WWW_DIR/agent-desk.html"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/V15_STOP_MYBREAK_TIMER_AFTER_ADMIN_CLOSE_BEFORE_$TS"
+mkdir -p "$BACKUP_DIR"
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend container مش شغال أو مش لاقيه"
+  exit 1
+fi
+
+bench_exec() {
+  "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"
+}
+
+echo "============================================================"
+echo "🔧 Roshdy V15: stop timer after admin closes break"
+echo "📦 Backup: $BACKUP_DIR"
+echo "============================================================"
+
+echo "🧯 Backup files + bench backup"
+for f in "$MY_BREAK_HTML" "$AGENT_HTML"; do
+  [[ -f "$f" ]] && cp -a "$f" "$BACKUP_DIR/$(basename "$f").before"
+done
+bench_exec backup --with-files | tee "$BACKUP_DIR/bench_backup_output.txt"
+
+echo "🧩 Patch /my-break and /agent-desk overlay/guard"
+export MY_BREAK_HTML AGENT_HTML
+python3 - <<'PY'
+# -*- coding: utf-8 -*-
+from pathlib import Path
+import os
+
+my_break = Path(os.environ["MY_BREAK_HTML"])
+agent = Path(os.environ["AGENT_HTML"])
+
+old_blocks = [
+    ("<!-- BEGIN ROSHDY AGENT BREAK CLOSE ALERT -->", "<!-- END ROSHDY AGENT BREAK CLOSE ALERT -->"),
+    ("<!-- BEGIN ROSHDY AGENT BREAK ADMIN CLOSED V10 -->", "<!-- END ROSHDY AGENT BREAK ADMIN CLOSED V10 -->"),
+    ("<!-- BEGIN ROSHDY AGENT BREAK ADMIN CLOSED V12 -->", "<!-- END ROSHDY AGENT BREAK ADMIN CLOSED V12 -->"),
+    ("<!-- BEGIN ROSHDY AGENT BREAK ADMIN CLOSED V13 -->", "<!-- END ROSHDY AGENT BREAK ADMIN CLOSED V13 -->"),
+    ("<!-- BEGIN ROSHDY BREAK ADMIN CLOSED OVERLAY V14 -->", "<!-- END ROSHDY BREAK ADMIN CLOSED OVERLAY V14 -->"),
+    ("<!-- BEGIN ROSHDY BREAK ADMIN CLOSED OVERLAY V15 -->", "<!-- END ROSHDY BREAK ADMIN CLOSED OVERLAY V15 -->"),
+]
+
+block = r'''
+<!-- BEGIN ROSHDY BREAK ADMIN CLOSED OVERLAY V15 -->
+{% raw %}
+<style>
+#roshdy-admin-break-closed-v15{position:fixed;inset:0;background:#b30000;z-index:2147483000;display:none;align-items:center;justify-content:center;padding:18px;direction:rtl;font-family:Tahoma,Arial,sans-serif;text-align:center;color:white}.rabc15-card{background:rgba(0,0,0,.28);border:2px solid rgba(255,255,255,.55);border-radius:24px;box-shadow:0 35px 90px rgba(0,0,0,.45);width:760px;max-width:96vw;padding:34px}.rabc15-ico{font-size:74px;margin-bottom:8px}.rabc15-title{font-size:48px;font-weight:900;margin-bottom:12px}.rabc15-msg{font-size:28px;margin-bottom:18px}.rabc15-admin{font-size:44px;color:#ffdd33;font-weight:900;text-shadow:2px 2px 7px #000;margin:8px 0}.rabc15-details{background:rgba(255,255,255,.14);border-radius:16px;padding:16px;font-size:19px;margin-bottom:22px}.rabc15-btn{background:#fff;color:#b30000;border:0;border-radius:16px;padding:16px 30px;font-size:22px;font-weight:900;cursor:pointer}.roshdy-break-closed-behind{filter:grayscale(1);opacity:.45;pointer-events:none}@media(max-width:700px){.rabc15-title{font-size:34px}.rabc15-msg{font-size:22px}.rabc15-admin{font-size:30px}.rabc15-details{font-size:16px}.rabc15-btn{font-size:18px}}
+</style>
+<div id="roshdy-admin-break-closed-v15"><div class="rabc15-card"><div class="rabc15-ico">🚨</div><div class="rabc15-title">تنبيه إداري</div><div class="rabc15-msg">تم إنهاء البريك</div><div id="rabc15-admin" class="rabc15-admin">الإدارة</div><div id="rabc15-details" class="rabc15-details"></div><button id="rabc15-ack" class="rabc15-btn">أعلم .. العودة للعمل</button></div></div>
+<script>
+(function(){
+  if(window.RoshdyBreakClosedV15) return;
+  window.RoshdyBreakClosedV15 = true;
+  var currentBreakLog = null;
+  var alreadyShown = false;
+  var employeeSelfClosing = false;
+  var lastHadTimer = false;
+
+  function api(method,args){
+    args=args||{};
+    var q=new URLSearchParams();
+    Object.keys(args).forEach(function(k){ if(args[k]!==undefined && args[k]!==null) q.append(k,args[k]); });
+    return fetch('/api/method/'+method+(q.toString()?'?'+q.toString():''), {method:'GET', credentials:'same-origin', cache:'no-store'})
+      .then(function(r){return r.json();})
+      .then(function(j){ if(j.exc) throw j; return j.message||j; });
+  }
+
+  function markBehindClosed(){
+    try{
+      var content = document.getElementById('content');
+      var title = document.getElementById('title');
+      if(title) title.textContent = 'تم إنهاء البريك';
+      if(content){
+        content.innerHTML = '<div style="background:#fee2e2;color:#991b1b;border:2px solid #ef4444;border-radius:18px;padding:24px;font-size:22px;font-weight:900">تم إنهاء البريك بواسطة الإدارة.<br><span style="font-size:14px;color:#7f1d1d">اضغط أعلم للعودة للعمل وتحديث الصفحة.</span></div>';
+      }
+      var tm = document.getElementById('tm');
+      if(tm) tm.textContent = 'تم الإنهاء';
+      document.body.classList.add('roshdy-break-closed-behind');
+      var overlay = document.getElementById('roshdy-admin-break-closed-v15');
+      if(overlay) overlay.classList.remove('roshdy-break-closed-behind');
+    }catch(e){}
+  }
+
+  function showAlert(a, generic){
+    if(alreadyShown) return;
+    alreadyShown = true;
+    a = a || {};
+    currentBreakLog = a.break_log || currentBreakLog;
+    var admin = a.closed_by || (generic ? 'الإدارة / النظام' : 'الإدارة');
+    var msg = a.message || 'تم إنهاء البريك بواسطة الإدارة';
+    document.querySelector('#roshdy-admin-break-closed-v15 .rabc15-msg').textContent = msg;
+    document.getElementById('rabc15-admin').textContent = admin;
+    document.getElementById('rabc15-details').innerHTML =
+      'نوع البريك: <b>'+(a.break_type||'')+'</b><br>'+
+      'وقت الإغلاق: <b>'+(a.end_time||'')+'</b><br>'+
+      'مدة البريك: <b>'+(a.duration_minutes||'')+' دقيقة</b>'+
+      (generic ? '<br><span style="font-size:14px;color:#fff">تم تحديث الحالة من السيرفر لأن البريك لم يعد نشطًا.</span>' : '');
+    markBehindClosed();
+    document.getElementById('roshdy-admin-break-closed-v15').style.display='flex';
+  }
+
+  function pollAdminAlert(){
+    api('restaurant_ops.api.break_api.get_my_break_admin_alert', {})
+      .then(function(r){ if(r && r.has_alert && r.alert) showAlert(r.alert, false); })
+      .catch(function(e){ console.log('admin break close alert poll', e); });
+  }
+
+  function pollBreakStateGuard(){
+    // Only on /my-break style pages where there is a visible active timer.
+    var timerEl = document.getElementById('tm');
+    if(timerEl) lastHadTimer = true;
+    if(!timerEl || alreadyShown || employeeSelfClosing) return;
+    api('restaurant_ops.api.break_api.get_break_page_data', {})
+      .then(function(d){
+        if(!d || !d.success) return;
+        if(!d.active_break && lastHadTimer && !employeeSelfClosing){
+          showAlert({message:'تم إنهاء البريك بواسطة الإدارة', closed_by:'الإدارة', break_type:'', end_time:'', duration_minutes:''}, true);
+        }
+      })
+      .catch(function(e){ console.log('break state guard', e); });
+  }
+
+  function wrapEmployeeEndBreak(){
+    try{
+      if(typeof window.endBreak === 'function' && !window.endBreak.__roshdyWrappedV15){
+        var old = window.endBreak;
+        window.endBreak = function(){
+          employeeSelfClosing = true;
+          setTimeout(function(){ employeeSelfClosing = false; }, 12000);
+          return old.apply(this, arguments);
+        };
+        window.endBreak.__roshdyWrappedV15 = true;
+      }
+    }catch(e){}
+  }
+
+  var ack = document.getElementById('rabc15-ack');
+  if(ack){
+    ack.onclick = function(){
+      var done = function(){ window.location.reload(); };
+      if(currentBreakLog){
+        api('restaurant_ops.api.break_api.acknowledge_admin_closed_break', {break_log: currentBreakLog}).then(done).catch(done);
+      }else{
+        done();
+      }
+    };
+  }
+
+  if(window.frappe && frappe.realtime){
+    try{ frappe.realtime.on('roshdy_break_force_closed', function(p){ showAlert(p||{}, false); }); }catch(e){}
+  }
+
+  setTimeout(function(){ wrapEmployeeEndBreak(); pollAdminAlert(); pollBreakStateGuard(); }, 500);
+  setInterval(function(){ wrapEmployeeEndBreak(); pollAdminAlert(); }, 2500);
+  setInterval(pollBreakStateGuard, 2000);
+})();
+</script>
+{% endraw %}
+<!-- END ROSHDY BREAK ADMIN CLOSED OVERLAY V15 -->
+'''
+
+def patch_page(path: Path):
+    if not path.exists():
+        return
+    text = path.read_text(encoding='utf-8', errors='ignore')
+    for a,b in old_blocks:
+        while a in text and b in text:
+            i=text.index(a); j=text.index(b,i)+len(b); text=text[:i]+'\n'+text[j:]
+    low=text.lower()
+    idx=low.rfind('</body>')
+    if idx >= 0:
+        text=text[:idx]+'\n'+block+'\n'+text[idx:]
+    else:
+        text=text.rstrip()+'\n'+block+'\n'
+    path.write_text(text, encoding='utf-8')
+
+patch_page(my_break)
+patch_page(agent)
+PY
+
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+if [[ -n "$APP_OWNER" ]]; then
+  chown "$APP_OWNER" "$MY_BREAK_HTML" "$AGENT_HTML" 2>/dev/null || true
+fi
+
+echo "🧹 Clear cache + restart frontend/backend/websocket"
+bench_exec clear-cache || true
+"${COMPOSE[@]}" restart backend frontend websocket queue-short queue-long scheduler >/dev/null
+sleep 8
+bench_exec clear-cache || true
+
+echo "🧪 Page smoke checks"
+set +e
+for p in my-break agent-desk admin-desk break-admin call-report; do
+  code="$(curl -k -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$p" 2>/dev/null || echo 000)"
+  echo "$p => $code" | tee -a "$BACKUP_DIR/page_smoke_checks_v15.txt"
+done
+set -e
+
+if ! grep -q "my-break => 200" "$BACKUP_DIR/page_smoke_checks_v15.txt"; then
+  echo "❌ my-break page failed. Restore from: $BACKUP_DIR"
+  exit 1
+fi
+
+echo "🧪 Backend alert endpoint check"
+set +e
+bench_exec execute restaurant_ops.api.break_api.debug_my_break_alert_binding | tee "$BACKUP_DIR/debug_my_break_alert_binding_v15.txt"
+V1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.break_api.get_active_breaks | tee "$BACKUP_DIR/active_breaks_v15.txt"
+V2=${PIPESTATUS[0]}
+set -e
+
+if [[ $V1 -ne 0 || $V2 -ne 0 ]]; then
+  echo "❌ Backend validation failed. راجع: $BACKUP_DIR"
+  exit 1
+fi
+
+echo "🏥 Health Check - Elastix/CDR/AMI + Queue + Call Report"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$BACKUP_DIR/health_asterisk_bridge.txt"
+H1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status | tee "$BACKUP_DIR/health_queue_status.txt"
+H2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' | tee "$BACKUP_DIR/health_call_report.txt"
+H3=${PIPESTATUS[0]}
+set -e
+
+if [[ $H1 -ne 0 || $H2 -ne 0 || $H3 -ne 0 ]]; then
+  echo "⚠️ Health returned non-zero. راجع: $BACKUP_DIR"
+else
+  echo "✅ Health checks OK"
+fi
+
+echo "============================================================"
+echo "✅ DONE V15"
+echo "📦 Backup folder: $BACKUP_DIR"
+echo "⏱️ /my-break timer will now stop visually and reload after admin-close acknowledgement"
+echo "🚨 Full-screen alert blocks the page when admin closes the break"
+echo "🛡️ report_api.py / Elastix / CDR / AMI untouched"
+echo "============================================================"

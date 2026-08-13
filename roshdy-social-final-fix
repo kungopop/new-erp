@@ -1,0 +1,521 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# roshdy-social-final-fix
+# Final stabilization for current Social Inbox state:
+# 1) Restore/fix admin-desk 417.
+# 2) Make GOWA credential source-of-truth site_config + bridge .env.
+# 3) Canonicalize one active WhatsApp/GOWA account and disable duplicate test accounts.
+# 4) Make ERP API read GOWA password from site_config when Password field is empty.
+# 5) Validate backend GOWA test + pages + Elastix/CDR health.
+# NOTE: Facebook/Instagram/TikTok unofficial linking needs a separate Browser Connector service; this script keeps them as planned/inactive.
+
+ROOT="/opt/frappe_crm"
+SITE="crm.local"
+APP_HOST="$ROOT/apps/restaurant_ops"
+APP_DIR="$APP_HOST/restaurant_ops"
+WWW_DIR="$APP_DIR/www"
+BRIDGE_DIR="/opt/roshdy_social_bridge/gowa-poc"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/ROSHDY_SOCIAL_FINAL_FIX_BEFORE_$TS"
+NEWPASS="Roshdy@123"
+GOWA_USER="roshdy_admin"
+GOWA_PORT="33030"
+DEVICE_ID="orders_wa_1"
+
+say(){ echo -e "\n============================================================\n$1\n============================================================"; }
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo "❌ شغّل كـ root: sudo -i ثم ./roshdy-social-final-fix"
+  exit 1
+fi
+
+say "1) Backup كامل قبل الإصلاح النهائي"
+cd "$ROOT"
+BACKEND="$(docker compose ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ لم أجد backend container. شغّل: cd /opt/frappe_crm && docker compose up -d"
+  exit 1
+fi
+mkdir -p "$BACKUP_DIR"
+cp -a "$APP_HOST" "$BACKUP_DIR/restaurant_ops"
+[[ -f "$ROOT/docker-compose.yml" ]] && cp -a "$ROOT/docker-compose.yml" "$BACKUP_DIR/docker-compose.yml"
+[[ -f "$BRIDGE_DIR/.env" ]] && cp -a "$BRIDGE_DIR/.env" "$BACKUP_DIR/gowa.env.bak" || true
+[[ -f "$BRIDGE_DIR/docker-compose.yml" ]] && cp -a "$BRIDGE_DIR/docker-compose.yml" "$BACKUP_DIR/gowa-docker-compose.yml.bak" || true
+
+echo "✅ Backup: $BACKUP_DIR"
+
+say "2) تثبيت GOWA password في .env + container"
+SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+[[ -z "$SERVER_IP" ]] && SERVER_IP="10.11.1.66"
+if [[ ! -d "$BRIDGE_DIR" ]]; then
+  echo "❌ لم أجد $BRIDGE_DIR"
+  exit 1
+fi
+cd "$BRIDGE_DIR"
+WHATSAPP_WEBHOOK_SECRET="$(grep -E '^WHATSAPP_WEBHOOK_SECRET=' .env 2>/dev/null | tail -n1 | cut -d= -f2- || true)"
+[[ -z "$WHATSAPP_WEBHOOK_SECRET" ]] && WHATSAPP_WEBHOOK_SECRET="secret"
+
+grep -q '^GOWA_USER=' .env && sed -i "s/^GOWA_USER=.*/GOWA_USER=$GOWA_USER/" .env || echo "GOWA_USER=$GOWA_USER" >> .env
+grep -q '^GOWA_PASS=' .env && sed -i "s/^GOWA_PASS=.*/GOWA_PASS=$NEWPASS/" .env || echo "GOWA_PASS=$NEWPASS" >> .env
+grep -q '^APP_BASIC_AUTH=' .env && sed -i "s/^APP_BASIC_AUTH=.*/APP_BASIC_AUTH=$GOWA_USER:$NEWPASS/" .env || echo "APP_BASIC_AUTH=$GOWA_USER:$NEWPASS" >> .env
+GOWA_PORT="$(grep -E '^GOWA_PORT=' .env | tail -n1 | cut -d= -f2- || echo 33030)"
+[[ -z "$GOWA_PORT" ]] && GOWA_PORT="33030"
+
+docker compose up -d --force-recreate gowa
+sleep 6
+
+echo "--- .env auth lines ---"
+grep -E '^(GOWA_USER|GOWA_PASS|APP_BASIC_AUTH|WHATSAPP_WEBHOOK_SECRET|GOWA_PORT)=' .env
+
+echo "--- Host curl GOWA /health ---"
+curl -fsS -u "$GOWA_USER:$NEWPASS" "http://127.0.0.1:$GOWA_PORT/health"
+echo
+
+GOWA_BASE_URL="http://$SERVER_IP:$GOWA_PORT"
+ERP_WEBHOOK_URL="http://$SERVER_IP/api/method/restaurant_ops.api.social_inbox_api.webhook"
+
+say "3) Set site_config social_gowa_* as source of truth"
+cd "$ROOT"
+docker exec "$BACKEND" bench --site "$SITE" set-config social_gowa_base_url "$GOWA_BASE_URL"
+docker exec "$BACKEND" bench --site "$SITE" set-config social_gowa_username "$GOWA_USER"
+docker exec "$BACKEND" bench --site "$SITE" set-config social_gowa_password "$NEWPASS"
+docker exec "$BACKEND" bench --site "$SITE" set-config social_gowa_webhook_secret "$WHATSAPP_WEBHOOK_SECRET"
+docker exec "$BACKEND" bench --site "$SITE" set-config social_gowa_device_id "$DEVICE_ID"
+
+say "4) Patch Social API final overrides"
+cat >> "$APP_DIR/api/social_inbox_api.py" <<'PY'
+
+# ===== ROSHDY SOCIAL FINAL FIX OVERRIDES =====
+def _conf_value(key, default=""):
+    try:
+        return frappe.conf.get(key) or default
+    except Exception:
+        return default
+
+
+def _clean_social_url(url):
+    import re
+    url = str(url or "").strip()
+    m = re.search(r'https?://[^\]\)\s]+', url)
+    return (m.group(0) if m else url).rstrip('/')
+
+
+def _password(doc, field):
+    # For canonical GOWA account, site_config is the final source of truth.
+    try:
+        if doc and getattr(doc, "provider", "") == "GOWA WhatsApp Web" and getattr(doc, "channel_type", "") == "WhatsApp":
+            if field == "api_password":
+                v = _conf_value("social_gowa_password")
+                if v:
+                    return v
+            if field == "webhook_secret":
+                v = _conf_value("social_gowa_webhook_secret")
+                if v:
+                    return v
+    except Exception:
+        pass
+    try:
+        v = doc.get_password(field)
+        if v:
+            return v
+    except Exception:
+        pass
+    try:
+        from frappe.utils.password import get_decrypted_password
+        v = get_decrypted_password(doc.doctype, doc.name, field, raise_exception=False)
+        if v:
+            return v
+    except Exception:
+        pass
+    try:
+        v = frappe.db.get_value(doc.doctype, doc.name, field)
+        if v and str(v).strip() and str(v).strip() != "*****":
+            return v
+    except Exception:
+        pass
+    return ""
+
+
+def _set_password(doc, fieldname, value):
+    if value is None or value == "":
+        return
+    try:
+        if hasattr(doc, "set_password"):
+            doc.set_password(fieldname, value)
+            return
+    except Exception:
+        pass
+    try:
+        from frappe.utils.password import set_encrypted_password
+        set_encrypted_password(doc.doctype, doc.name, value, fieldname)
+        return
+    except Exception:
+        pass
+    try:
+        frappe.db.set_value(doc.doctype, doc.name, fieldname, value, update_modified=False)
+    except TypeError:
+        frappe.db.set_value(doc.doctype, doc.name, fieldname, value)
+
+
+def _is_gowa(doc):
+    return bool(doc and doc.channel_type == "WhatsApp" and doc.provider == "GOWA WhatsApp Web")
+
+
+def _social_first_account():
+    return (
+        frappe.db.get_value("Social Channel Account", {"provider": "GOWA WhatsApp Web", "channel_type": "WhatsApp", "active": 1}, "name")
+        or frappe.db.get_value("Social Channel Account", {"provider": "GOWA WhatsApp Web", "channel_type": "WhatsApp"}, "name")
+    )
+
+
+def _social_account(account_name=None):
+    name = account_name or _social_first_account()
+    return frappe.get_doc("Social Channel Account", name) if name and frappe.db.exists("Social Channel Account", name) else None
+
+
+def _require_gowa(account):
+    if not account:
+        return False, {"success": False, "message": "لا يوجد حساب WhatsApp/GOWA محفوظ"}
+    if not _is_gowa(account):
+        return False, {"success": False, "message": "هذا الحساب ليس WhatsApp GOWA. فيسبوك/إنستجرام/تيك توك يحتاج Browser Connector منفصل."}
+    if not account.api_base_url:
+        account.api_base_url = _conf_value("social_gowa_base_url")
+    if not account.api_username:
+        account.api_username = _conf_value("social_gowa_username", "roshdy_admin")
+    if not account.device_id:
+        account.device_id = _conf_value("social_gowa_device_id", "orders_wa_1")
+    if not account.api_base_url:
+        return False, {"success": False, "message": "API Base URL missing للحساب المختار"}
+    if not account.api_username or not _password(account, "api_password"):
+        return False, {"success": False, "message": "GOWA username/password غير متاحين حتى من site_config"}
+    return True, None
+
+
+@frappe.whitelist(allow_guest=False)
+def debug_gowa_auth(account_name=None):
+    if not _is_admin():
+        return _deny("للأدمن فقط")
+    account = _social_account(account_name)
+    if not account:
+        return {"success": False, "message": "No GOWA account"}
+    _require_gowa(account)
+    pwd = _password(account, "api_password")
+    secret = _password(account, "webhook_secret")
+    return {
+        "success": True,
+        "account": account.name,
+        "provider": account.provider,
+        "api_base_url": account.api_base_url,
+        "api_username": account.api_username,
+        "password_present": bool(pwd),
+        "password_length": len(pwd or ""),
+        "password_source": "site_config_for_gowa",
+        "secret_present": bool(secret),
+        "secret_length": len(secret or ""),
+        "device_id": account.device_id,
+    }
+
+
+@frappe.whitelist(allow_guest=False)
+def list_accounts():
+    if not _has_access():
+        return _deny()
+    rows = frappe.get_all(
+        "Social Channel Account",
+        fields=["name", "account_label", "channel_type", "provider", "device_id", "phone_label", "status", "active", "api_base_url", "api_username", "admin_only_start_chat", "allowed_roles", "allowed_users"],
+        order_by="active desc, channel_type asc, provider desc, modified desc",
+        limit_page_length=300,
+    )
+    return {"success": True, "accounts": rows, "is_admin": _is_admin()}
+
+
+@frappe.whitelist(allow_guest=False)
+def test_account(account_name):
+    if not _has_access():
+        return _deny()
+    doc = _social_account(account_name)
+    ok, err = _require_gowa(doc)
+    if not ok:
+        return err
+    health = _http_request("GET", _clean_social_url(doc.api_base_url) + "/health", account=doc)
+    status = _http_request("GET", _clean_social_url(doc.api_base_url) + "/app/status", account=doc, headers={"X-Device-Id": doc.device_id or ""}) if doc.device_id else None
+    try:
+        res = status.get("data", {}).get("results") if isinstance(status, dict) and isinstance(status.get("data"), dict) else None
+        if isinstance(res, dict):
+            doc.status = "Logged In" if res.get("is_logged_in") else ("Connected" if res.get("is_connected") else "Disconnected")
+            doc.save(ignore_permissions=True)
+            frappe.db.commit()
+    except Exception:
+        pass
+    return {"success": True, "health": health, "status": status}
+
+
+def _join_url(base, path):
+    return _clean_social_url(base) + "/" + path.lstrip("/")
+
+
+def _gowa_paths(path):
+    path = "/" + path.lstrip("/")
+    return [path, "/api" + path] if not path.startswith("/api/") else [path, path[4:]]
+
+
+def _gowa_call(account, method, path, json_body=None, headers=None, timeout=25):
+    ok, err = _require_gowa(account)
+    if not ok:
+        return {"ok": False, "status_code": 0, "data": err, "text": err.get("message"), "path_used": path}
+    last = None
+    for p in _gowa_paths(path):
+        res = _http_request(method, _join_url(account.api_base_url, p), account=account, headers=headers or {}, json_body=json_body, timeout=timeout)
+        res["path_used"] = p
+        last = res
+        txt = str(res.get("text") or res.get("data") or "")[:120].lower()
+        if res.get("status_code") != 404 and "cannot" not in txt:
+            return res
+    return last or {"ok": False, "status_code": 0, "data": None, "text": "No response", "path_used": path}
+
+
+@frappe.whitelist(allow_guest=False)
+def gowa_devices(account_name=None):
+    if not _is_admin():
+        return _deny("إدارة أجهزة واتساب للأدمن فقط")
+    account = _social_account(account_name)
+    return {"success": True, "account": account.name if account else None, "response": _gowa_call(account, "GET", "/devices")}
+
+
+@frappe.whitelist(allow_guest=False)
+def gowa_create_device(account_name=None, device_id=None, account_label=None):
+    if not _is_admin():
+        return _deny("إضافة جهاز واتساب للأدمن فقط")
+    account = _social_account(account_name)
+    ok, err = _require_gowa(account)
+    if not ok:
+        return err
+    device_id = (device_id or account.device_id or _conf_value("social_gowa_device_id", "orders_wa_1")).strip()
+    res = _gowa_call(account, "POST", "/devices", json_body={"device_id": device_id})
+    account.device_id = device_id
+    if account_label:
+        account.account_label = account_label
+    account.phone_label = account.phone_label or device_id
+    account.save(ignore_permissions=True)
+    frappe.db.commit()
+    return {"success": True, "device_id": device_id, "response": res}
+
+
+@frappe.whitelist(allow_guest=False)
+def gowa_status(account_name=None, device_id=None):
+    if not _has_access():
+        return _deny()
+    account = _social_account(account_name)
+    ok, err = _require_gowa(account)
+    if not ok:
+        return err
+    did = device_id or account.device_id
+    res = _gowa_call(account, "GET", "/app/status", headers={"X-Device-Id": did})
+    return {"success": True, "account": account.name, "device_id": did, "response": res}
+
+
+@frappe.whitelist(allow_guest=False)
+def gowa_login_qr(account_name=None, device_id=None):
+    if not _is_admin():
+        return _deny("QR Login للأدمن فقط")
+    account = _social_account(account_name)
+    ok, err = _require_gowa(account)
+    if not ok:
+        return err
+    did = (device_id or account.device_id or _conf_value("social_gowa_device_id", "orders_wa_1")).strip()
+    account.device_id = did
+    account.save(ignore_permissions=True)
+    frappe.db.commit()
+    _gowa_call(account, "POST", "/devices", json_body={"device_id": did})
+    res = _gowa_call(account, "GET", "/app/login", headers={"X-Device-Id": did}, timeout=35)
+    return {"success": True, "account": account.name, "device_id": did, "response": res}
+
+
+@frappe.whitelist(allow_guest=False)
+def gowa_pair_code(account_name=None, device_id=None, phone=None):
+    if not _is_admin():
+        return _deny("Pair Code للأدمن فقط")
+    if not phone:
+        return {"success": False, "message": "اكتب رقم الهاتف بكود الدولة"}
+    account = _social_account(account_name)
+    ok, err = _require_gowa(account)
+    if not ok:
+        return err
+    did = (device_id or account.device_id or _conf_value("social_gowa_device_id", "orders_wa_1")).strip()
+    account.device_id = did
+    account.save(ignore_permissions=True)
+    frappe.db.commit()
+    _gowa_call(account, "POST", "/devices", json_body={"device_id": did})
+    res = _gowa_call(account, "GET", "/app/login-with-code?phone=" + normalize_phone(phone), headers={"X-Device-Id": did}, timeout=35)
+    return {"success": True, "account": account.name, "device_id": did, "response": res}
+
+
+@frappe.whitelist(allow_guest=False)
+def gowa_reconnect(account_name=None, device_id=None):
+    if not _is_admin():
+        return _deny("للأدمن فقط")
+    account = _social_account(account_name)
+    ok, err = _require_gowa(account)
+    if not ok:
+        return err
+    did = device_id or account.device_id
+    return {"success": True, "response": _gowa_call(account, "GET", "/app/reconnect", headers={"X-Device-Id": did})}
+
+
+@frappe.whitelist(allow_guest=False)
+def gowa_logout_device(account_name=None, device_id=None):
+    if not _is_admin():
+        return _deny("للأدمن فقط")
+    account = _social_account(account_name)
+    ok, err = _require_gowa(account)
+    if not ok:
+        return err
+    did = device_id or account.device_id
+    return {"success": True, "response": _gowa_call(account, "GET", "/app/logout", headers={"X-Device-Id": did})}
+
+
+@frappe.whitelist(allow_guest=False)
+def gowa_remove_device(account_name=None, device_id=None):
+    if not _is_admin():
+        return _deny("للأدمن فقط")
+    account = _social_account(account_name)
+    ok, err = _require_gowa(account)
+    if not ok:
+        return err
+    did = device_id or account.device_id
+    return {"success": True, "response": _gowa_call(account, "DELETE", "/devices/%s" % did)}
+PY
+
+say "5) Canonicalize Social Accounts: one active GOWA; disable duplicates/placeholders"
+cat > "$APP_DIR/scripts/social_final_canonical.py" <<'PY'
+import frappe
+
+
+def run():
+    base = frappe.conf.get('social_gowa_base_url') or 'http://10.11.1.66:33030'
+    user = frappe.conf.get('social_gowa_username') or 'roshdy_admin'
+    device = frappe.conf.get('social_gowa_device_id') or 'orders_wa_1'
+    name = (
+        frappe.db.get_value('Social Channel Account', {'provider':'GOWA WhatsApp Web', 'channel_type':'WhatsApp'}, 'name')
+        or frappe.db.get_value('Social Channel Account', {'account_label':'واتساب أوردرات رشدي'}, 'name')
+    )
+    if name:
+        doc = frappe.get_doc('Social Channel Account', name)
+    else:
+        doc = frappe.get_doc({'doctype':'Social Channel Account'})
+    doc.account_label = 'واتساب أوردرات رشدي'
+    doc.channel_type = 'WhatsApp'
+    doc.provider = 'GOWA WhatsApp Web'
+    doc.device_id = device
+    doc.phone_label = device
+    doc.api_base_url = base.rstrip('/')
+    doc.api_username = user
+    doc.active = 1
+    doc.admin_only_start_chat = 1
+    doc.allowed_roles = doc.allowed_roles or 'Social Inbox Admin\nSocial Inbox Supervisor\nSocial Inbox Agent\nCall Center Admin'
+    doc.allowed_users = doc.allowed_users or ''
+    doc.status = doc.status or 'Unknown'
+    if doc.is_new():
+        doc.insert(ignore_permissions=True)
+    else:
+        doc.save(ignore_permissions=True)
+    # Disable duplicate GOWA accounts so UI doesn't select blank test accounts.
+    for r in frappe.get_all('Social Channel Account', filters={'provider':'GOWA WhatsApp Web', 'channel_type':'WhatsApp'}, fields=['name']):
+        if r.name != doc.name:
+            frappe.db.set_value('Social Channel Account', r.name, {'active':0, 'status':'Duplicate Disabled'}, update_modified=False)
+    # Keep non-WhatsApp placeholders inactive/planned.
+    for r in frappe.get_all('Social Channel Account', filters={'channel_type':['in',['Facebook','Instagram','TikTok']]}, fields=['name','status']):
+        frappe.db.set_value('Social Channel Account', r.name, {'active':0, 'status': r.status or 'Planned'}, update_modified=False)
+    frappe.db.commit()
+    return {'success': True, 'canonical_account': doc.name, 'base': doc.api_base_url, 'device': doc.device_id}
+PY
+
+chmod 644 "$APP_DIR/api/social_inbox_api.py" "$APP_DIR/scripts/social_final_canonical.py"
+docker exec "$BACKEND" bash -lc "find /home/frappe/frappe-bench/apps/restaurant_ops -name '*.pyc' -delete; find /home/frappe/frappe-bench/apps/restaurant_ops -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.scripts.social_final_canonical.run
+
+say "6) Fix admin-desk 417 safely"
+python3 - <<'PY'
+from pathlib import Path
+import re
+p = Path('/opt/frappe_crm/apps/restaurant_ops/restaurant_ops/www/admin-desk.html')
+if not p.exists():
+    print('⚠️ admin-desk.html missing')
+    raise SystemExit
+s = p.read_text(errors='ignore')
+patterns = [
+    r'<!-- ROSHDY_SOCIAL_INBOX_ADMIN_LINK_START -->[\s\S]*?<!-- ROSHDY_SOCIAL_INBOX_ADMIN_LINK_END -->',
+    r'<style[^>]*id=["\']roshdy-social-admin-style["\'][\s\S]*?</style>\s*',
+    r'<div[^>]*id=["\']roshdySocialAdminDock["\'][\s\S]*?</div>\s*',
+]
+for pat in patterns:
+    s = re.sub(pat, '', s, flags=re.I)
+s = s.replace('{#', '{ #')
+block = '''
+<!-- ROSHDY_SOCIAL_INBOX_ADMIN_LINK_START -->
+<div id="roshdySocialAdminDock" style="position:fixed;left:18px;top:86px;z-index:99999;display:flex;flex-direction:column;gap:8px;direction:rtl;font-family:Tahoma,Arial">
+  <a href="/social-inbox" style="background:#10b981;color:#fff;text-decoration:none;border-radius:14px;padding:10px 13px;box-shadow:0 8px 24px rgba(0,0,0,.14);font-weight:800">💬 Social Inbox</a>
+  <a href="/social-settings" style="background:#1F4E79;color:#fff;text-decoration:none;border-radius:14px;padding:10px 13px;box-shadow:0 8px 24px rgba(0,0,0,.14);font-weight:800">⚙️ Social Settings</a>
+</div>
+<!-- ROSHDY_SOCIAL_INBOX_ADMIN_LINK_END -->
+'''
+if '<body' in s.lower():
+    s = re.sub(r'(<body[^>]*>)', r'\1\n' + block, s, count=1, flags=re.I)
+else:
+    s = block + s
+p.write_text(s)
+print('✅ admin-desk sanitized')
+PY
+
+say "7) Clear cache + restart"
+docker exec "$BACKEND" bench --site "$SITE" migrate
+docker exec "$BACKEND" bench --site "$SITE" clear-cache || true
+docker exec "$BACKEND" bench --site "$SITE" clear-website-cache || true
+docker compose restart backend frontend websocket queue-short queue-long scheduler
+sleep 10
+BACKEND="$(docker compose ps -q backend)"
+
+say "8) Validation"
+echo "--- debug_gowa_auth ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.social_inbox_api.debug_gowa_auth || true
+
+echo "--- list accounts ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.social_inbox_api.list_accounts || true
+
+ACC="$(docker exec "$BACKEND" bench --site "$SITE" execute frappe.db.get_value --args '["Social Channel Account", {"provider":"GOWA WhatsApp Web", "channel_type":"WhatsApp", "active":1}, "name"]' 2>/dev/null | tr -d '"' || true)"
+echo "ERP active GOWA account: $ACC"
+if [[ -n "$ACC" && "$ACC" != "None" ]]; then
+  echo "--- test_account ---"
+  docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.social_inbox_api.test_account --kwargs "{\"account_name\":\"$ACC\"}" || true
+fi
+
+echo "--- Page HTTP status ---"
+BAD=0
+for page in admin-desk social-settings social-inbox agent-desk call-report; do
+  code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$page" || true)"
+  echo "$page => $code"
+  [[ "$code" == "200" || "$code" == "302" ]] || BAD=1
+done
+
+if [[ "$BAD" == "1" ]]; then
+  echo "⚠️ فيه صفحة مش 200/302. آخر أخطاء backend:"
+  docker compose logs --tail=220 backend | grep -Ei "Traceback|TemplateSyntaxError|admin-desk|social-settings|social-inbox|417|500|jinja" -A4 -B4 || true
+fi
+
+say "9) Health Check مهم: Elastix/CDR/AMI + Queue + Call Report"
+echo "--- Asterisk/Elastix diagnostics ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics || true
+
+echo "--- Queue status ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.queue_api.get_queue_status || true
+
+echo "--- Calls report admin sample ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' || true
+
+say "✅ Roshdy Social Final Fix Done يا زعيم"
+echo "GOWA login: http://$SERVER_IP:$GOWA_PORT"
+echo "username: $GOWA_USER"
+echo "password: $NEWPASS"
+echo "Facebook/Instagram/TikTok: لسه Browser Connector منفصل بعد تثبيت الواتساب."
+echo "Backup: $BACKUP_DIR"

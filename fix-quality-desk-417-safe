@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# fix-quality-desk-417-safe
+# Emergency fix for /quality-desk 417 after JS injection.
+# Rewrites quality-desk as a pure static safe page with no Jinja expressions.
+# Keeps: filters, stats, full complaint details, attachments, save quality review, print/PDF, open Desk list/form.
+# Does NOT touch CDR/report_api/Elastix except health checks.
+
+ROOT="/opt/frappe_crm"
+SITE="crm.local"
+APP_HOST="$ROOT/apps/restaurant_ops"
+APP_DIR="$APP_HOST/restaurant_ops"
+WWW_DIR="$APP_DIR/www"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/FIX_QUALITY_DESK_417_SAFE_BEFORE_$TS"
+
+say(){ echo -e "\n============================================================\n$1\n============================================================"; }
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo "❌ شغّل كـ root: sudo -i ثم ./fix-quality-desk-417-safe"
+  exit 1
+fi
+
+say "1) Backup قبل إصلاح 417 في Quality Desk"
+cd "$ROOT"
+BACKEND="$(docker compose ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ لم أجد backend container. شغّل: cd /opt/frappe_crm && docker compose up -d"
+  exit 1
+fi
+mkdir -p "$BACKUP_DIR"
+cp -a "$APP_HOST" "$BACKUP_DIR/restaurant_ops"
+[[ -f "$ROOT/docker-compose.yml" ]] && cp -a "$ROOT/docker-compose.yml" "$BACKUP_DIR/docker-compose.yml"
+echo "✅ Backup: $BACKUP_DIR"
+
+say "2) Rewrite quality-desk.py safe"
+mkdir -p "$WWW_DIR"
+cat > "$WWW_DIR/quality-desk.py" <<'PY'
+import frappe
+no_cache = 1
+
+def get_context(context):
+    if frappe.session.user == "Guest":
+        frappe.local.flags.redirect_location = "/login?redirect-to=/quality-desk"
+        raise frappe.Redirect
+    roles = frappe.get_roles(frappe.session.user)
+    allowed = {"Complaint_Quality_User", "Call Center Admin", "System Manager"}
+    if frappe.session.user != "Administrator" and not (set(roles) & allowed):
+        frappe.throw("Not permitted", frappe.PermissionError)
+    return context
+PY
+chmod 644 "$WWW_DIR/quality-desk.py"
+
+say "3) Rewrite quality-desk.html static بدون Jinja"
+cat > "$WWW_DIR/quality-desk.html" <<'HTML'
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Quality Desk</title>
+<style>
+*{box-sizing:border-box;font-family:'Segoe UI',Tahoma,Arial}body{margin:0;background:#eef2f7;color:#111827;direction:rtl}.top{background:#20262d;color:#fff;padding:14px 22px;display:flex;justify-content:space-between;align-items:center;border-bottom:4px solid #6f42c1}.top a,.top button{color:#fff;text-decoration:none;border:1px solid #64748b;border-radius:10px;padding:8px 12px;margin:2px;background:#1F4E79;cursor:pointer}.wrap{padding:22px;max-width:1600px;margin:auto}.title{text-align:center;color:#1F4E79;margin:12px 0 22px}.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:16px}.stat{background:#fff;border:1px solid #d8dee9;border-right:5px solid #6f42c1;border-radius:14px;padding:14px;box-shadow:0 6px 18px #0001}.stat .lbl{color:#64748b;font-weight:800;font-size:13px}.stat .num{font-size:30px;font-weight:900;color:#1F4E79}.panel{background:#fff;border:1px solid #d8dee9;border-radius:16px;box-shadow:0 10px 28px #0001;margin-bottom:16px;overflow:hidden}.head{padding:14px 16px;border-bottom:1px solid #e5e7eb;display:flex;justify-content:space-between;gap:10px;align-items:center}.body{padding:16px}.grid{display:grid;grid-template-columns:repeat(6,1fr);gap:10px}label{font-weight:800;color:#475569;font-size:12px}input,select,textarea{width:100%;border:1px solid #d1d5db;border-radius:11px;padding:9px}.btn{border:0;border-radius:11px;padding:10px 13px;background:#1F4E79;color:white;font-weight:800;cursor:pointer;text-decoration:none;display:inline-block}.btn.green{background:#16a34a}.btn.orange{background:#f97316}.btn.red{background:#dc2626}.btn.purple{background:#7c3aed}.btn.light{background:white;color:#111827;border:1px solid #d1d5db}.tablewrap{overflow:auto}.table{width:100%;border-collapse:collapse;min-width:1120px}.table th{background:#111827;color:#fff;padding:10px;text-align:right}.table td{border:1px solid #e5e7eb;padding:9px;font-size:13px}.tag{border-radius:999px;padding:3px 8px;font-size:12px;font-weight:800}.open{background:#fee2e2;color:#991b1b}.review{background:#fef3c7;color:#92400e}.done{background:#dcfce7;color:#166534}.muted{color:#64748b;font-size:12px}.modal{display:none;position:fixed;inset:0;background:#0008;z-index:99999;align-items:center;justify-content:center;padding:20px}.modal.show{display:flex}.modalbox{background:#fff;border-radius:18px;max-width:1120px;width:100%;max-height:94vh;overflow:auto}.modalhead{padding:14px 18px;background:#20262d;color:#fff;display:flex;justify-content:space-between;align-items:center}.modalbody{padding:18px}.cols{display:grid;grid-template-columns:1fr 1fr;gap:12px}.info{border:1px solid #e5e7eb;background:#f8fafc;border-radius:12px;padding:12px;margin:8px 0}.att{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px}.att a{display:block;border:1px solid #ddd;border-radius:10px;padding:8px;text-decoration:none;color:#1F4E79;background:#fff}.att img{max-width:100%;max-height:120px;display:block;margin:auto}.debug{background:#0f172a;color:#dcfce7;padding:10px;border-radius:10px;white-space:pre-wrap;direction:ltr;text-align:left;max-height:220px;overflow:auto}@media(max-width:1000px){.grid{grid-template-columns:1fr 1fr}.cols{grid-template-columns:1fr}.top{display:block}.table{min-width:900px}}
+</style>
+</head>
+<body>
+<div class="top"><b>⭐ ديسك الجودة ومتابعة الشكاوى</b><div><a class="btn purple" href="/app/call-center-complaint" target="_blank">📋 سجل الشكاوى في Desk</a><a class="btn" href="/roshdy-logout">خروج</a></div></div>
+<div class="wrap"><h2 class="title" id="welcome">جاري التحميل...</h2><div class="stats"><div class="stat"><div class="lbl">إجمالي الفترة</div><div class="num" id="st_total">0</div></div><div class="stat"><div class="lbl">مفتوحة</div><div class="num" id="st_open">0</div></div><div class="stat"><div class="lbl">قيد المراجعة</div><div class="num" id="st_review">0</div></div><div class="stat"><div class="lbl">تم حلها/إغلاقها</div><div class="num" id="st_resolved">0</div></div><div class="stat"><div class="lbl">عاجلة/High</div><div class="num" id="st_urgent">0</div></div><div class="stat"><div class="lbl">تمت مراجعتها</div><div class="num" id="st_reviewed">0</div></div></div>
+<div class="panel"><div class="head"><b>فلاتر التقرير</b><button class="btn light" onclick="setThisMonth()">الشهر الحالي</button></div><div class="body"><div class="grid"><div><label>من تاريخ</label><input type="date" id="date_from"></div><div><label>إلى تاريخ</label><input type="date" id="date_to"></div><div><label>الحالة</label><select id="status"><option value="All">الكل</option><option value="Draft">مسودة</option><option value="Open">مفتوحة</option><option value="Under Review">قيد المراجعة</option><option value="Resolved">تم الحل</option><option value="Closed">مغلقة</option></select></div><div><label>الأولوية</label><select id="priority"><option value="All">الكل</option><option value="Low">منخفضة</option><option value="Medium">متوسطة</option><option value="High">عالية</option><option value="Urgent">عاجلة</option></select></div><div><label>بحث</label><input id="search" placeholder="رقم/عميل/تفاصيل"></div><div><label>الإسناد</label><select id="assigned"><option value="All">الكل</option><option value="mine">المسند لي</option><option value="unassigned">غير مسند</option></select></div></div><br><button class="btn green" onclick="loadData()">تحديث</button> <button class="btn orange" onclick="printReport()">طباعة / PDF</button></div></div>
+<div class="panel"><div class="head"><b>الشكاوى</b><span class="muted" id="rowsInfo"></span></div><div class="body tablewrap"><table class="table"><thead><tr><th>رقم</th><th>التاريخ</th><th>العميل</th><th>الهاتف</th><th>الفئة</th><th>الأولوية</th><th>الحالة</th><th>المفتش</th><th>فتح</th></tr></thead><tbody id="tb"><tr><td colspan="9">جاري التحميل...</td></tr></tbody></table></div></div></div>
+<div class="modal" id="modal"><div class="modalbox"><div class="modalhead"><b id="m_title">شكوى</b><button class="btn red" onclick="closeModal()">X</button></div><div class="modalbody"><div id="m_info" class="info"></div><div id="m_attach" class="info"></div><br><div class="cols"><div><label>الحالة</label><select id="m_status"><option value="Draft">مسودة</option><option value="Open">مفتوحة</option><option value="Under Review">قيد المراجعة</option><option value="Resolved">تم الحل</option><option value="Closed">مغلقة</option></select></div><div><label>مسؤول الجودة</label><input id="m_assigned" placeholder="email أو اتركها للمستخدم الحالي"></div></div><br><label>تحليل التحقيق</label><textarea id="m_analysis" rows="5"></textarea><br><label>الإجراء التصحيحي</label><textarea id="m_action" rows="3"></textarea><br><label>ملاحظات الإغلاق</label><textarea id="m_closing" rows="3"></textarea><br><button class="btn green" id="saveBtn" onclick="saveComplaint()">حفظ مراجعة الجودة</button> <button class="btn light" onclick="openDeskComplaint()">فتح الشكوى في Desk</button> <button class="btn orange" onclick="printComplaint()">طباعة الشكوى PDF</button><pre id="m_debug" class="debug"></pre></div></div></div>
+<script>
+var currentComplaint=null;
+function method(parts){return parts.join('')}
+function esc(x){return String(x==null?'':x).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
+async function api(methodName,args){args=args||{};try{var r=await fetch('/api/method/'+methodName,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','Accept':'application/json','X-Frappe-CSRF-Token':window.csrf_token||''},body:JSON.stringify(args)});var j=await r.json();if(j&&j.message)return j.message}catch(e){}var qs=new URLSearchParams();Object.keys(args).forEach(function(k){if(args[k]!==undefined&&args[k]!==null)qs.append(k,args[k])});var r2=await fetch('/api/method/'+methodName+'?'+qs.toString(),{credentials:'same-origin',cache:'no-store'});var j2=await r2.json();return j2.message}
+function iso(d){return d.toISOString().slice(0,10)}
+function setThisMonth(){var d=new Date();date_from.value=iso(new Date(d.getFullYear(),d.getMonth(),1));date_to.value=iso(d);loadData()}
+function statusClass(s){s=String(s||'');if(['Resolved','Closed','تم الحل','مغلقة'].indexOf(s)>=0)return'done';if(['Under Review','قيد المراجعة'].indexOf(s)>=0)return'review';return'open'}
+function tagStatus(s){return '<span class="tag '+statusClass(s)+'">'+esc(s||'')+'</span>'}
+function fileHtml(f){var url=f.file_url||'';var name=f.file_name||url;var img=/\.(png|jpg|jpeg|gif|webp)$/i.test(url);return '<a href="'+esc(url)+'" target="_blank">'+(img?'<img src="'+esc(url)+'">':'📎')+'<br>'+esc(name)+'</a>'}
+async function loadData(){var d=await api(method(['restaurant','_ops.api.quality','_api.get_quality_dashboard']),{date_from:date_from.value,date_to:date_to.value,status:status.value,priority:priority.value,search:search.value,assigned:assigned.value,page_size:500});if(!d||!d.success){tb.innerHTML='<tr><td colspan="9">'+esc((d&&d.message)||'تعذر التحميل')+'</td></tr>';return}welcome.textContent='⭐ ديسك الجودة — أهلاً '+(d.employee_name||'');var s=d.stats||{};st_total.textContent=s.total||0;st_open.textContent=s.open||0;st_review.textContent=s.under_review||0;st_resolved.textContent=s.resolved||0;st_urgent.textContent=s.urgent||0;st_reviewed.textContent=s.reviewed||0;rowsInfo.textContent='الفترة '+d.date_from+' إلى '+d.date_to+' — عدد '+(d.total_rows||0);var rows=d.rows||[];tb.innerHTML=rows.length?rows.map(function(r){return '<tr><td>'+esc(r.name)+'</td><td>'+esc(r.dt)+'</td><td>'+esc(r.customer_name)+'</td><td>'+esc(r.phone_number)+'</td><td>'+esc(r.complaint_category)+'</td><td>'+esc(r.complaint_priority)+'</td><td>'+tagStatus(r.status)+'</td><td>'+esc(r.assigned_quality_inspector)+'</td><td><button class="btn" onclick="openComplaint(\''+esc(r.name)+'\')">فتح/مراجعة</button></td></tr>'}).join(''):'<tr><td colspan="9">لا توجد شكاوى في الفترة</td></tr>'}
+async function openComplaint(name){var d=await api(method(['restaurant','_ops.api.quality','_api.get_complaint_full']),{name:name});if(!d||!d.success){alert((d&&d.message)||'تعذر الفتح');return}currentComplaint=d.complaint;m_title.textContent='شكوى '+currentComplaint.name;m_info.innerHTML='<b>العميل:</b> '+esc(currentComplaint.customer_name)+' — <b>الهاتف:</b> '+esc(currentComplaint.phone_number)+'<br><b>الفئة:</b> '+esc(currentComplaint.complaint_category)+' — <b>الأولوية:</b> '+esc(currentComplaint.complaint_priority)+' — <b>الحالة:</b> '+esc(currentComplaint.status)+'<br><b>المصدر:</b> '+esc(currentComplaint.complaint_source)+' — <b>التاريخ:</b> '+esc(currentComplaint.complaint_datetime||currentComplaint.creation)+'<br><b>التفاصيل:</b><br><div style="white-space:pre-wrap">'+esc(currentComplaint.complaint_details)+'</div>';var files=d.attachments||[];m_attach.innerHTML='<b>المرفقات والصور:</b><div class="att">'+(files.length?files.map(fileHtml).join(''):'<span class="muted">لا توجد مرفقات</span>')+'</div>';m_status.value=statusValue(currentComplaint.status);m_assigned.value=currentComplaint.assigned_quality_inspector||'';m_analysis.value=currentComplaint.investigation_analysis||'';m_action.value=currentComplaint.corrective_action||'';m_closing.value=currentComplaint.closing_notes||'';m_debug.textContent='';modal.classList.add('show')}
+function statusValue(s){var m={'مسودة':'Draft','Draft':'Draft','مفتوحة':'Open','مفتوح':'Open','Open':'Open','قيد المراجعة':'Under Review','Under Review':'Under Review','تم الحل':'Resolved','Resolved':'Resolved','مغلقة':'Closed','مغلق':'Closed','Closed':'Closed'};return m[String(s||'').trim()]||'Under Review'}
+function closeModal(){modal.classList.remove('show')}
+async function saveComplaint(){if(!currentComplaint){alert('اختار شكوى الأول');return}saveBtn.disabled=true;saveBtn.textContent='جاري الحفظ...';m_debug.textContent='Saving...';var args={name:currentComplaint.name,assigned_quality_inspector:m_assigned.value||'',investigation_analysis:m_analysis.value||'',corrective_action:m_action.value||'',status:m_status.value||'Under Review',closing_notes:m_closing.value||''};try{var d=await api(method(['restaurant','_ops.api.quality','_api.update_quality_review']),args);m_debug.textContent=JSON.stringify(d,null,2);if(d&&d.success){alert('تم حفظ مراجعة الجودة بنجاح');await loadData();currentComplaint.status=d.status||args.status}else alert((d&&d.message)||'فشل الحفظ')}catch(e){m_debug.textContent=String(e.stack||e);alert('Error: '+(e.message||e))}finally{saveBtn.disabled=false;saveBtn.textContent='حفظ مراجعة الجودة'}}
+function openDeskComplaint(){if(!currentComplaint){alert('اختار شكوى الأول');return}window.open('/app/call-center-complaint/'+encodeURIComponent(currentComplaint.name),'_blank')}
+async function printComplaint(){if(!currentComplaint)return;var d=await api(method(['restaurant','_ops.api.quality','_api.export_complaint_html']),{name:currentComplaint.name});if(d&&d.success){var w=window.open('','_blank');w.document.write(d.html);w.document.close()}else alert((d&&d.message)||'تعذر الطباعة')}
+async function printReport(){var d=await api(method(['restaurant','_ops.api.quality','_api.export_quality_report_html']),{date_from:date_from.value,date_to:date_to.value,status:status.value,priority:priority.value,search:search.value,assigned:assigned.value});if(d&&d.success){var w=window.open('','_blank');w.document.write(d.html);w.document.close()}else alert((d&&d.message)||'تعذر الطباعة')}
+setThisMonth();
+</script>
+</body>
+</html>
+HTML
+chmod 644 "$WWW_DIR/quality-desk.html"
+
+say "4) Clear cache/restart"
+docker exec "$BACKEND" bench --site "$SITE" clear-cache || true
+docker exec "$BACKEND" bench --site "$SITE" clear-website-cache || true
+docker compose restart backend frontend
+sleep 8
+BACKEND="$(docker compose ps -q backend)"
+
+say "5) Validation"
+echo "--- Page HTTP status ---"
+for page in quality-desk app/call-center-complaint call-report admin-desk; do
+  code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$page" || true)"
+  echo "$page => $code"
+done
+
+echo "--- quality dashboard api ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.quality_api.get_quality_dashboard --kwargs '{"page_size":2}' || true
+
+say "6) Health Check مهم: Elastix/CDR/AMI + Queue + Call Report"
+echo "--- Asterisk/Elastix diagnostics ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics || true
+
+echo "--- Queue status ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.queue_api.get_queue_status || true
+
+echo "--- Calls report admin sample ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' || true
+
+say "✅ Quality Desk 417 fixed يا زعيم"
+echo "افتح /quality-desk واعمل Ctrl+F5. الزر فوق يفتح سجل الشكاوى في Desk، وجوه المودال زر يفتح نفس الشكوى في Desk."
+echo "Backup: $BACKUP_DIR"

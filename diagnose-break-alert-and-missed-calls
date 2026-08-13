@@ -1,0 +1,411 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# READ-ONLY diagnostic for:
+# 1) Why admin-ended break alert does not appear on agent/my-break.
+# 2) Why customer-service email shows missed/cancelled employee attempts but upper email does not list employees.
+# It creates a temporary diagnostic module, runs it, then removes it. No business data is changed.
+# It does NOT touch report_api.py / Elastix / CDR / AMI config.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "❌ docker compose/docker-compose مش موجود"
+  exit 1
+fi
+
+APP_DIR="$ROOT/apps/$APP"
+PKG_DIR="$APP_DIR/$APP"
+API_DIR="$PKG_DIR/api"
+WWW_DIR="$PKG_DIR/www"
+SCRIPTS_DIR="$PKG_DIR/scripts"
+TS="$(date +%Y%m%d_%H%M%S)"
+OUT_DIR="$ROOT/backups/DIAG_BREAK_ALERT_MISSED_CALLS_$TS"
+mkdir -p "$OUT_DIR" "$SCRIPTS_DIR"
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend container مش شغال أو مش لاقيه"
+  exit 1
+fi
+
+bench_exec() {
+  "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"
+}
+
+echo "============================================================"
+echo "🔎 Diagnostic only: break alert + missed/cancelled calls"
+echo "📁 Output: $OUT_DIR"
+echo "============================================================"
+
+# Capture current relevant page/API files, no edits.
+for f in \
+  "$WWW_DIR/agent-desk.html" "$WWW_DIR/my-break.html" "$WWW_DIR/break-admin.html" "$WWW_DIR/admin-desk.html" \
+  "$API_DIR/break_api.py" "$API_DIR/break_notifications.py" "$API_DIR/email_report.py" "$API_DIR/upper_management_email_api.py" "$API_DIR/report_api.py"; do
+  if [[ -f "$f" ]]; then
+    cp -a "$f" "$OUT_DIR/$(basename "$f").snapshot" || true
+  fi
+done
+
+# Grep important labels/code paths.
+{
+  echo "===== grep break alert endpoints in www/api ====="
+  grep -RIn --exclude='*.pyc' --exclude-dir='__pycache__' \
+    -e "get_my_break_admin_alert" \
+    -e "acknowledge_admin_closed_break" \
+    -e "admin_end_break" \
+    -e "roshdy_break_force_closed" \
+    -e "closure_type" \
+    -e "closed_by" \
+    "$WWW_DIR" "$API_DIR" || true
+  echo
+  echo "===== grep missed/cancelled report words ====="
+  grep -RIn --exclude='*.pyc' --exclude-dir='__pycache__' \
+    -e "staff_missed" -e "employee_missed" -e "missed_by_employee" -e "declined" -e "rejected" -e "BUSY" -e "NO ANSWER" \
+    -e "محاولات" -e "فائت" -e "كنسل" -e "مرفوض" \
+    "$API_DIR/email_report.py" "$API_DIR/upper_management_email_api.py" "$API_DIR/report_api.py" 2>/dev/null || true
+} | tee "$OUT_DIR/grep_relevant_code.txt"
+
+# Temporary diagnostic module.
+DIAG_MOD="$SCRIPTS_DIR/diag_break_alert_missed_calls_v13.py"
+cat > "$DIAG_MOD" <<'PY'
+# -*- coding: utf-8 -*-
+import json
+import re
+import frappe
+from frappe.utils import cstr, cint, flt, now_datetime, add_to_date, today
+
+
+def _cols(dt):
+    try:
+        return [d.fieldname for d in frappe.get_meta(dt).fields] + ["name", "owner", "creation", "modified", "modified_by", "docstatus"]
+    except Exception:
+        return []
+
+
+def _has(dt, fn):
+    try:
+        return frappe.get_meta(dt).has_field(fn) or fn in ("name", "owner", "creation", "modified", "modified_by", "docstatus")
+    except Exception:
+        return False
+
+
+def _safe_fields(dt, wanted):
+    return [f for f in wanted if _has(dt, f)]
+
+
+def _get_all_safe(dt, wanted, filters=None, order_by=None, limit=20):
+    if not frappe.db.exists("DocType", dt):
+        return []
+    fields = _safe_fields(dt, wanted)
+    if not fields:
+        fields = ["name"]
+    try:
+        return frappe.get_all(dt, filters=filters or {}, fields=fields, order_by=order_by, limit_page_length=limit)
+    except Exception as e:
+        return [{"error": cstr(e), "fields_attempted": fields}]
+
+
+def _employee_user(emp):
+    if not emp or not frappe.db.exists("DocType", "Employee"):
+        return None
+    try:
+        return frappe.db.get_value("Employee", emp, "user_id")
+    except Exception:
+        return None
+
+
+def _employee_name(emp):
+    if not emp or not frappe.db.exists("DocType", "Employee"):
+        return emp
+    try:
+        return frappe.db.get_value("Employee", emp, "employee_name") or emp
+    except Exception:
+        return emp
+
+
+def _ext_sessions(ext=None, user=None):
+    if not frappe.db.exists("DocType", "Extension Session"):
+        return []
+    filters = {"session_status": "active"}
+    if ext:
+        filters["extension"] = ext
+    if user:
+        filters["user"] = user
+    return _get_all_safe("Extension Session", ["name", "user", "employee", "extension", "session_status", "creation", "modified"], filters=filters, order_by="modified desc", limit=20)
+
+
+def _target_candidates_for_break(row):
+    out = []
+    emp = row.get("employee")
+    ext = row.get("extension_at_start")
+    owner = row.get("owner")
+    u = _employee_user(emp)
+    if u:
+        out.append({"source": "Employee.user_id", "user": u})
+    if ext:
+        for s in _ext_sessions(ext=ext):
+            if s.get("user"):
+                out.append({"source": "Extension Session active", "user": s.get("user"), "extension": ext})
+    if owner and owner not in ("Administrator", "Guest"):
+        out.append({"source": "Break owner", "user": owner})
+    # de-dupe
+    seen = set(); clean = []
+    for x in out:
+        u = x.get("user")
+        if u and u not in seen:
+            seen.add(u); clean.append(x)
+    return clean
+
+
+def _simulate_alert_for_user(user):
+    if not user:
+        return None
+    old = frappe.session.user
+    try:
+        frappe.set_user(user)
+        from restaurant_ops.api import break_api
+        return break_api.get_my_break_admin_alert()
+    except Exception as e:
+        return {"error": cstr(e)}
+    finally:
+        try:
+            frappe.set_user(old)
+        except Exception:
+            pass
+
+
+def _parse_ext(row):
+    for k in ("actual_ext", "extension", "agent_extension"):
+        v = cstr(row.get(k) or "").strip()
+        if re.match(r"^\d{3,6}$", v) and v not in ("123", "1234"):
+            return v
+    blob = " ".join(cstr(row.get(k) or "") for k in ("agent_name", "dstchannel", "channel", "lastdata", "dst", "clid"))
+    pats = [r"(?:Local|SIP|PJSIP|IAX2|DAHDI)/(\d{3,6})", r"تحويلة\s*(\d{3,6})", r"\((\d{3,6})\)", r"\b(\d{3,6})\b"]
+    for pat in pats:
+        m = re.search(pat, blob, re.I)
+        if m and m.group(1) not in ("123", "1234"):
+            return m.group(1)
+    return ""
+
+
+def _employee_by_ext(ext):
+    if not ext or not frappe.db.exists("DocType", "Employee"):
+        return ""
+    try:
+        meta = frappe.get_meta("Employee")
+        fields = []
+        for df in meta.fields:
+            fn = cstr(df.fieldname).lower()
+            if any(x in fn for x in ("extension", "ext", "sip")):
+                fields.append(df.fieldname)
+        for fn in fields:
+            val = frappe.db.get_value("Employee", {fn: ext}, "employee_name")
+            if val:
+                return val
+    except Exception:
+        pass
+    return ""
+
+
+def _call_report(kwargs):
+    try:
+        from restaurant_ops.api import report_api
+        res = report_api.get_calls_report(**kwargs)
+        return res.get("message") if isinstance(res, dict) and isinstance(res.get("message"), dict) else res
+    except Exception as e:
+        return {"success": False, "error": cstr(e), "kwargs": kwargs}
+
+
+def _rows(obj):
+    if isinstance(obj, dict):
+        for k in ("calls", "rows", "data", "records", "items", "result"):
+            if isinstance(obj.get(k), list):
+                return obj.get(k)
+    return []
+
+
+def _sample_call_row(r):
+    ext = _parse_ext(r)
+    return {
+        "calldate": r.get("calldate"),
+        "src": r.get("src") or r.get("cnum"),
+        "dst": r.get("dst"),
+        "actual_ext": r.get("actual_ext"),
+        "parsed_ext": ext,
+        "mapped_employee": _employee_by_ext(ext),
+        "agent_name": r.get("agent_name"),
+        "smart_category": r.get("smart_category"),
+        "category_label": r.get("category_label"),
+        "disposition": r.get("disposition"),
+        "duration": r.get("duration"),
+        "billsec": r.get("billsec"),
+        "lastapp": r.get("lastapp"),
+        "lastdata": r.get("lastdata"),
+        "dstchannel": r.get("dstchannel"),
+        "uniqueid": r.get("uniqueid"),
+    }
+
+
+def _report_category_diagnostics():
+    cats = [None, "staff_missed", "employee_missed", "agent_missed", "missed_by_employee", "declined", "rejected", "busy", "abandoned", "no_answer"]
+    out = []
+    for cat in cats:
+        kwargs = {"page": 1, "page_size": 20, "view_mode": "admin"}
+        if cat:
+            kwargs["smart_category"] = cat
+        data = _call_report(kwargs)
+        rs = _rows(data)
+        out.append({
+            "smart_category_filter": cat or "ALL",
+            "success": data.get("success") if isinstance(data, dict) else None,
+            "summary": data.get("summary") if isinstance(data, dict) else None,
+            "pagination": data.get("pagination") if isinstance(data, dict) else None,
+            "row_count_returned": len(rs),
+            "sample_rows": [_sample_call_row(x) for x in rs[:8]],
+            "error": data.get("error") if isinstance(data, dict) else None,
+        })
+    return out
+
+
+def _upper_debug_missed():
+    try:
+        from restaurant_ops.api import upper_management_email_api as up
+        if hasattr(up, "debug_employee_missed_rows"):
+            return up.debug_employee_missed_rows()
+        data = up.get_upper_management_report_data()
+        return data.get("calls", {})
+    except Exception as e:
+        return {"error": cstr(e)}
+
+
+def _email_debug():
+    out = {}
+    try:
+        from restaurant_ops.api import upper_management_email_api as up
+        if hasattr(up, "debug_email_send_config"):
+            out["upper_debug_email_send_config"] = up.debug_email_send_config()
+    except Exception as e:
+        out["upper_debug_error"] = cstr(e)
+    try:
+        rows = frappe.db.sql("""
+            select 'User' as source, name as doctype, 'email' as field, email as value
+            from `tabUser`
+            where email like '%%@roshdy.com%%'
+            union all
+            select 'Singles' as source, doctype, field, value
+            from `tabSingles`
+            where value like '%%@roshdy.com%%'
+        """, as_dict=True)
+        out["roshdy_dot_com_occurrences"] = rows
+    except Exception as e:
+        out["roshdy_scan_error"] = cstr(e)
+    return out
+
+
+def execute():
+    result = {"generated_at": now_datetime().strftime("%Y-%m-%d %H:%M:%S")}
+    # Schema
+    for dt in ("Employee Break Log", "Employee", "Extension Session", "Call Center Complaint"):
+        result[f"schema_{dt}"] = _cols(dt)
+
+    # Break rows
+    wanted_break = ["name", "owner", "creation", "modified", "employee", "break_type", "status", "start_time", "end_time", "duration_minutes", "duration_seconds", "extension_at_start", "closed_by", "closure_type", "admin_close_target_user", "admin_close_acknowledged", "admin_close_acknowledged_at", "admin_close_message", "notes"]
+    result["recent_break_logs"] = _get_all_safe("Employee Break Log", wanted_break, order_by="modified desc", limit=20)
+    result["recent_admin_closed_breaks"] = _get_all_safe("Employee Break Log", wanted_break, filters={"closure_type": "admin"}, order_by="modified desc", limit=10)
+    # Add target candidates/simulated alerts for admin closed rows
+    enriched = []
+    for r in result["recent_admin_closed_breaks"]:
+        item = dict(r)
+        item["employee_name"] = _employee_name(r.get("employee"))
+        item["target_candidates"] = _target_candidates_for_break(r)
+        sims = []
+        for c in item["target_candidates"]:
+            sims.append({"candidate": c, "simulated_get_my_break_admin_alert": _simulate_alert_for_user(c.get("user"))})
+        item["simulations"] = sims
+        enriched.append(item)
+    result["recent_admin_closed_breaks_enriched"] = enriched
+
+    # Active extension sessions and employees with extension-like fields
+    result["active_extension_sessions"] = _ext_sessions()
+    emp_fields = ["name", "employee_name", "user_id", "status"]
+    try:
+        meta = frappe.get_meta("Employee")
+        for df in meta.fields:
+            fn = cstr(df.fieldname).lower()
+            if any(x in fn for x in ("extension", "ext", "sip")):
+                emp_fields.append(df.fieldname)
+    except Exception:
+        pass
+    result["employee_extension_mapping_sample"] = _get_all_safe("Employee", emp_fields, filters={}, order_by="modified desc", limit=100)
+
+    # API outputs
+    try:
+        from restaurant_ops.api import break_api
+        result["break_api_get_active_breaks"] = break_api.get_active_breaks()
+    except Exception as e:
+        result["break_api_get_active_breaks_error"] = cstr(e)
+    try:
+        old = frappe.session.user
+        result["current_user_debug_my_break_alert"] = _simulate_alert_for_user(old)
+    except Exception as e:
+        result["current_user_debug_my_break_alert_error"] = cstr(e)
+
+    result["call_report_category_diagnostics"] = _report_category_diagnostics()
+    result["upper_management_missed_debug"] = _upper_debug_missed()
+    result["email_debug"] = _email_debug()
+    return result
+PY
+
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+[[ -n "$APP_OWNER" ]] && chown "$APP_OWNER" "$DIAG_MOD" 2>/dev/null || true
+
+echo "▶️ Running diagnostic module..."
+set +e
+bench_exec execute restaurant_ops.scripts.diag_break_alert_missed_calls_v13.execute | tee "$OUT_DIR/diagnostic_result.json"
+RC=${PIPESTATUS[0]}
+set -e
+
+# Remove temporary module after running.
+rm -f "$DIAG_MOD" 2>/dev/null || true
+rm -rf "$SCRIPTS_DIR/__pycache__" 2>/dev/null || true
+
+if [[ $RC -ne 0 ]]; then
+  echo "❌ Diagnostic module failed. Check: $OUT_DIR/diagnostic_result.json"
+  exit 1
+fi
+
+# Also run the direct known endpoints in separate files for easy copy/paste.
+echo "▶️ Running direct endpoint checks..."
+set +e
+bench_exec execute restaurant_ops.api.break_api.get_active_breaks | tee "$OUT_DIR/direct_active_breaks.json"
+bench_exec execute restaurant_ops.api.break_api.get_my_break_admin_alert | tee "$OUT_DIR/direct_my_break_alert_as_current_user.json"
+bench_exec execute restaurant_ops.api.upper_management_email_api.debug_email_send_config | tee "$OUT_DIR/direct_email_debug.json"
+bench_exec execute restaurant_ops.api.upper_management_email_api.debug_employee_missed_rows | tee "$OUT_DIR/direct_employee_missed_rows.json"
+bench_exec execute restaurant_ops.api.upper_management_email_api.verify_cancellations_in_upper_email | tee "$OUT_DIR/direct_email_verify.json"
+set -e
+
+echo "🏥 Health check (read-only)"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$OUT_DIR/health_asterisk_bridge.json"
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status | tee "$OUT_DIR/health_queue_status.json"
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' | tee "$OUT_DIR/health_call_report.json"
+set -e
+
+echo "============================================================"
+echo "✅ Diagnostic finished"
+echo "📁 Send me these files/content from: $OUT_DIR"
+echo "   1) diagnostic_result.json"
+echo "   2) direct_employee_missed_rows.json"
+echo "   3) direct_my_break_alert_as_current_user.json"
+echo "   4) grep_relevant_code.txt"
+echo "   5) health_call_report.json"
+echo "============================================================"

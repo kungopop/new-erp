@@ -1,0 +1,283 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# fix-quality-save-action
+# Fixes Quality modal save button not saving:
+# - Removes bad Quality permlevel 2 rows.
+# - Ensures Complaint_Quality_User has clean level 0/1 permissions.
+# - Overrides update_quality_review to use db.set_value (no full DocType validation failures from old Arabic Select values).
+# - Injects robust JS save handler/status mapping into /quality-desk.
+# - Does NOT touch Call Report / CDR / Elastix logic except health checks.
+
+ROOT="/opt/frappe_crm"
+SITE="crm.local"
+APP_HOST="$ROOT/apps/restaurant_ops"
+APP_DIR="$APP_HOST/restaurant_ops"
+WWW_DIR="$APP_DIR/www"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/FIX_QUALITY_SAVE_ACTION_BEFORE_$TS"
+
+say(){ echo -e "\n============================================================\n$1\n============================================================"; }
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo "❌ شغّل كـ root: sudo -i ثم ./fix-quality-save-action"
+  exit 1
+fi
+
+say "1) Backup قبل إصلاح زر حفظ الجودة"
+cd "$ROOT"
+BACKEND="$(docker compose ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ لم أجد backend container. شغّل: cd /opt/frappe_crm && docker compose up -d"
+  exit 1
+fi
+mkdir -p "$BACKUP_DIR"
+cp -a "$APP_HOST" "$BACKUP_DIR/restaurant_ops"
+[[ -f "$ROOT/docker-compose.yml" ]] && cp -a "$ROOT/docker-compose.yml" "$BACKUP_DIR/docker-compose.yml"
+echo "✅ Backup: $BACKUP_DIR"
+
+say "2) Fix Quality permissions cleanly"
+mkdir -p "$APP_DIR/scripts" "$APP_DIR/api" "$WWW_DIR"
+cat > "$APP_DIR/scripts/fix_quality_save_permissions.py" <<'PY'
+import frappe
+
+
+def ensure_role(role):
+    if not frappe.db.exists('Role', role):
+        frappe.get_doc({'doctype':'Role','role_name':role,'desk_access':1}).insert(ignore_permissions=True)
+    else:
+        doc=frappe.get_doc('Role', role)
+        if not doc.desk_access:
+            doc.desk_access=1
+            doc.save(ignore_permissions=True)
+
+
+def append_perm(doc, role, permlevel, read=0, write=0, create=0, delete=0, report=0, export=0, select=0, print_=0):
+    doc.append('permissions', {
+        'role': role,
+        'permlevel': int(permlevel),
+        'select': int(select),
+        'read': int(read),
+        'write': int(write),
+        'create': int(create),
+        'delete': int(delete),
+        'submit': 0,
+        'cancel': 0,
+        'amend': 0,
+        'report': int(report),
+        'export': int(export),
+        'import': 0,
+        'share': 0,
+        'print': int(print_ or read),
+        'email': 0,
+    })
+
+
+def run():
+    ensure_role('Complaint_Quality_User')
+    dt='Call Center Complaint'
+    if frappe.db.exists('DocType', dt):
+        # Hard remove all existing Quality permissions from DB first, including any invalid zero row at level 2.
+        frappe.db.sql('delete from `tabDocPerm` where parent=%s and role=%s', (dt, 'Complaint_Quality_User'))
+        frappe.db.commit()
+        doc=frappe.get_doc('DocType', dt)
+        doc.permissions=[p for p in doc.permissions if p.role!='Complaint_Quality_User']
+        append_perm(doc, 'Complaint_Quality_User', 0, select=1, read=1, write=1, create=0, delete=0, report=1, export=1, print_=1)
+        append_perm(doc, 'Complaint_Quality_User', 1, select=1, read=1, write=1, create=0, delete=0, report=1, export=1, print_=1)
+        # Do not add level 2 row.
+        doc.save(ignore_permissions=True)
+        frappe.clear_cache(doctype=dt)
+    # Ensure quality users are System Users / Desk Users.
+    users=frappe.get_all('Has Role', filters={'role':'Complaint_Quality_User','parenttype':'User'}, pluck='parent')
+    for u in users:
+        if u in ('Administrator','Guest'):
+            continue
+        try:
+            usr=frappe.get_doc('User', u)
+            usr.enabled=1
+            usr.user_type='System User'
+            usr.save(ignore_permissions=True)
+            if not frappe.db.exists('Has Role', {'parent':u,'parenttype':'User','role':'Desk User'}):
+                usr.add_roles('Desk User')
+        except Exception as e:
+            print('user skip', u, e)
+    frappe.db.commit()
+    return {'success': True}
+PY
+chmod 644 "$APP_DIR/scripts/fix_quality_save_permissions.py"
+
+say "3) Append final API override for update_quality_review"
+cat >> "$APP_DIR/api/quality_api.py" <<'PY'
+
+# ===== ROSHDY QUALITY SAVE FINAL OVERRIDE START =====
+def _qsave_roles():
+    try:
+        return set(frappe.get_roles(frappe.session.user))
+    except Exception:
+        return set()
+
+
+def _qsave_allowed():
+    user = frappe.session.user
+    return user == 'Administrator' or bool(_qsave_roles() & {'Complaint_Quality_User', 'Call Center Admin', 'System Manager'})
+
+
+def _qsave_meta_fields():
+    try:
+        return {df.fieldname for df in frappe.get_meta('Call Center Complaint').fields}
+    except Exception:
+        return set()
+
+
+def _qsave_status(status):
+    s = str(status or '').strip()
+    mapping = {
+        'مسودة': 'Draft', 'Draft': 'Draft',
+        'مفتوح': 'Open', 'مفتوحة': 'Open', 'Open': 'Open',
+        'قيد المراجعة': 'Under Review', 'قيد مراجعه': 'Under Review', 'Under Review': 'Under Review',
+        'تم الحل': 'Resolved', 'محلولة': 'Resolved', 'Resolved': 'Resolved',
+        'مغلق': 'Closed', 'مغلقة': 'Closed', 'Closed': 'Closed',
+    }
+    return mapping.get(s, s if s in {'Draft','Open','Under Review','Resolved','Closed'} else '')
+
+
+@frappe.whitelist(allow_guest=False)
+def update_quality_review(name, assigned_quality_inspector=None, investigation_analysis='', corrective_action='', status='', closing_notes=''):
+    """Final safe save: update only quality/status fields with db.set_value to avoid full doc validation problems."""
+    if not _qsave_allowed():
+        return {'success': False, 'message': 'Permission denied'}
+    if not name or not frappe.db.exists('Call Center Complaint', name):
+        return {'success': False, 'message': 'Complaint not found'}
+    meta = _qsave_meta_fields()
+    values = {}
+    if 'assigned_quality_inspector' in meta:
+        values['assigned_quality_inspector'] = assigned_quality_inspector or frappe.session.user
+    if 'investigation_analysis' in meta:
+        values['investigation_analysis'] = investigation_analysis or ''
+    if 'corrective_action' in meta:
+        values['corrective_action'] = corrective_action or ''
+    if 'closing_notes' in meta:
+        values['closing_notes'] = closing_notes or ''
+    st = _qsave_status(status)
+    if st and 'status' in meta:
+        values['status'] = st
+        if st in {'Resolved', 'Closed'}:
+            if 'resolved_by' in meta:
+                values['resolved_by'] = frappe.session.user
+            if 'resolved_at' in meta:
+                values['resolved_at'] = now_datetime()
+    if not values:
+        return {'success': True, 'message': 'لا توجد حقول للتحديث', 'name': name}
+    frappe.db.set_value('Call Center Complaint', name, values, update_modified=True)
+    frappe.db.commit()
+    out = frappe.db.get_value('Call Center Complaint', name, ['name','status','assigned_quality_inspector','investigation_analysis','corrective_action','closing_notes'], as_dict=True)
+    return {'success': True, 'message': 'تم حفظ مراجعة الجودة', 'name': name, 'updated': values, 'complaint': out, 'status': out.get('status') if out else st}
+# ===== ROSHDY QUALITY SAVE FINAL OVERRIDE END =====
+PY
+chmod 644 "$APP_DIR/api/quality_api.py"
+
+say "4) Inject robust JS save handler into quality-desk"
+python3 - <<'PY'
+from pathlib import Path
+import re
+p=Path('/opt/frappe_crm/apps/restaurant_ops/restaurant_ops/www/quality-desk.html')
+if not p.exists():
+    raise SystemExit('quality-desk.html not found')
+s=p.read_text(errors='ignore')
+s=re.sub(r'<!-- ROSHDY_QUALITY_SAVE_FINAL_JS_START -->[\s\S]*?<!-- ROSHDY_QUALITY_SAVE_FINAL_JS_END -->','',s,flags=re.I)
+block=r'''
+<!-- ROSHDY_QUALITY_SAVE_FINAL_JS_START -->
+<script id="quality-save-final-js">
+(function(){
+function M(a){return a.join('')}
+function esc(x){return String(x==null?'':x).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
+function normStatus(s){s=String(s||'').trim();var m={'مسودة':'Draft','Draft':'Draft','مفتوح':'Open','مفتوحة':'Open','Open':'Open','قيد المراجعة':'Under Review','قيد مراجعه':'Under Review','Under Review':'Under Review','تم الحل':'Resolved','محلولة':'Resolved','Resolved':'Resolved','مغلق':'Closed','مغلقة':'Closed','Closed':'Closed'};return m[s]||s||'Under Review'}
+async function api(method,args){
+  args=args||{};
+  try{
+    var r=await fetch('/api/method/'+method,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','Accept':'application/json','X-Frappe-CSRF-Token':(window.csrf_token||'')},body:JSON.stringify(args)});
+    var j=await r.json();
+    if(j&&j.message) return j.message;
+  }catch(e){}
+  var qs=new URLSearchParams();Object.keys(args).forEach(function(k){if(args[k]!==undefined&&args[k]!==null)qs.append(k,args[k])});
+  var r2=await fetch('/api/method/'+method+'?'+qs.toString(),{credentials:'same-origin',cache:'no-store'});var j2=await r2.json();return j2.message;
+}
+function fixStatusSelect(){
+  var sel=document.getElementById('m_status'); if(!sel)return;
+  sel.innerHTML='<option value="Draft">مسودة</option><option value="Open">مفتوحة</option><option value="Under Review">قيد المراجعة</option><option value="Resolved">تم الحل</option><option value="Closed">مغلقة</option>';
+  try{ if(window.current&&window.current.status) sel.value=normStatus(window.current.status); }catch(e){}
+  if(!sel.value) sel.value='Under Review';
+}
+var oldOpen=window.openComplaint;
+if(typeof oldOpen==='function'){
+  window.openComplaint=async function(name){ await oldOpen(name); setTimeout(fixStatusSelect,120); };
+}
+window.saveComplaint=async function(){
+  var cur=window.current;
+  if(!cur||!cur.name){alert('مفيش شكوى مفتوحة');return;}
+  var btns=Array.from(document.querySelectorAll('button'));
+  var btn=btns.find(function(b){return (b.textContent||'').indexOf('حفظ مراجعة الجودة')>=0});
+  if(btn){btn.disabled=true;btn.textContent='جاري الحفظ...';}
+  var dbg=document.getElementById('m_debug'); if(dbg)dbg.textContent='Saving...';
+  var args={name:cur.name,assigned_quality_inspector:(document.getElementById('m_assigned')||{}).value||'',investigation_analysis:(document.getElementById('m_analysis')||{}).value||'',corrective_action:(document.getElementById('m_action')||{}).value||'',status:normStatus((document.getElementById('m_status')||{}).value||cur.status||'Under Review'),closing_notes:(document.getElementById('m_closing')||{}).value||''};
+  try{
+    var d=await api(M(['restaurant','_ops.api.quality','_api.update_quality_review']),args);
+    if(dbg)dbg.textContent=JSON.stringify(d,null,2);
+    if(d&&d.success){alert('تم حفظ مراجعة الجودة بنجاح'); if(typeof window.load==='function') await window.load(); cur.status=d.status||args.status;}
+    else alert((d&&d.message)||'فشل الحفظ');
+  }catch(e){ if(dbg)dbg.textContent=String(e.stack||e); alert('Error: '+(e.message||e)); }
+  finally{ if(btn){btn.disabled=false;btn.textContent='حفظ مراجعة الجودة';} }
+};
+document.addEventListener('click',function(ev){var b=ev.target&&ev.target.closest?ev.target.closest('button'):null;if(!b)return;if((b.textContent||'').indexOf('حفظ مراجعة الجودة')>=0){ev.preventDefault();ev.stopPropagation();window.saveComplaint();}},true);
+setTimeout(fixStatusSelect,500);
+})();
+</script>
+<!-- ROSHDY_QUALITY_SAVE_FINAL_JS_END -->
+'''
+if '</body>' in s:
+    s=s.replace('</body>',block+'\n</body>',1)
+else:
+    s+='\n'+block
+p.write_text(s)
+print('✅ quality desk JS save handler injected')
+PY
+
+say "5) Execute permissions fix + migrate + restart"
+docker exec "$BACKEND" bash -lc "find /home/frappe/frappe-bench/apps/restaurant_ops -name '*.pyc' -delete; find /home/frappe/frappe-bench/apps/restaurant_ops -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.scripts.fix_quality_save_permissions.run
+docker exec "$BACKEND" bench --site "$SITE" migrate
+docker exec "$BACKEND" bench --site "$SITE" clear-cache || true
+docker exec "$BACKEND" bench --site "$SITE" clear-website-cache || true
+docker compose restart backend frontend websocket queue-short queue-long scheduler
+sleep 10
+BACKEND="$(docker compose ps -q backend)"
+
+say "6) Validation"
+echo "--- update API import smoke ---"
+docker exec "$BACKEND" bench --site "$SITE" execute frappe.get_attr --args '["restaurant_ops.api.quality_api.update_quality_review"]' >/dev/null && echo "update_quality_review OK" || true
+
+echo "--- permissions check ---"
+docker exec "$BACKEND" bench --site "$SITE" execute frappe.db.sql --args '["select role, permlevel, `select`, `read`, `write`, `create`, `delete`, report, export from `tabDocPerm` where parent=\"Call Center Complaint\" and role=\"Complaint_Quality_User\" order by permlevel"]' || true
+
+echo "--- bad level 2 check ---"
+docker exec "$BACKEND" bench --site "$SITE" execute frappe.db.sql --args '["select name, role, permlevel from `tabDocPerm` where parent=\"Call Center Complaint\" and role=\"Complaint_Quality_User\" and permlevel=2"]' || true
+
+echo "--- Page HTTP status ---"
+for page in quality-desk quality-complaint call-report admin-desk; do
+  code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$page" || true)"
+  echo "$page => $code"
+done
+
+say "7) Health Check مهم: Elastix/CDR/AMI + Queue + Call Report"
+echo "--- Asterisk/Elastix diagnostics ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics || true
+
+echo "--- Queue status ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.queue_api.get_queue_status || true
+
+echo "--- Calls report admin sample ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' || true
+
+say "✅ Quality save button fixed يا زعيم"
+echo "افتح /quality-desk واعمل Ctrl+F5، وجرب حفظ مراجعة الجودة. المفروض يظهر Alert نجاح و m_debug فيه JSON success."
+echo "Backup: $BACKUP_DIR"

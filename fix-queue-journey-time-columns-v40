@@ -1,0 +1,442 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Roshdy V40: Queue Journey time columns and wording polish
+# ----------------------------------------------------------------------
+# User feedback:
+# - The time differences are confusing.
+# - Rename "وقت المصير" to a clearer "وقت الرد اللاحق".
+# - Add approximate ring start and response delay.
+# - Apply to /queue-journey-report and both email reports.
+#
+# Fix:
+# - Queue Journey API enriches rows with:
+#   ring_start_time, ring_end_time, response_time, response_after_seconds, response_after_text
+# - Queue Journey page uses clear columns:
+#   بداية الرن التقريبية / انتهاء الرن بدون رد / وقت الرد اللاحق / المدة حتى الرد
+# - Upper Management email uses the same clear columns.
+# - Customer Service Manager email journey section uses the same clear columns.
+#
+# Safety:
+# - Backup first.
+# - Does NOT edit report_api.py.
+# - Does NOT touch Elastix / CDR / AMI config.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "❌ docker compose/docker-compose مش موجود"
+  exit 1
+fi
+
+APP_DIR="$ROOT/apps/$APP"
+PKG_DIR="$APP_DIR/$APP"
+API_DIR="$PKG_DIR/api"
+WWW_DIR="$PKG_DIR/www"
+QUEUE_API="$API_DIR/queue_journey_api.py"
+UPPER_API="$API_DIR/upper_management_email_api.py"
+EMAIL_REPORT="$API_DIR/email_report.py"
+PAGE_HTML="$WWW_DIR/queue-journey-report.html"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/FIX_QUEUE_JOURNEY_TIME_COLUMNS_V40_BEFORE_$TS"
+mkdir -p "$BACKUP_DIR/files"
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend container مش شغال أو مش لاقيه"
+  exit 1
+fi
+
+bench_exec() { "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"; }
+
+echo "============================================================"
+echo "🔧 Roshdy V40: Queue Journey time columns polish"
+echo "📦 Backup: $BACKUP_DIR"
+echo "============================================================"
+
+echo "🧯 Step 1: Backup files + bench backup"
+for f in "$QUEUE_API" "$UPPER_API" "$EMAIL_REPORT" "$PAGE_HTML"; do
+  [[ -e "$f" ]] && cp -a "$f" "$BACKUP_DIR/files/$(basename "$f").before" || true
+done
+bench_exec backup --with-files | tee "$BACKUP_DIR/bench_backup_output.txt"
+
+# -----------------------------------------------------------------------------
+# 2) Patch Queue Journey API rows
+# -----------------------------------------------------------------------------
+echo "🧩 Step 2: Patch queue_journey_api.py"
+cat >> "$QUEUE_API" <<'PYAPI'
+
+# BEGIN ROSHDY QUEUE JOURNEY TIME COLUMNS V40
+try:
+    import frappe
+    from frappe.utils import cstr, flt, get_datetime, today
+    from datetime import timedelta
+except Exception:
+    pass
+
+try:
+    _qj40_prev_get_queue_journey_report = get_queue_journey_report
+except Exception:
+    _qj40_prev_get_queue_journey_report = None
+
+
+def _qj40_fmt_dt(dt):
+    try:
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return ""
+
+
+def _qj40_parse_dt(v):
+    try:
+        if not v:
+            return None
+        return get_datetime(v)
+    except Exception:
+        return None
+
+
+def _qj40_duration_text(seconds):
+    try:
+        seconds = int(round(float(seconds or 0)))
+    except Exception:
+        return ""
+    if seconds < 0:
+        seconds = 0
+    if seconds < 60:
+        return f"بعد {seconds} ثانية"
+    m = seconds // 60
+    s = seconds % 60
+    if s:
+        return f"بعد {m} دقيقة و {s} ثانية"
+    return f"بعد {m} دقيقة"
+
+
+def _qj40_enrich_row(row):
+    row = dict(row or {})
+    ring_end = _qj40_parse_dt(row.get("attempt_time"))
+    ring_seconds = flt(row.get("ring_seconds") or 0)
+    ring_start = ring_end - timedelta(seconds=ring_seconds) if ring_end else None
+    fate = cstr(row.get("fate") or "")
+    fate_time = _qj40_parse_dt(row.get("fate_time"))
+    answered = fate.startswith("answered_later")
+    row["ring_start_time"] = _qj40_fmt_dt(ring_start)
+    row["ring_end_time"] = _qj40_fmt_dt(ring_end) or cstr(row.get("attempt_time") or "")
+    row["response_time"] = _qj40_fmt_dt(fate_time) if answered else ""
+    row["response_after_seconds"] = int(max((fate_time - ring_end).total_seconds(), 0)) if answered and fate_time and ring_end else None
+    row["response_after_text"] = _qj40_duration_text(row.get("response_after_seconds")) if answered and row.get("response_after_seconds") is not None else ""
+    # Business wording for any old labels.
+    if row.get("fate_label") == "لم يظهر رد أو إغلاق بعد هذه المحاولة":
+        row["fate_label"] = "مصير المحاولة غير محسوم"
+    return row
+
+
+@frappe.whitelist()
+def get_queue_journey_report(date_from=None, date_to=None, threshold=15, queues=None, mask_phones=0, limit_rows=500):
+    if not _qj40_prev_get_queue_journey_report:
+        return {"success": False, "message": "Base queue journey report is missing"}
+    data = _qj40_prev_get_queue_journey_report(date_from=date_from, date_to=date_to, threshold=threshold, queues=queues, mask_phones=mask_phones, limit_rows=limit_rows)
+    try:
+        rows = [_qj40_enrich_row(r) for r in (data.get("rows") or [])]
+        data["rows"] = rows
+        # Also enrich sample if present under another key.
+        if data.get("attempt_rows_sample"):
+            data["attempt_rows_sample"] = [_qj40_enrich_row(r) for r in data.get("attempt_rows_sample")]
+    except Exception as e:
+        data["enrich_error"] = cstr(e)
+    return data
+
+
+@frappe.whitelist()
+def debug_queue_journey_time_columns_v40(date_from=None, date_to=None):
+    d = get_queue_journey_report(date_from=date_from or today(), date_to=date_to or date_from or today(), threshold=15, limit_rows=20)
+    return {"success": True, "summary": d.get("summary"), "rows_sample": d.get("rows", [])[:5]}
+# END ROSHDY QUEUE JOURNEY TIME COLUMNS V40
+PYAPI
+
+# -----------------------------------------------------------------------------
+# 3) Patch page JS by appending final load/csv override.
+# -----------------------------------------------------------------------------
+echo "🧩 Step 3: Patch /queue-journey-report page"
+python3 - <<'PY'
+from pathlib import Path
+import os
+p = Path(os.environ.get('PAGE_HTML','/opt/frappe_crm/apps/restaurant_ops/restaurant_ops/www/queue-journey-report.html'))
+if not p.exists():
+    raise SystemExit(0)
+s = p.read_text(encoding='utf-8', errors='ignore')
+a='<!-- BEGIN ROSHDY QUEUE JOURNEY PAGE TIME COLUMNS V40 -->'
+b='<!-- END ROSHDY QUEUE JOURNEY PAGE TIME COLUMNS V40 -->'
+while a in s and b in s:
+    i=s.index(a); j=s.index(b,i)+len(b); s=s[:i]+'\n'+s[j:]
+block = r'''
+<!-- BEGIN ROSHDY QUEUE JOURNEY PAGE TIME COLUMNS V40 -->
+<script>
+(function(){
+  function esc(s){return String(s||'').replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+  function qs(o){let p=new URLSearchParams();Object.keys(o||{}).forEach(k=>{let v=o[k];if(v!==undefined&&v!==null&&v!=='')p.append(k,v)});return p.toString()}
+  async function api(m,args){let q=qs(args||{});let r=await fetch('/api/method/'+m+(q?'?'+q:''),{method:'GET',credentials:'same-origin',cache:'no-store'});let j=await r.json();if(j.exc)throw j;return j.message||j}
+  function get(id){return document.getElementById(id)}
+  window.load = async function(){
+    last = await api('restaurant_ops.api.queue_journey_api.get_queue_journey_report',{date_from:get('df').value,date_to:get('dt').value,threshold:get('threshold').value,queues:get('queues').value,mask_phones:get('mask').value,limit_rows:1000});
+    let s=last.summary||{};
+    get('total').textContent=s.attempts_total||0;
+    get('answered').textContent=s.answered_later_total||0;
+    get('abandoned').textContent=s.customer_abandoned_after_attempt||0;
+    get('unknown').textContent=s.unknown_or_timeout||0;
+    if(get('cache')) get('cache').textContent=(last.journey_available?'مصدر بيانات الرحلة: ':'مصدر احتياطي: ')+(last.cache_source||last.source||'');
+    get('byext').innerHTML=(s.attempts_by_missed_extension||[]).map(x=>'<tr><td>'+esc(x.extension)+'</td><td>'+esc(x.employee)+'</td><td>'+esc(x.attempts)+'</td><td>'+esc(x.answered_later)+'</td><td>'+esc(x.customer_abandoned_after_attempt)+'</td><td>'+esc(x.unknown_or_timeout)+'</td></tr>').join('')||'<tr><td colspan="6" style="text-align:center;color:#64748b">لا توجد بيانات</td></tr>';
+    get('rows').innerHTML=(last.rows||[]).map(r=>'<tr><td>'+esc(r.ring_start_time)+'</td><td>'+esc(r.ring_end_time||r.attempt_time)+'</td><td>'+esc(r.queue)+'</td><td>'+esc(r.caller)+'</td><td>'+esc(r.missed_employee)+'</td><td>'+esc(r.missed_extension)+'</td><td>'+esc(r.ring_seconds)+'</td><td>'+esc(r.fate_label)+'</td><td>'+esc(r.answered_employee||r.answered_extension)+'</td><td>'+esc(r.response_time)+'</td><td>'+esc(r.response_after_text)+'</td></tr>').join('')||'<tr><td colspan="11" style="text-align:center;color:#64748b">لا توجد محاولات</td></tr>';
+  };
+  window.csv = function(){
+    if(!last)return;
+    let headers=['ring_start','ring_end_no_answer','queue','caller','missed_employee','missed_extension','ring_seconds','fate','answered_by','answer_time','answer_delay'];
+    let lines=[headers.join(',')].concat((last.rows||[]).map(r=>[r.ring_start_time,r.ring_end_time||r.attempt_time,r.queue,r.caller,r.missed_employee,r.missed_extension,r.ring_seconds,r.fate_label,r.answered_employee||r.answered_extension,r.response_time,r.response_after_text].map(x=>'"'+String(x||'').replace(/"/g,'""')+'"').join(',')));
+    let blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'});let a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='queue-journey.csv';a.click();
+  };
+  // Rewrite visible headers once DOM is ready.
+  setTimeout(function(){
+    var tables=document.querySelectorAll('table');
+    if(tables.length>=2){
+      var detail=tables[tables.length-1];
+      var th=detail.querySelector('thead tr');
+      if(th){th.innerHTML='<th>بداية الرن التقريبية</th><th>انتهاء الرن بدون رد</th><th>الطابور</th><th>رقم العميل</th><th>لم يرد على الرن</th><th>التحويلة</th><th>مدة الرن</th><th>مصير المحاولة بعد الرن</th><th>تم التعامل لاحقًا بواسطة</th><th>وقت الرد اللاحق</th><th>المدة حتى الرد</th>';}
+      var sum=tables[tables.length-2];
+      var sh=sum.querySelector('thead tr');
+      if(sh){sh.innerHTML='<th>التحويلة</th><th>الموظف</th><th>المحاولات</th><th>تم الرد لاحقًا</th><th>العميل أغلق بعدها</th><th>مصير غير محسوم</th>';}
+    }
+    if(typeof window.load==='function') window.load();
+  },300);
+})();
+</script>
+<!-- END ROSHDY QUEUE JOURNEY PAGE TIME COLUMNS V40 -->
+'''
+idx=s.lower().rfind('</body>')
+if idx>=0:
+    s=s[:idx]+'\n'+block+'\n'+s[idx:]
+else:
+    s=s+'\n'+block
+s=s.replace('غير محدد<div class="num" id="unknown"', 'مصير غير محسوم<div class="num" id="unknown"')
+s=s.replace('<th>غير محدد</th>', '<th>مصير غير محسوم</th>')
+s=s.replace('وقت المصير', 'وقت الرد اللاحق')
+p.write_text(s, encoding='utf-8')
+PY
+
+# -----------------------------------------------------------------------------
+# 4) Patch Upper email render final V40. Keep it complete including feedback.
+# -----------------------------------------------------------------------------
+echo "🧩 Step 4: Patch Upper Management email journey table"
+cat >> "$UPPER_API" <<'PYUPPER'
+
+# BEGIN ROSHDY UPPER JOURNEY TIME COLUMNS V40
+try:
+    import frappe
+    from frappe.utils import today, cstr, flt, now_datetime
+    import html as _uj40_html
+except Exception:
+    pass
+
+try:
+    _uj40_prev_get_upper_management_report_data = get_upper_management_report_data
+except Exception:
+    _uj40_prev_get_upper_management_report_data = None
+
+
+def _uj40_e(v):
+    return _uj40_html.escape(cstr(v) if v is not None else "")
+
+
+def _uj40_n(v):
+    try:
+        f=flt(v or 0)
+        return f"{int(f):,}" if float(f).is_integer() else f"{f:,.1f}"
+    except Exception:
+        return cstr(v)
+
+
+def _uj40_td(v,strong=False):
+    val=_uj40_e(v)
+    if strong: val='<b>'+val+'</b>'
+    return f"<td style='padding:8px;border:1px solid #e5e7eb;text-align:right;direction:rtl;font-size:12px'>{val}</td>"
+
+
+def _uj40_empty(cols,text):
+    return f"<tr><td colspan='{cols}' style='padding:12px;border:1px solid #e5e7eb;text-align:center;color:#64748b;background:#f8fafc'>{_uj40_e(text)}</td></tr>"
+
+
+def _uj40_table(headers,body):
+    th=''.join(f"<th style='background:#111827;color:white;padding:9px;border:1px solid #e5e7eb;text-align:right;direction:rtl;font-size:12px'>{_uj40_e(h)}</th>" for h in headers)
+    return f"<table dir='rtl' width='100%' cellpadding='0' cellspacing='0' style='border-collapse:collapse;width:100%;direction:rtl;text-align:right;margin-top:8px;font-family:Tahoma,Arial,sans-serif'><thead><tr>{th}</tr></thead><tbody>{body}</tbody></table>"
+
+
+def _uj40_card(title,value,note,color="#1F4E79",bg="#fff"):
+    return f"<td style='width:25%;padding:6px;vertical-align:top'><div style='background:{bg};border:1px solid #e5e7eb;border-right:6px solid {color};border-radius:14px;padding:13px;min-height:102px;text-align:right;direction:rtl'><div style='font-size:13px;color:#475569;font-weight:bold'>{_uj40_e(title)}</div><div style='font-size:28px;font-weight:900;color:{color};margin-top:5px'>{_uj40_e(value)}</div><div style='font-size:12px;color:#64748b;margin-top:4px'>{note}</div></div></td>"
+
+
+def _uj40_feedback_section(date_from=None,date_to=None):
+    try:
+        from restaurant_ops.api.feedback_api import get_feedback_email_summary
+        d=get_feedback_email_summary(date_from=date_from or today(), date_to=date_to or date_from or today())
+    except Exception:
+        return ''
+    sat_rows=''.join(f"<tr>{_uj40_td(k)}{_uj40_td(v,True)}</tr>" for k,v in (d.get('satisfaction_counts') or {}).items()) or _uj40_empty(2,'لا توجد تقييمات مكتملة')
+    agent_rows=''.join(f"<tr>{_uj40_td(k)}{_uj40_td(v,True)}</tr>" for k,v in (d.get('by_agent') or {}).items()) or _uj40_empty(2,'لا توجد بيانات موظفين')
+    return f"<div style='border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-top:14px'><h3 style='margin:0 0 8px'>📣 الفيدباك</h3><table width='100%' dir='rtl' style='border-collapse:collapse;margin-bottom:10px'><tr><td style='padding:8px;border:1px solid #e5e7eb;background:#f8fafc'>إجمالي الأرقام</td>{_uj40_td(d.get('total'),True)}<td style='padding:8px;border:1px solid #e5e7eb;background:#f8fafc'>تم الفيدباك</td>{_uj40_td(d.get('completed'),True)}<td style='padding:8px;border:1px solid #e5e7eb;background:#f8fafc'>متبقي</td>{_uj40_td(d.get('pending'),True)}<td style='padding:8px;border:1px solid #e5e7eb;background:#f8fafc'>متوسط التقييم</td>{_uj40_td(d.get('avg_rating'),True)}</tr></table><table width='100%' dir='rtl'><tr><td style='vertical-align:top;width:50%'><b>حسب درجة الرضاء</b>{_uj40_table(['درجة الرضاء','العدد'],sat_rows)}</td><td style='vertical-align:top;width:50%'><b>حسب الموظف</b>{_uj40_table(['الموظف','عدد الفيدباك'],agent_rows)}</td></tr></table></div>"
+
+
+@frappe.whitelist()
+def get_upper_management_report_data(date_from=None,date_to=None):
+    if _uj40_prev_get_upper_management_report_data:
+        data=_uj40_prev_get_upper_management_report_data(date_from=date_from,date_to=date_to)
+    else:
+        data={'success':True,'period':{'from':cstr(date_from or today()),'to':cstr(date_to or date_from or today()),'label':cstr(date_from or today())},'generated_at':now_datetime().strftime('%Y-%m-%d %H:%M:%S')}
+    # Force journey rows enriched by latest API
+    try:
+        from restaurant_ops.api.queue_journey_api import get_queue_journey_report
+        period=data.get('period') or {}
+        df=date_from or period.get('from') or today(); dt=date_to or period.get('to') or df
+        journey=get_queue_journey_report(date_from=df,date_to=dt,threshold=15,mask_phones=0,limit_rows=300)
+        data['queue_journey']=journey
+        js=journey.get('summary') or {}
+        calls=data.setdefault('calls',{})
+        calls['staff_missed_count']=js.get('attempts_total') or 0
+        calls['employee_issue_count']=js.get('attempts_total') or 0
+        calls['employee_issue_rows']=journey.get('rows') or []
+        calls['journey_answered_later']=js.get('answered_later_total')
+        calls['journey_customer_abandoned']=js.get('customer_abandoned_after_attempt')
+        calls['journey_unknown']=js.get('unknown_or_timeout')
+    except Exception as e:
+        data.setdefault('calls',{})['journey_v40_error']=cstr(e)
+    return data
+
+
+@frappe.whitelist()
+def render_upper_management_report_html(date_from=None,date_to=None):
+    d=get_upper_management_report_data(date_from,date_to)
+    calls=d.get('calls') or {}; comps=d.get('complaints') or {}; cancels=d.get('cancellations') or {}; target=d.get('target_items') or {}; cq=d.get('complaint_queue') or {}; journey=d.get('queue_journey') or {}; js=journey.get('summary') or {}; jrows=journey.get('rows') or []
+    journey_html=''.join(f"<tr>{_uj40_td(r.get('ring_start_time'))}{_uj40_td(r.get('ring_end_time') or r.get('attempt_time'))}{_uj40_td(r.get('caller'))}{_uj40_td(r.get('missed_employee'))}{_uj40_td(r.get('missed_extension'))}{_uj40_td(r.get('ring_seconds'))}{_uj40_td(r.get('fate_label'),True)}{_uj40_td(r.get('answered_employee') or r.get('answered_extension'))}{_uj40_td(r.get('response_time'))}{_uj40_td(r.get('response_after_text'))}</tr>" for r in jrows[:100]) or _uj40_empty(10,'لا توجد محاولات رن طويلة لم يتم الرد عليها خلال الفترة')
+    open_rows=comps.get('open_rows') or []
+    open_html=''.join(f"<tr>{_uj40_td(r.get('name'))}{_uj40_td(r.get('status'))}{_uj40_td(r.get('category'))}{_uj40_td(r.get('priority'))}{_uj40_td(r.get('customer_name'))}{_uj40_td(r.get('creation'))}</tr>" for r in open_rows[:100]) or _uj40_empty(6,'لا توجد شكاوى مفتوحة حاليًا')
+    cancel_rows=cancels.get('rows') or []
+    cancel_html=''.join(f"<tr>{_uj40_td(r.get('cancellation_time'))}{_uj40_td(r.get('order_no'))}{_uj40_td(r.get('shift'))}{_uj40_td(r.get('shift_number') or '')}{_uj40_td(r.get('branch'))}{_uj40_td(r.get('customer_name'))}{_uj40_td(r.get('reason'))}{_uj40_td(r.get('logged_by'))}</tr>" for r in cancel_rows[:80]) or _uj40_empty(8,'لا توجد إلغاءات مسجلة اليوم')
+    target_rows=target.get('rows') or []
+    target_html=''.join(f"<tr>{_uj40_td(r.get('item'))}{_uj40_td(_uj40_n(r.get('qty')),True)}{_uj40_td(_uj40_n(r.get('entries')),True)}</tr>" for r in target_rows[:80]) or _uj40_empty(3,'لا توجد تسجيلات عرض للأصناف المطلوبة خلال الفترة')
+    follow=''.join(f"<div style='background:#fffbeb;border:1px solid #fde68a;border-radius:10px;padding:9px;margin:6px 0;color:#92400e;font-size:13px'>• {_uj40_e(x)}</div>" for x in (d.get('followups') or ['لا توجد ملاحظات تحتاج متابعة اليوم.']))
+    open_color='#dc2626' if flt(comps.get('open_all') or 0)>0 else '#16a34a'; abandoned=js.get('customer_abandoned_after_attempt') or 0; abandoned_color='#dc2626' if flt(abandoned)>0 else '#16a34a'
+    feedback=_uj40_feedback_section(date_from,date_to)
+    return f"""<!doctype html><html lang='ar' dir='rtl'><head><meta charset='utf-8'></head><body dir='rtl' style='margin:0;background:#f3f4f6;direction:rtl;text-align:right;font-family:Tahoma,Arial,sans-serif;color:#111827'><table dir='rtl' width='100%' style='background:#f3f4f6'><tr><td align='right' style='padding:16px'><div style='max-width:980px;margin:0 0 0 auto;background:white;border:1px solid #e5e7eb;border-radius:16px;overflow:hidden'><div style='height:8px;background:#1F4E79'></div><div style='padding:18px'><h1 style='margin:0;font-size:22px;color:#0f172a'>مطعم رشدي — تقرير الإدارة العليا</h1><div style='color:#64748b;font-size:13px;margin-top:6px'>الفترة: {_uj40_e((d.get('period') or {}).get('label'))} | وقت الإصدار: {_uj40_e(d.get('generated_at'))}</div><h2 style='font-size:18px;margin:16px 0 8px'>ملخص اليوم</h2><table width='100%' dir='rtl'><tr>{_uj40_card('شكاوى مفتوحة حاليًا',_uj40_n(comps.get('open_all')),'كل الشكاوى غير المغلقة وتحتاج متابعة',open_color,'#fef2f2' if flt(comps.get('open_all') or 0)>0 else '#f0fdf4')}{_uj40_card('مكالمات واردة على خط الشكاوى',_uj40_n(cq.get('count')),'مكالمة دخلت على خط الشكاوى خلال الفترة','#2563eb')}{_uj40_card('المكالمات التي تم الرد عليها',_uj40_n(calls.get('answered')),'المكالمات المكتملة بالرد خلال الفترة','#16a34a')}{_uj40_card('محاولات لم يرد عليها من الموظفين',_uj40_n(js.get('attempts_total')),'محاولات رن طويلة على تحويلات موظفين','#f59e0b')}</tr><tr>{_uj40_card('تم الرد عليها لاحقًا',_uj40_n(js.get('answered_later_total')),'محاولات تم إنقاذها بواسطة موظف آخر/نفس التحويلة','#16a34a')}{_uj40_card('العميل أغلق بعدها',_uj40_n(abandoned),'محاولات انتهت بإغلاق العميل بعد الرن',abandoned_color,'#fef2f2' if flt(abandoned)>0 else '#f0fdf4')}{_uj40_card('إلغاءات اليوم',_uj40_n(cancels.get('count')),'مدخلة يدويًا من الإدارة','#6f42c1')}{_uj40_card('تسجيلات عرض الأصناف المطلوبة',_uj40_n(target.get('total_qty')),'لا تمثل إجمالي مبيعات المطعم','#f59e0b')}</tr></table><div style='border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-top:14px'><h3 style='margin:0 0 8px'>🔴 المطلوب متابعته اليوم</h3>{follow}</div><div style='border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-top:14px'><h3 style='margin:0 0 8px'>👤 تقرير محاولات الرن غير المجابة</h3><div style='color:#64748b;font-size:12px'>بداية الرن تقريبية ومحسوبة من وقت انتهاء الرن ناقص مدة الرن. وقت الرد اللاحق هو وقت تعامل موظف آخر/نفس التحويلة مع المكالمة.</div>{_uj40_table(['بداية الرن التقريبية','انتهاء الرن بدون رد','رقم العميل','لم يرد على الرن','التحويلة','مدة الرن','مصير المحاولة بعد الرن','تم التعامل لاحقًا بواسطة','وقت الرد اللاحق','المدة حتى الرد'],journey_html)}</div><div style='border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-top:14px'><h3 style='margin:0 0 8px'>🔴 الشكاوى المفتوحة حاليًا</h3>{_uj40_table(['رقم الشكوى','الحالة','التصنيف','الأولوية','العميل','تاريخ التسجيل'],open_html)}</div><div style='border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-top:14px'><h3 style='margin:0 0 8px'>↩️ الإلغاءات المسجلة اليوم</h3>{_uj40_table(['وقت التسجيل','رقم الطلب','الوردية','رقم الوردية','الفرع','اسم العميل','سبب الإلغاء','سجلها'],cancel_html)}</div><div style='border:1px solid #e5e7eb;border-radius:14px;padding:14px;margin-top:14px'><h3 style='margin:0 0 8px'>🛒 تسجيلات عرض الأصناف المطلوبة</h3>{_uj40_table(['الصنف المطلوب عرضه','القطع/التسجيلات','عدد مرات التسجيل'],target_html)}</div>{feedback}</div></div></td></tr></table></body></html>"""
+
+@frappe.whitelist()
+def preview_upper_management_report(date_from=None,date_to=None,**kwargs):
+    return {'success':True,'html':render_upper_management_report_html(date_from,date_to),'data':get_upper_management_report_data(date_from,date_to)}
+# END ROSHDY UPPER JOURNEY TIME COLUMNS V40
+PYUPPER
+
+# -----------------------------------------------------------------------------
+# 5) Patch center email journey section.
+# -----------------------------------------------------------------------------
+echo "🧩 Step 5: Patch Center Manager email journey table"
+cat >> "$EMAIL_REPORT" <<'PYCENTER'
+
+# BEGIN ROSHDY CENTER JOURNEY TIME COLUMNS V40
+try:
+    import frappe
+    from frappe.utils import today, cstr
+    import html as _cj40_html
+except Exception:
+    pass
+
+def _cj40_e(v): return _cj40_html.escape(cstr(v) if v is not None else "")
+def _cj40_table(headers, rows, empty='لا توجد بيانات'):
+    th=''.join('<th style="background:#111827;color:white;padding:8px;border:1px solid #e5e7eb;text-align:right">%s</th>'%_cj40_e(h) for h in headers)
+    if rows: body=''.join('<tr>'+''.join('<td style="padding:8px;border:1px solid #e5e7eb;text-align:right">%s</td>'%_cj40_e(c) for c in r)+'</tr>' for r in rows)
+    else: body='<tr><td colspan="%s" style="padding:10px;text-align:center;color:#64748b;background:#f8fafc;border:1px solid #e5e7eb">%s</td></tr>'%(len(headers),_cj40_e(empty))
+    return '<table dir="rtl" width="100%" style="border-collapse:collapse;margin-top:8px">'+ '<thead><tr>'+th+'</tr></thead><tbody>'+body+'</tbody></table>'
+
+def _qjc40_staff_missed_html(date_from=None,date_to=None,title='تقرير محاولات الرن غير المجابة'):
+    df=date_from or today(); dt=date_to or df
+    try:
+        from restaurant_ops.api.queue_journey_api import get_queue_journey_report
+        d=get_queue_journey_report(date_from=df,date_to=dt,threshold=15,mask_phones=0,limit_rows=500)
+    except Exception as e:
+        return '<h3>%s</h3><div class="note">تعذر تحميل رحلة المحاولات: %s</div>'%(_cj40_e(title),_cj40_e(e))
+    s=d.get('summary') or {}; rows=[]
+    for r in d.get('rows') or []:
+        rows.append([r.get('ring_start_time'), r.get('ring_end_time') or r.get('attempt_time'), r.get('caller'), r.get('missed_employee'), r.get('missed_extension'), r.get('ring_seconds'), r.get('fate_label'), r.get('answered_employee') or r.get('answered_extension'), r.get('response_time'), r.get('response_after_text')])
+    cards='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:10px 0"><div style="background:#fff7ed;border:1px solid #fed7aa;border-radius:12px;padding:10px"><b>محاولات لم يرد عليها</b><div style="font-size:24px;font-weight:900">%s</div></div><div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:12px;padding:10px"><b>تم الرد لاحقًا</b><div style="font-size:24px;font-weight:900">%s</div></div><div style="background:#fef2f2;border:1px solid #fecaca;border-radius:12px;padding:10px"><b>العميل أغلق بعدها</b><div style="font-size:24px;font-weight:900">%s</div></div></div>'%(_cj40_e(s.get('attempts_total') or 0),_cj40_e(s.get('answered_later_total') or 0),_cj40_e(s.get('customer_abandoned_after_attempt') or 0))
+    note='<div style="background:#eff6ff;color:#1e3a8a;border:1px solid #bfdbfe;border-radius:10px;padding:10px;margin:8px 0">بداية الرن تقريبية ومحسوبة من وقت انتهاء الرن ناقص مدة الرن. وقت الرد اللاحق هو وقت تعامل موظف آخر/نفس التحويلة مع المكالمة.</div>'
+    return '<h3>%s</h3>%s%s%s'%(_cj40_e(title),note,cards,_cj40_table(['بداية الرن التقريبية','انتهاء الرن بدون رد','رقم العميل','لم يرد على الرن','التحويلة','مدة الرن','مصير المحاولة بعد الرن','تم التعامل لاحقًا بواسطة','وقت الرد اللاحق','المدة حتى الرد'],rows,'لا توجد محاولات رن طويلة لم يتم الرد عليها خلال الفترة'))
+
+def _staff_missed_section(): return _qjc40_staff_missed_html(today(), today())
+def _er_staff_missed_section(date_from,date_to): return _qjc40_staff_missed_html(date_from,date_to)
+def _adv_staff_missed_section(st):
+    try: df,dt,_a,_b=_adv_period(st)
+    except Exception: df=dt=today()
+    return _qjc40_staff_missed_html(df,dt)
+
+@frappe.whitelist()
+def debug_center_journey_time_columns_v40(date_from=None,date_to=None):
+    from restaurant_ops.api.queue_journey_api import get_queue_journey_report
+    d=get_queue_journey_report(date_from=date_from or today(), date_to=date_to or date_from or today(), threshold=15, limit_rows=5)
+    return {'success':True,'summary':d.get('summary'),'rows_sample':d.get('rows')}
+# END ROSHDY CENTER JOURNEY TIME COLUMNS V40
+PYCENTER
+
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+[[ -n "$APP_OWNER" ]] && chown "$APP_OWNER" "$QUEUE_API" "$UPPER_API" "$EMAIL_REPORT" "$PAGE_HTML" 2>/dev/null || true
+
+echo "🧹 Step 6: Clear cache + restart app services"
+bench_exec clear-cache || true
+"${COMPOSE[@]}" restart backend frontend websocket queue-short queue-long scheduler >/dev/null
+sleep 8
+bench_exec clear-cache || true
+
+echo "🧪 Step 7: Validation"
+set +e
+bench_exec execute restaurant_ops.api.queue_journey_api.debug_queue_journey_time_columns_v40 | tee "$BACKUP_DIR/debug_queue_journey_time_columns_v40.txt"
+V1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.upper_management_email_api.preview_upper_management_report > "$BACKUP_DIR/preview_upper_v40.txt" 2>&1
+V2=$?
+bench_exec execute restaurant_ops.api.email_report.debug_center_journey_time_columns_v40 | tee "$BACKUP_DIR/debug_center_journey_time_columns_v40.txt"
+V3=${PIPESTATUS[0]}
+for p in queue-journey-report email-report-customizer; do
+  code="$(curl -k -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$p" 2>/dev/null || echo 000)"
+  echo "$p => $code" | tee -a "$BACKUP_DIR/page_smoke_checks_v40.txt"
+done
+set -e
+
+if [[ $V1 -ne 0 || $V2 -ne 0 || $V3 -ne 0 ]]; then
+  echo "❌ Validation failed. راجع: $BACKUP_DIR"
+  exit 1
+fi
+
+echo "🏥 Step 8: Health Check - Elastix/CDR/AMI + Queue + Call Report"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$BACKUP_DIR/health_asterisk_bridge.txt"
+H1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status | tee "$BACKUP_DIR/health_queue_status.txt"
+H2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' | tee "$BACKUP_DIR/health_call_report.txt"
+H3=${PIPESTATUS[0]}
+set -e
+
+if [[ $H1 -ne 0 || $H2 -ne 0 || $H3 -ne 0 ]]; then
+  echo "⚠️ Health returned non-zero. راجع: $BACKUP_DIR"
+else
+  echo "✅ Health checks OK"
+fi
+
+echo "============================================================"
+echo "✅ DONE V40"
+echo "📦 Backup folder: $BACKUP_DIR"
+echo "⏱️ Queue Journey table now has clear start/end/answer time columns"
+echo "🛡️ report_api.py / Elastix / CDR / AMI untouched"
+echo "============================================================"

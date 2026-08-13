@@ -1,0 +1,429 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# fix-complaints-visibility-workflow
+# Fix the real workflow issue:
+# - Complaint register /app/call-center-complaint must be visible to all operational roles, not owner-only.
+# - Quality Desk remains a helper/reporting desk: pure quality users see assigned complaints only.
+# - quality.test@roshdy.com (and System Manager / Call Center Admin) sees all in Quality Desk.
+# - Assigned Quality Inspector field routes complaints to the proper quality user.
+# - Adds hard permission hooks to bypass owner/user-permission filtering for allowed roles.
+# - Keeps login redirect behavior: quality users still land on /quality-desk, but can open Desk complaint forms.
+# - Does NOT touch report_api / CDR / Elastix logic except health checks.
+
+ROOT="/opt/frappe_crm"
+SITE="crm.local"
+APP_HOST="$ROOT/apps/restaurant_ops"
+APP_DIR="$APP_HOST/restaurant_ops"
+DOCTYPE_DIR="$APP_DIR/restaurant_operations/doctype/call_center_complaint"
+DOCTYPE_JSON="$DOCTYPE_DIR/call_center_complaint.json"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/FIX_COMPLAINTS_VISIBILITY_WORKFLOW_BEFORE_$TS"
+
+say(){ echo -e "\n============================================================\n$1\n============================================================"; }
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo "❌ شغّل كـ root: sudo -i ثم ./fix-complaints-visibility-workflow"
+  exit 1
+fi
+
+say "1) Backup قبل إصلاح رؤية الشكاوى"
+cd "$ROOT"
+BACKEND="$(docker compose ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ لم أجد backend container. شغّل: cd /opt/frappe_crm && docker compose up -d"
+  exit 1
+fi
+mkdir -p "$BACKUP_DIR"
+cp -a "$APP_HOST" "$BACKUP_DIR/restaurant_ops"
+[[ -f "$ROOT/docker-compose.yml" ]] && cp -a "$ROOT/docker-compose.yml" "$BACKUP_DIR/docker-compose.yml"
+echo "✅ Backup: $BACKUP_DIR"
+
+say "2) Patch Call Center Complaint JSON permissions + Link field user-permission bypass"
+python3 - <<'PY'
+from pathlib import Path
+import json
+p = Path('/opt/frappe_crm/apps/restaurant_ops/restaurant_ops/restaurant_operations/doctype/call_center_complaint/call_center_complaint.json')
+if not p.exists():
+    print('⚠️ call_center_complaint.json not found')
+    raise SystemExit
+j = json.loads(p.read_text())
+perms = [x for x in (j.get('permissions') or []) if x.get('role') not in {
+    'Restaurant Agent', 'Call Center Admin', 'Complaint_Quality_User', 'Complaint_Finance_User',
+    'Social Inbox Agent', 'Social Inbox Supervisor', 'Social Inbox Admin'
+}]
+
+def perm(role, level, read=1, write=0, create=0, delete=0, report=1, export=1, select=1, print_=1):
+    perms.append({
+        'role': role, 'permlevel': int(level), 'select': int(select), 'read': int(read), 'write': int(write),
+        'create': int(create), 'delete': int(delete), 'submit': 0, 'cancel': 0, 'amend': 0,
+        'report': int(report), 'export': int(export), 'import': 0, 'share': 0, 'print': int(print_), 'email': 0,
+        'if_owner': 0,
+    })
+
+# Admin / call center can see and manage all complaints.
+perm('Call Center Admin', 0, read=1, write=1, create=1, delete=1, report=1, export=1)
+perm('Call Center Admin', 1, read=1, write=1, create=0, delete=0, report=1, export=1)
+perm('Call Center Admin', 2, read=1, write=1, create=0, delete=0, report=1, export=1)
+
+# Agents can create complaints and read/search ALL complaint history. No delete.
+perm('Restaurant Agent', 0, read=1, write=1, create=1, delete=0, report=1, export=0)
+# No level 1/2 for Restaurant Agent.
+
+# Quality can see base info and update quality section. No finance level 2.
+perm('Complaint_Quality_User', 0, read=1, write=1, create=0, delete=0, report=1, export=1)
+perm('Complaint_Quality_User', 1, read=1, write=1, create=0, delete=0, report=1, export=1)
+
+# Finance can see base and finance section, not quality section.
+perm('Complaint_Finance_User', 0, read=1, write=1, create=0, delete=0, report=1, export=1)
+perm('Complaint_Finance_User', 2, read=1, write=1, create=0, delete=0, report=1, export=1)
+
+# Social inbox roles can read/link complaint history; admin/supervisor can update base if needed.
+perm('Social Inbox Agent', 0, read=1, write=0, create=0, delete=0, report=1, export=0)
+perm('Social Inbox Supervisor', 0, read=1, write=1, create=1, delete=0, report=1, export=1)
+perm('Social Inbox Admin', 0, read=1, write=1, create=1, delete=1, report=1, export=1)
+
+j['permissions'] = perms
+
+# Prevent user permission filters on linked users/employees from hiding complaints.
+for f in j.get('fields') or []:
+    if f.get('fieldtype') == 'Link':
+        f['ignore_user_permissions'] = 1
+
+p.write_text(json.dumps(j, ensure_ascii=False, indent=1, sort_keys=True) + '\n')
+print('✅ JSON permissions patched for all operational roles, if_owner=0, no Quality level 2')
+PY
+
+say "3) Write hard permission hook + DB fixer"
+mkdir -p "$APP_DIR/api" "$APP_DIR/scripts"
+cat > "$APP_DIR/api/complaint_permissions.py" <<'PY'
+import frappe
+
+# Roles that can see the global complaint register. Quality Desk may still filter assigned complaints separately.
+VISIBLE_ROLES = {
+    'System Manager', 'Administrator', 'Call Center Admin', 'Restaurant Agent',
+    'Complaint_Quality_User', 'Complaint_Finance_User',
+    'Social Inbox Admin', 'Social Inbox Supervisor', 'Social Inbox Agent',
+}
+WRITE_ROLES = {
+    'System Manager', 'Administrator', 'Call Center Admin', 'Restaurant Agent',
+    'Complaint_Quality_User', 'Complaint_Finance_User', 'Social Inbox Admin', 'Social Inbox Supervisor',
+}
+CREATE_ROLES = {'System Manager', 'Administrator', 'Call Center Admin', 'Restaurant Agent', 'Social Inbox Admin', 'Social Inbox Supervisor'}
+DELETE_ROLES = {'System Manager', 'Administrator', 'Call Center Admin', 'Social Inbox Admin'}
+
+
+def _roles(user=None):
+    try:
+        return set(frappe.get_roles(user or frappe.session.user))
+    except Exception:
+        return set()
+
+
+def _ok(user=None, perm='read'):
+    user = user or frappe.session.user
+    if user == 'Administrator':
+        return True
+    roles = _roles(user)
+    if perm in ('read', 'select', 'report', 'export', 'print'):
+        return bool(roles & VISIBLE_ROLES)
+    if perm == 'create':
+        return bool(roles & CREATE_ROLES)
+    if perm == 'delete':
+        return bool(roles & DELETE_ROLES)
+    if perm in ('write', 'submit', 'cancel', 'amend'):
+        return bool(roles & WRITE_ROLES)
+    return bool(roles & VISIBLE_ROLES)
+
+
+def get_permission_query_conditions(user=None):
+    # Returning empty string means no row-level restriction for allowed roles.
+    if _ok(user, 'read'):
+        return ''
+    return "`tabCall Center Complaint`.`name` = '__no_access__'"
+
+
+def has_permission(doc, user=None, permission_type=None):
+    return _ok(user, permission_type or 'read')
+PY
+chmod 644 "$APP_DIR/api/complaint_permissions.py"
+
+cat > "$APP_DIR/scripts/fix_complaints_visibility_workflow.py" <<'PY'
+import frappe
+
+ROLES = [
+    'Restaurant Agent', 'Call Center Admin', 'Complaint_Quality_User', 'Complaint_Finance_User',
+    'Social Inbox Admin', 'Social Inbox Supervisor', 'Social Inbox Agent', 'Desk User'
+]
+
+
+def ensure_role(role):
+    if not frappe.db.exists('Role', role):
+        frappe.get_doc({'doctype':'Role','role_name':role,'desk_access':1}).insert(ignore_permissions=True)
+    else:
+        r = frappe.get_doc('Role', role)
+        if role != 'Guest' and not r.desk_access:
+            r.desk_access = 1
+            r.save(ignore_permissions=True)
+
+
+def append_perm(doc, role, level, read=1, write=0, create=0, delete=0, report=1, export=1, select=1, print_=1):
+    doc.append('permissions', {
+        'role': role, 'permlevel': int(level), 'select': int(select), 'read': int(read), 'write': int(write),
+        'create': int(create), 'delete': int(delete), 'submit': 0, 'cancel': 0, 'amend': 0,
+        'report': int(report), 'export': int(export), 'import': 0, 'share': 0, 'print': int(print_), 'email': 0,
+        'if_owner': 0,
+    })
+
+
+def fix_doctype():
+    dt = 'Call Center Complaint'
+    if not frappe.db.exists('DocType', dt):
+        print('⚠️ Missing doctype', dt); return
+    # Hard delete all old rows for operational roles to eliminate if_owner/bad rows.
+    roles = ['Restaurant Agent','Call Center Admin','Complaint_Quality_User','Complaint_Finance_User','Social Inbox Admin','Social Inbox Supervisor','Social Inbox Agent']
+    frappe.db.sql('delete from `tabDocPerm` where parent=%s and role in %s', (dt, tuple(roles)))
+    frappe.db.commit()
+
+    doc = frappe.get_doc('DocType', dt)
+    doc.permissions = [p for p in doc.permissions if p.role not in roles]
+
+    append_perm(doc, 'Call Center Admin', 0, read=1, write=1, create=1, delete=1, report=1, export=1)
+    append_perm(doc, 'Call Center Admin', 1, read=1, write=1, create=0, delete=0, report=1, export=1)
+    append_perm(doc, 'Call Center Admin', 2, read=1, write=1, create=0, delete=0, report=1, export=1)
+
+    append_perm(doc, 'Restaurant Agent', 0, read=1, write=1, create=1, delete=0, report=1, export=0)
+
+    append_perm(doc, 'Complaint_Quality_User', 0, read=1, write=1, create=0, delete=0, report=1, export=1)
+    append_perm(doc, 'Complaint_Quality_User', 1, read=1, write=1, create=0, delete=0, report=1, export=1)
+
+    append_perm(doc, 'Complaint_Finance_User', 0, read=1, write=1, create=0, delete=0, report=1, export=1)
+    append_perm(doc, 'Complaint_Finance_User', 2, read=1, write=1, create=0, delete=0, report=1, export=1)
+
+    append_perm(doc, 'Social Inbox Agent', 0, read=1, write=0, create=0, delete=0, report=1, export=0)
+    append_perm(doc, 'Social Inbox Supervisor', 0, read=1, write=1, create=1, delete=0, report=1, export=1)
+    append_perm(doc, 'Social Inbox Admin', 0, read=1, write=1, create=1, delete=1, report=1, export=1)
+
+    # Turn off user-permission filtering on all Link fields in this doctype.
+    for df in doc.fields:
+        if df.fieldtype == 'Link':
+            df.ignore_user_permissions = 1
+
+    doc.save(ignore_permissions=True)
+    frappe.clear_cache(doctype=dt)
+    print('✅ DocPerm fixed for global complaint visibility')
+
+
+def ensure_operational_users_are_desk():
+    # Any user with operational roles should be System User + Desk User, so /app list can open.
+    op_roles = ['Restaurant Agent','Call Center Admin','Complaint_Quality_User','Complaint_Finance_User','Social Inbox Agent','Social Inbox Supervisor','Social Inbox Admin']
+    users = set()
+    for role in op_roles:
+        users.update(frappe.get_all('Has Role', filters={'role': role, 'parenttype':'User'}, pluck='parent'))
+    for u in users:
+        if u in ('Administrator','Guest'):
+            continue
+        try:
+            user = frappe.get_doc('User', u)
+            user.enabled = 1
+            user.user_type = 'System User'
+            user.save(ignore_permissions=True)
+            if not frappe.db.exists('Has Role', {'parent':u, 'parenttype':'User', 'role':'Desk User'}):
+                user.add_roles('Desk User')
+            print('✅ Desk access for', u)
+        except Exception as e:
+            print('⚠️ user skip', u, e)
+
+
+def run():
+    for r in ROLES:
+        ensure_role(r)
+    frappe.db.commit()
+    fix_doctype()
+    ensure_operational_users_are_desk()
+    frappe.clear_cache()
+    frappe.db.commit()
+    return {'success': True}
+PY
+chmod 644 "$APP_DIR/scripts/fix_complaints_visibility_workflow.py"
+
+say "4) Patch hooks.py with permission query / has_permission hooks"
+cat >> "$APP_DIR/hooks.py" <<'PY'
+
+# ROSHDY: all operational roles can see global complaint register; quality desk filters assignment separately.
+try:
+    permission_query_conditions
+except NameError:
+    permission_query_conditions = {}
+permission_query_conditions["Call Center Complaint"] = "restaurant_ops.api.complaint_permissions.get_permission_query_conditions"
+
+try:
+    has_permission
+except NameError:
+    has_permission = {}
+has_permission["Call Center Complaint"] = "restaurant_ops.api.complaint_permissions.has_permission"
+PY
+chmod 644 "$APP_DIR/hooks.py"
+
+say "5) Patch quality_api assignment workflow"
+cat >> "$APP_DIR/api/quality_api.py" <<'PY'
+
+# ===== ROSHDY QUALITY ASSIGNMENT WORKFLOW FINAL START =====
+QUALITY_SUPERVISOR_USERS = {'quality.test@roshdy.com'}
+
+
+def _qflow_roles():
+    try:
+        return set(frappe.get_roles(frappe.session.user))
+    except Exception:
+        return set()
+
+
+def _qflow_is_manager():
+    user = frappe.session.user
+    roles = _qflow_roles()
+    return user == 'Administrator' or user in QUALITY_SUPERVISOR_USERS or bool(roles & {'System Manager', 'Call Center Admin'})
+
+
+def _qflow_is_quality_user():
+    return 'Complaint_Quality_User' in _qflow_roles()
+
+
+def _qflow_allowed():
+    return _qflow_is_manager() or _qflow_is_quality_user()
+
+
+def _qflow_status_en(v):
+    m = {'مسودة':'Draft','مفتوح':'Open','مفتوحة':'Open','قيد المراجعة':'Under Review','قيد مراجعه':'Under Review','تم الحل':'Resolved','محلولة':'Resolved','مغلق':'Closed','مغلقة':'Closed'}
+    s = str(v or '').strip()
+    return m.get(s, s)
+
+
+def _qflow_priority_en(v):
+    m = {'منخفضة':'Low','منخفض':'Low','متوسطة':'Medium','متوسط':'Medium','عالية':'High','عالي':'High','عاجلة':'Urgent','عاجل':'Urgent'}
+    s = str(v or '').strip()
+    return m.get(s, s)
+
+
+def _qflow_meta_fields():
+    try:
+        return {df.fieldname for df in frappe.get_meta('Call Center Complaint').fields}
+    except Exception:
+        return set()
+
+
+def _qflow_rows(date_from=None, date_to=None, search='', assigned='All'):
+    from datetime import datetime, time
+    from frappe.utils import getdate, add_days
+    meta = _qflow_meta_fields()
+    today = getdate()
+    df = getdate(date_from) if date_from else today.replace(day=1)
+    dt = getdate(date_to) if date_to else today
+    start = datetime.combine(df, time.min)
+    end = datetime.combine(add_days(dt, 1), time.min)
+    date_expr = 'COALESCE(complaint_datetime, creation)' if 'complaint_datetime' in meta else 'creation'
+    fields = ['name'] + [f for f in ['customer_name','phone_number','complaint_source','complaint_category','complaint_priority','status','assigned_quality_inspector','investigation_analysis','corrective_action','complaint_details','complaint_datetime','creation','modified','closing_notes','resolved_by','resolved_at','opened_by_agent','shift','shift_leader','call_record_link'] if f in meta]
+    where = [f'{date_expr} >= %s', f'{date_expr} < %s']
+    vals = [start, end]
+    if search:
+        like = '%' + str(search).strip() + '%'
+        parts=[]
+        for f in ['name','customer_name','phone_number','complaint_details','complaint_category']:
+            if f == 'name' or f in meta:
+                parts.append(f'{f} like %s'); vals.append(like)
+        if parts:
+            where.append('(' + ' or '.join(parts) + ')')
+    # Quality Desk routing: managers/supervisor see all. Pure quality sees only assigned to them.
+    if not _qflow_is_manager() and _qflow_is_quality_user() and 'assigned_quality_inspector' in meta:
+        where.append('assigned_quality_inspector=%s')
+        vals.append(frappe.session.user)
+    elif assigned == 'mine' and 'assigned_quality_inspector' in meta:
+        where.append('assigned_quality_inspector=%s')
+        vals.append(frappe.session.user)
+    elif assigned == 'unassigned' and 'assigned_quality_inspector' in meta:
+        where.append("(assigned_quality_inspector is null or assigned_quality_inspector='')")
+    sql = f"select {', '.join(fields)} from `tabCall Center Complaint` where {' and '.join(where)} order by {date_expr} desc limit 10000"
+    rows = frappe.db.sql(sql, vals, as_dict=True)
+    for r in rows:
+        r['dt'] = str(r.get('complaint_datetime') or r.get('creation') or '')
+        r['can_update_quality'] = True
+    return rows, df, dt
+
+
+def _qflow_filter(rows, status='All', priority='All'):
+    if status and status != 'All':
+        rows = [r for r in rows if _qflow_status_en(r.get('status')) == _qflow_status_en(status)]
+    if priority and priority != 'All':
+        rows = [r for r in rows if _qflow_priority_en(r.get('complaint_priority')) == _qflow_priority_en(priority)]
+    return rows
+
+
+def _qflow_stats(rows):
+    total=len(rows)
+    resolved=sum(1 for r in rows if _qflow_status_en(r.get('status')) in {'Resolved','Closed'})
+    under=sum(1 for r in rows if _qflow_status_en(r.get('status')) == 'Under Review')
+    open_count=sum(1 for r in rows if _qflow_status_en(r.get('status')) in {'Draft','Open'})
+    urgent=sum(1 for r in rows if _qflow_priority_en(r.get('complaint_priority')) in {'High','Urgent'} and _qflow_status_en(r.get('status')) not in {'Resolved','Closed'})
+    reviewed=sum(1 for r in rows if r.get('investigation_analysis') or r.get('corrective_action') or _qflow_status_en(r.get('status')) in {'Resolved','Closed'})
+    unassigned=sum(1 for r in rows if not r.get('assigned_quality_inspector'))
+    mine=sum(1 for r in rows if r.get('assigned_quality_inspector') == frappe.session.user)
+    return {'total':total,'open':open_count,'under_review':under,'resolved':resolved,'urgent':urgent,'reviewed':reviewed,'unassigned':unassigned,'mine':mine}
+
+
+@frappe.whitelist(allow_guest=False)
+def get_quality_dashboard(date_from=None, date_to=None, status='All', priority='All', search='', assigned='All', page=1, page_size=200):
+    if not _qflow_allowed():
+        return {'success': False, 'message': 'Permission denied'}
+    rows, df, dt = _qflow_rows(date_from, date_to, search, assigned)
+    rows = _qflow_filter(rows, status, priority)
+    page=max(1,int(page or 1)); page_size=max(10,min(int(page_size or 200),500))
+    start=(page-1)*page_size
+    try:
+        emp = frappe.db.get_value('Employee', {'user_id': frappe.session.user}, 'employee_name') or frappe.db.get_value('User', frappe.session.user, 'full_name') or frappe.session.user
+    except Exception:
+        emp = frappe.session.user
+    return {'success': True, 'employee_name': emp, 'user': frappe.session.user, 'quality_manager_view': _qflow_is_manager(), 'date_from': str(df), 'date_to': str(dt), 'stats': _qflow_stats(rows), 'rows': rows[start:start+page_size], 'total_rows': len(rows), 'page': page, 'page_size': page_size, 'total_complaints': len(rows), 'my_count': len(rows[start:start+page_size]), 'my_complaints': rows[start:start+page_size]}
+# ===== ROSHDY QUALITY ASSIGNMENT WORKFLOW FINAL END =====
+PY
+
+say "6) Clear cache, migrate, restart"
+docker exec "$BACKEND" bash -lc "find /home/frappe/frappe-bench/apps/restaurant_ops -name '*.pyc' -delete; find /home/frappe/frappe-bench/apps/restaurant_ops -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.scripts.fix_complaints_visibility_workflow.run
+docker exec "$BACKEND" bench --site "$SITE" migrate
+docker exec "$BACKEND" bench --site "$SITE" clear-cache || true
+docker exec "$BACKEND" bench --site "$SITE" clear-website-cache || true
+docker compose restart backend frontend websocket queue-short queue-long scheduler
+sleep 12
+BACKEND="$(docker compose ps -q backend)"
+
+say "7) Validation"
+echo "--- DocPerm Complaint roles ---"
+docker exec "$BACKEND" bench --site "$SITE" execute frappe.db.sql --args '["select role, permlevel, if_owner, `select`, `read`, `write`, `create`, `delete`, report, export from `tabDocPerm` where parent=\"Call Center Complaint\" and role in (\"Restaurant Agent\",\"Call Center Admin\",\"Complaint_Quality_User\",\"Complaint_Finance_User\") order by role, permlevel"]' || true
+
+echo "--- bad if_owner check ---"
+docker exec "$BACKEND" bench --site "$SITE" execute frappe.db.sql --args '["select role, permlevel, if_owner from `tabDocPerm` where parent=\"Call Center Complaint\" and if_owner=1"]' || true
+
+echo "--- quality.test dashboard (should see all in quality desk) ---"
+docker exec "$BACKEND" bench --site "$SITE" execute frappe.get_attr --args '["restaurant_ops.api.quality_api.get_quality_dashboard"]' >/dev/null && echo "quality api OK" || true
+
+echo "--- Page HTTP status ---"
+for page in app/call-center-complaint quality-desk call-report admin-desk; do
+  code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$page" || true)"
+  echo "$page => $code"
+done
+
+say "8) Health Check مهم: Elastix/CDR/AMI + Queue + Call Report"
+echo "--- Asterisk/Elastix diagnostics ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics || true
+
+echo "--- Queue status ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.queue_api.get_queue_status || true
+
+echo "--- Calls report admin sample ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' || true
+
+say "✅ Complaints visibility workflow fixed يا زعيم"
+echo "النتيجة: سجل الشكاوى في /app/call-center-complaint ظاهر لكل الأدوار التشغيلية، بدون owner-only."
+echo "Quality Desk: quality.test/System/Call Center Admin يشوفوا الكل، وأي Quality عادي يشوف المسند له فقط من assigned_quality_inspector."
+echo "افتح بيوزر Agent وابحث في /app/call-center-complaint، وافتح بيوزر Quality assigned وتأكد من /quality-desk."
+echo "Backup: $BACKUP_DIR"

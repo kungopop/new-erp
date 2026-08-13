@@ -1,0 +1,405 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# email-report-final-customizer
+# Finalizes the hidden email customizer and makes the ACTUAL email send use it.
+# - Rewrites /email-report-customizer with full controls for Center Service Manager + Upper Management.
+# - Appends final overrides to email_report.py: preview + send use saved customizer settings.
+# - Keeps /settings page existing; send_report_now remains compatible.
+# - Does NOT touch report_api.py / CDR core logic.
+
+ROOT="/opt/frappe_crm"
+SITE="crm.local"
+APP_HOST="$ROOT/apps/restaurant_ops"
+APP_DIR="$APP_HOST/restaurant_ops"
+API_DIR="$APP_DIR/api"
+WWW_DIR="$APP_DIR/www"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/EMAIL_REPORT_FINAL_CUSTOMIZER_BEFORE_$TS"
+
+say(){ echo -e "\n============================================================\n$1\n============================================================"; }
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo "❌ شغّل كـ root: sudo -i ثم ./email-report-final-customizer"
+  exit 1
+fi
+
+say "1) Backup قبل تثبيت Email Customizer النهائي"
+cd "$ROOT"
+BACKEND="$(docker compose ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ لم أجد backend container. شغّل: cd /opt/frappe_crm && docker compose up -d"
+  exit 1
+fi
+mkdir -p "$BACKUP_DIR"
+cp -a "$APP_HOST" "$BACKUP_DIR/restaurant_ops"
+[[ -f "$ROOT/docker-compose.yml" ]] && cp -a "$ROOT/docker-compose.yml" "$BACKUP_DIR/docker-compose.yml"
+echo "✅ Backup: $BACKUP_DIR"
+
+say "2) Append final email_report.py overrides"
+cat >> "$API_DIR/email_report.py" <<'PY'
+
+# ===== ROSHDY EMAIL REPORT FINAL CUSTOMIZER START =====
+import json as _json
+
+
+def _er_bool(v, default=1):
+    if v is None:
+        return bool(default)
+    if isinstance(v, bool):
+        return v
+    try:
+        return bool(int(v))
+    except Exception:
+        return str(v).strip().lower() in ("true", "yes", "on", "y")
+
+
+def _er_split_recipients(raw):
+    return [x.strip() for x in str(raw or "").replace(";", ",").split(",") if x.strip()]
+
+
+def _er_customizer_defaults():
+    place = "مطعم رشدي"
+    try:
+        place = frappe.conf.get("restaurant_place_name") or place
+    except Exception:
+        pass
+    return {
+        "place_name": place,
+        "primary_color": "#1F4E79",
+        "center_title": "تقرير مدير إدارة خدمة العملاء",
+        "upper_title": "تقرير الإدارة العليا",
+        "shift_start": "00:00",
+        "shift_end": "23:59",
+        "center_recipients_override": "",
+        "upper_recipients_override": "",
+        "center_intro": "",
+        "center_footer": "",
+        "upper_intro": "",
+        "upper_footer": "",
+        "show_call_explanation": 1,
+        "show_breaks_center": 1,
+        "show_sales_center": 1,
+        "show_complaints_center": 1,
+        "show_staff_missed_center": 1,
+        "show_permissions_center": 1,
+        "show_charges_center": 1,
+        "show_call_explanation_upper": 1,
+        "show_raw_summary_upper": 1,
+        "show_sales_upper": 1,
+        "show_complaints_upper": 1,
+        "show_staff_missed_upper": 1,
+        "show_breaks_upper": 0,
+        "custom_css": "",
+    }
+
+
+def _er_get_customizer():
+    raw = "{}"
+    try:
+        raw = frappe.db.get_default("roshdy_email_customizer_v4") or frappe.db.get_default("roshdy_email_customizer_v3") or "{}"
+    except Exception:
+        raw = "{}"
+    try:
+        data = _json.loads(raw or "{}")
+    except Exception:
+        data = {}
+    defaults = _er_customizer_defaults()
+    defaults.update(data or {})
+    return defaults
+
+
+def _er_save_customizer(data):
+    frappe.db.set_default("roshdy_email_customizer_v4", _json.dumps(data, ensure_ascii=False))
+    frappe.db.commit()
+    return data
+
+
+def _er_period_args(st=None):
+    st = st or _er_get_customizer()
+    dt = today()
+    return dt, dt, st.get("shift_start") or "00:00", st.get("shift_end") or "23:59"
+
+
+def _er_table(headers, rows):
+    h = "".join([f"<th>{frappe.utils.escape_html(str(x))}</th>" for x in headers])
+    body = ""
+    for row in rows:
+        body += "<tr>" + "".join([f"<td>{frappe.utils.escape_html(str(x if x is not None else ''))}</td>" for x in row]) + "</tr>"
+    if not rows:
+        body = f"<tr><td colspan='{len(headers)}' style='text-align:center;color:#777'>لا توجد بيانات</td></tr>"
+    return f"<table><thead><tr>{h}</tr></thead><tbody>{body}</tbody></table>"
+
+
+def _er_base_html(title, st, inner):
+    color = st.get("primary_color") or "#1F4E79"
+    css = st.get("custom_css") or ""
+    place = st.get("place_name") or "مطعم رشدي"
+    return f"""
+    <div dir="rtl" style="font-family:Tahoma,Arial,sans-serif;color:#111827">
+    <style>
+      .roshdy-email-wrap h2{{color:{color};margin:0 0 10px}}
+      .roshdy-email-wrap h3{{color:{color};border-bottom:1px solid #ddd;padding-bottom:6px;margin-top:22px}}
+      .roshdy-email-wrap table{{width:100%;border-collapse:collapse;margin:10px 0 16px}}
+      .roshdy-email-wrap th{{background:#24292e;color:#fff;padding:8px;border:1px solid #111;text-align:right}}
+      .roshdy-email-wrap td{{padding:7px;border:1px solid #ddd;text-align:right;vertical-align:top}}
+      .roshdy-email-wrap .note{{background:#f8fafc;border:1px solid #e5e7eb;border-radius:10px;padding:10px;margin:8px 0;line-height:1.7}}
+      {css}
+    </style>
+    <div class="roshdy-email-wrap">
+      <h2>{frappe.utils.escape_html(title)}</h2>
+      <div style="color:#64748b;margin-bottom:12px">{frappe.utils.escape_html(place)} — {frappe.utils.escape_html(str(now_datetime()))}</div>
+      {inner}
+      <div style="margin-top:25px;color:#64748b;text-align:center;font-size:12px">ERPNext — {frappe.utils.escape_html(place)}</div>
+    </div></div>
+    """
+
+
+def _er_complaints_section(date_from, date_to):
+    try:
+        rows = frappe.db.sql("""
+            SELECT status, complaint_category, complaint_priority, COUNT(*) cnt
+            FROM `tabCall Center Complaint`
+            WHERE COALESCE(complaint_datetime, creation) BETWEEN %s AND %s
+            GROUP BY status, complaint_category, complaint_priority
+            ORDER BY cnt DESC
+        """, (f"{date_from} 00:00:00", f"{date_to} 23:59:59"), as_dict=True)
+        table_rows = [[r.status or '', r.complaint_category or '', r.complaint_priority or '', r.cnt] for r in rows]
+        return "<h3>الشكاوى</h3>" + _er_table(["الحالة", "الفئة", "الأولوية", "العدد"], table_rows)
+    except Exception as e:
+        return f"<h3>الشكاوى</h3><div class='note'>تعذر تحميل الشكاوى: {frappe.utils.escape_html(str(e))}</div>"
+
+
+def _er_staff_missed_section(date_from, date_to):
+    try:
+        from restaurant_ops.api.report_api import get_staff_missed_attempts
+        d = get_staff_missed_attempts(date_from, date_to, 15)
+        rows = []
+        for r in d.get("grouped", [])[:30]:
+            rows.append([r.get("agent_name") or r.get("actual_ext") or "", r.get("count") or 0, r.get("total_duration") or ""])
+        return "<h3>محاولات فائتة على الموظفين</h3>" + _er_table(["الموظف/التحويلة", "العدد", "المدة"], rows)
+    except Exception:
+        return ""
+
+
+def _er_permissions_section():
+    try:
+        month = today()[:7]
+        rows = frappe.db.sql("""
+            SELECT e.employee_name, COALESCE(SUM(p.hours),0) hours
+            FROM `tabEmployee Permission Log` p
+            LEFT JOIN `tabEmployee` e ON p.employee=e.name
+            WHERE p.month=%s GROUP BY e.employee_name ORDER BY hours DESC
+        """, (month,), as_dict=True)
+        return "<h3>الأذونات</h3>" + _er_table(["الموظف", "الساعات"], [[r.employee_name or '', r.hours or 0] for r in rows])
+    except Exception:
+        return ""
+
+
+def _er_charges_section():
+    try:
+        month = today()[:7]
+        rows = frappe.db.sql("""
+            SELECT e.employee_name, COUNT(c.name) cnt, COALESCE(SUM(c.amount),0) amount
+            FROM `tabEmployee Charge Log` c
+            LEFT JOIN `tabEmployee` e ON c.employee=e.name
+            WHERE c.month=%s GROUP BY e.employee_name ORDER BY amount DESC
+        """, (month,), as_dict=True)
+        return "<h3>الجزاءات / الخصومات</h3>" + _er_table(["الموظف", "العدد", "المبلغ"], [[r.employee_name or '', r.cnt or 0, r.amount or 0] for r in rows])
+    except Exception:
+        return ""
+
+
+def _er_render_report(report_type="center"):
+    from restaurant_ops.api.ops_reports_api import get_owner_call_summary, get_break_report, get_sales_report
+    st = _er_get_customizer()
+    date_from, date_to, shift_start, shift_end = _er_period_args(st)
+    title = st.get("center_title") if report_type == "center" else st.get("upper_title")
+    intro = st.get("center_intro") if report_type == "center" else st.get("upper_intro")
+    footer = st.get("center_footer") if report_type == "center" else st.get("upper_footer")
+    sections = []
+    if intro:
+        sections.append(f"<div class='note'>{frappe.utils.escape_html(intro)}</div>")
+    calls = get_owner_call_summary(date_from, date_to, shift_start, shift_end)
+    if (report_type == "center" and _er_bool(st.get("show_call_explanation"), 1)) or (report_type == "upper" and _er_bool(st.get("show_call_explanation_upper"), 1)):
+        rows = [[x.get("label"), x.get("count"), x.get("note")] for x in calls.get("explanation", [])]
+        sections.append("<h3>ملخص المكالمات الإداري</h3>" + _er_table(["البند", "العدد", "التفسير"], rows))
+    if report_type == "upper" and _er_bool(st.get("show_raw_summary_upper"), 1):
+        sm = calls.get("summary", {})
+        rows = [["إجمالي أحداث السنترال", sm.get("raw_total",0)], ["وصل للطوابير", sm.get("queue_total",0)], ["نسبة الوصول للطابور", str(sm.get("queue_reach_rate_of_all",0))+"%"], ["نسبة الرد داخل الطابور", str(sm.get("answer_rate_of_queue",0))+"%"]]
+        sections.append("<h3>مؤشرات مختصرة للإدارة العليا</h3>" + _er_table(["المؤشر", "القيمة"], rows))
+    if (report_type == "center" and _er_bool(st.get("show_breaks_center"), 1)) or (report_type == "upper" and _er_bool(st.get("show_breaks_upper"), 0)):
+        br = get_break_report(date_from, date_to, shift_start, shift_end)
+        rows = [[x.get("employee_name"), x.get("count"), x.get("minutes")] for x in br.get("by_employee", [])]
+        sections.append("<h3>البريكات</h3>" + _er_table(["الموظف", "عدد البريكات", "الدقائق"], rows))
+    if (report_type == "center" and _er_bool(st.get("show_sales_center"), 1)) or (report_type == "upper" and _er_bool(st.get("show_sales_upper"), 1)):
+        sales = get_sales_report(date_from, date_to, shift_start, shift_end)
+        rows1 = [[x.get("employee_name"), x.get("orders"), x.get("quantity")] for x in sales.get("by_agent", [])]
+        rows2 = [[x.get("item_name"), x.get("orders"), x.get("quantity")] for x in sales.get("by_item", [])]
+        sections.append("<h3>المبيعات حسب الموظف</h3>" + _er_table(["الموظف", "عدد العمليات", "الكمية"], rows1))
+        sections.append("<h3>المبيعات حسب الصنف</h3>" + _er_table(["الصنف", "عدد العمليات", "الكمية"], rows2))
+    if (report_type == "center" and _er_bool(st.get("show_complaints_center"), 1)) or (report_type == "upper" and _er_bool(st.get("show_complaints_upper"), 1)):
+        sections.append(_er_complaints_section(date_from, date_to))
+    if (report_type == "center" and _er_bool(st.get("show_staff_missed_center"), 1)) or (report_type == "upper" and _er_bool(st.get("show_staff_missed_upper"), 1)):
+        sections.append(_er_staff_missed_section(date_from, date_to))
+    if report_type == "center" and _er_bool(st.get("show_permissions_center"), 1):
+        sections.append(_er_permissions_section())
+    if report_type == "center" and _er_bool(st.get("show_charges_center"), 1):
+        sections.append(_er_charges_section())
+    if footer:
+        sections.append(f"<div class='note'>{frappe.utils.escape_html(footer)}</div>")
+    html = _er_base_html(title or "تقرير", st, "".join(sections))
+    return {"success": True, "html": html, "settings": st, "calls": calls}
+
+
+@frappe.whitelist()
+def get_email_customizer_settings():
+    if not (frappe.session.user == "Administrator" or "System Manager" in frappe.get_roles(frappe.session.user)):
+        return {"success": False, "message": "System Manager only"}
+    return {"success": True, "settings": _er_get_customizer()}
+
+
+@frappe.whitelist()
+def save_email_customizer_settings(settings_json=None, **kwargs):
+    if not (frappe.session.user == "Administrator" or "System Manager" in frappe.get_roles(frappe.session.user)):
+        return {"success": False, "message": "System Manager only"}
+    data = _er_get_customizer()
+    if settings_json:
+        try: data.update(_json.loads(settings_json))
+        except Exception: pass
+    data.update(kwargs)
+    _er_save_customizer(data)
+    return {"success": True, "settings": data}
+
+
+@frappe.whitelist()
+def preview_email_report(report_type="center"):
+    return _er_render_report(report_type or "center")
+
+
+@frappe.whitelist()
+def preview_center_manager_report():
+    return _er_render_report("center")
+
+
+@frappe.whitelist()
+def preview_upper_management_report():
+    return _er_render_report("upper")
+
+
+def _er_recipients_for(settings_doc, report_type, st):
+    if report_type == "center":
+        override = st.get("center_recipients_override") or ""
+        fallback = getattr(settings_doc, "center_manager_recipients", "") or getattr(settings_doc, "daily_report_recipients", "") or "el.alfy@roshdy.com"
+    else:
+        override = st.get("upper_recipients_override") or ""
+        fallback = getattr(settings_doc, "upper_management_recipients", "") or "admin@roshdy.com"
+    return _er_split_recipients(override or fallback)
+
+
+def send_center_manager_report(settings) -> dict:
+    try:
+        st = _er_get_customizer()
+        recipients = _er_recipients_for(settings, "center", st)
+        if not recipients:
+            return {"success": False, "message": "No center recipients"}
+        rendered = _er_render_report("center")
+        subject = f"📋 {st.get('center_title') or 'تقرير مدير إدارة خدمة العملاء'} — {today()}"
+        frappe.sendmail(recipients=recipients, subject=subject, message=rendered.get("html"), now=True)
+        return {"success": True, "message": f"sent to {len(recipients)}", "recipients": recipients}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
+def send_upper_management_report(settings) -> dict:
+    try:
+        st = _er_get_customizer()
+        recipients = _er_recipients_for(settings, "upper", st)
+        if not recipients:
+            return {"success": False, "message": "No upper recipients"}
+        rendered = _er_render_report("upper")
+        subject = f"📊 {st.get('upper_title') or 'تقرير الإدارة العليا'} — {today()}"
+        frappe.sendmail(recipients=recipients, subject=subject, message=rendered.get("html"), now=True)
+        return {"success": True, "message": f"sent to {len(recipients)}", "recipients": recipients}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
+def send_daily_shift_report() -> dict:
+    try:
+        settings = frappe.get_single("Call Center Settings")
+        if hasattr(settings, "daily_report_enabled") and not settings.daily_report_enabled:
+            return {"success": False, "message": "Daily report disabled"}
+        c = send_center_manager_report(settings)
+        u = send_upper_management_report(settings)
+        return {"success": True, "message": f"Center: {c.get('message')} | Upper: {u.get('message')}", "center": c, "upper": u}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
+@frappe.whitelist()
+def send_report_now(report_type="both") -> dict:
+    try:
+        settings = frappe.get_single("Call Center Settings")
+        rt = (report_type or "both").lower()
+        if rt in ("center", "service", "manager"):
+            return send_center_manager_report(settings)
+        if rt in ("upper", "management"):
+            return send_upper_management_report(settings)
+        return send_daily_shift_report()
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+# ===== ROSHDY EMAIL REPORT FINAL CUSTOMIZER END =====
+PY
+chmod 644 "$API_DIR/email_report.py"
+
+say "3) Rewrite /email-report-customizer page"
+cat > "$WWW_DIR/email-report-customizer.py" <<'PY'
+import frappe
+no_cache=1
+
+def get_context(context):
+    if frappe.session.user == 'Guest':
+        frappe.local.flags.redirect_location='/login?redirect-to=/email-report-customizer'
+        raise frappe.Redirect
+    if frappe.session.user != 'Administrator' and 'System Manager' not in frappe.get_roles(frappe.session.user):
+        frappe.throw('System Manager only', frappe.PermissionError)
+    return context
+PY
+cat > "$WWW_DIR/email-report-customizer.html" <<'HTML'
+<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Email Report Customizer</title><style>*{box-sizing:border-box;font-family:Tahoma,Arial}body{margin:0;background:#eef2f7;direction:rtl}.top{background:#20262d;color:white;padding:14px 22px;display:flex;justify-content:space-between}.top a{color:white;text-decoration:none;border:1px solid #64748b;border-radius:10px;padding:8px 12px}.wrap{padding:22px;max-width:1400px;margin:auto}.panel{background:#fff;border:1px solid #ddd;border-radius:16px;padding:16px;margin:12px 0}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.grid2{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}input,select,textarea{width:100%;padding:9px;border:1px solid #ccc;border-radius:8px}.btn{border:0;border-radius:9px;padding:10px 13px;background:#1F4E79;color:#fff;font-weight:bold;cursor:pointer;margin:3px}.green{background:#16a34a}.orange{background:#f97316}.checks{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px}.checks label{border:1px solid #ddd;border-radius:10px;padding:8px;background:#f8fafc}iframe{width:100%;height:650px;border:1px solid #ddd;border-radius:12px;background:#fff}pre{direction:ltr;text-align:left;background:#111827;color:#dcfce7;border-radius:10px;padding:10px;white-space:pre-wrap}@media(max-width:900px){.grid,.grid2{grid-template-columns:1fr}}</style></head><body><div class="top"><b>📧 Email Report Customizer — System Manager</b><div><a href="/settings">Settings</a><a href="/admin-desk">Admin Desk</a></div></div><div class="wrap"><div class="panel"><h3>عام</h3><div class="grid"><div><label>نوع التقرير للمعاينة/الإرسال</label><select id="report_type"><option value="center">مدير إدارة خدمة العملاء</option><option value="upper">الإدارة العليا</option><option value="both">الاتنين عند الإرسال</option></select></div><div><label>اسم المكان</label><input id="place_name"></div><div><label>لون أساسي</label><input id="primary_color" value="#1F4E79"></div><div><label>Shift Start</label><input id="shift_start"></div><div><label>Shift End</label><input id="shift_end"></div><div><label>عنوان تقرير خدمة العملاء</label><input id="center_title"></div><div><label>عنوان تقرير الإدارة العليا</label><input id="upper_title"></div></div><br><div class="grid2"><div><label>Recipients override لخدمة العملاء</label><input id="center_recipients_override" placeholder="اختياري: a@x.com,b@x.com"></div><div><label>Recipients override للإدارة العليا</label><input id="upper_recipients_override" placeholder="اختياري"></div></div></div><div class="panel"><h3>أقسام تقرير خدمة العملاء</h3><div class="checks"><label><input type="checkbox" id="show_call_explanation"> شرح المكالمات</label><label><input type="checkbox" id="show_breaks_center"> البريكات</label><label><input type="checkbox" id="show_sales_center"> المبيعات</label><label><input type="checkbox" id="show_complaints_center"> الشكاوى</label><label><input type="checkbox" id="show_staff_missed_center"> محاولات فائتة</label><label><input type="checkbox" id="show_permissions_center"> الأذونات</label><label><input type="checkbox" id="show_charges_center"> الجزاءات/الخصومات</label></div><br><label>نص افتتاحي</label><textarea id="center_intro" rows="2"></textarea><label>نص ختامي</label><textarea id="center_footer" rows="2"></textarea></div><div class="panel"><h3>أقسام تقرير الإدارة العليا</h3><div class="checks"><label><input type="checkbox" id="show_call_explanation_upper"> شرح المكالمات</label><label><input type="checkbox" id="show_raw_summary_upper"> مؤشرات مختصرة</label><label><input type="checkbox" id="show_sales_upper"> المبيعات</label><label><input type="checkbox" id="show_complaints_upper"> الشكاوى</label><label><input type="checkbox" id="show_staff_missed_upper"> محاولات فائتة</label><label><input type="checkbox" id="show_breaks_upper"> البريكات للإدارة العليا</label></div><br><label>نص افتتاحي</label><textarea id="upper_intro" rows="2"></textarea><label>نص ختامي</label><textarea id="upper_footer" rows="2"></textarea></div><div class="panel"><h3>CSS متقدم اختياري</h3><textarea id="custom_css" rows="4" placeholder="اختياري"></textarea><br><button class="btn green" onclick="save()">حفظ التخصيص</button><button class="btn orange" onclick="preview()">Preview</button><button class="btn" onclick="sendTest()">إرسال تجريبي حسب النوع</button><pre id="out"></pre></div><div class="panel"><iframe id="frame"></iframe></div></div><script>function M(a){return a.join('')}async function api(m,args){let qs=new URLSearchParams();args=args||{};Object.keys(args).forEach(k=>{if(args[k]!==undefined&&args[k]!==null)qs.append(k,args[k])});let r=await fetch('/api/method/'+m+'?'+qs.toString(),{credentials:'same-origin',cache:'no-store'});let j=await r.json();return j.message}function id(x){return document.getElementById(x)}function val(x){return id(x).value}function chk(x){return id(x).checked?1:0}function setv(x,v){id(x).value=v==null?'':v}function setc(x,v){id(x).checked=!!Number(v)}function collect(){let data={};['place_name','primary_color','center_title','upper_title','shift_start','shift_end','center_recipients_override','upper_recipients_override','center_intro','center_footer','upper_intro','upper_footer','custom_css'].forEach(k=>data[k]=val(k));['show_call_explanation','show_breaks_center','show_sales_center','show_complaints_center','show_staff_missed_center','show_permissions_center','show_charges_center','show_call_explanation_upper','show_raw_summary_upper','show_sales_upper','show_complaints_upper','show_staff_missed_upper','show_breaks_upper'].forEach(k=>data[k]=chk(k));return data}async function load(){let d=await api(M(['restaurant','_ops.api.email','_report.get_email_customizer_settings']));let s=(d&&d.settings)||{};Object.keys(s).forEach(k=>{if(id(k)){if(id(k).type==='checkbox')setc(k,s[k]);else setv(k,s[k])}});out.textContent=JSON.stringify(d,null,2)}async function save(){let d=await api(M(['restaurant','_ops.api.email','_report.save_email_customizer_settings']),{settings_json:JSON.stringify(collect())});out.textContent=JSON.stringify(d,null,2);alert(d&&d.success?'تم الحفظ':'فشل')}async function preview(){await save();let rt=val('report_type');if(rt==='both')rt='center';let d=await api(M(['restaurant','_ops.api.email','_report.preview_email_report']),{report_type:rt});out.textContent=JSON.stringify({success:d&&d.success,settings:d&&d.settings},null,2);if(d&&d.success)frame.srcdoc=d.html;else alert((d&&d.message)||'Error')}async function sendTest(){await save();let rt=val('report_type');let d=await api(M(['restaurant','_ops.api.email','_report.send_report_now']),{report_type:rt});out.textContent=JSON.stringify(d,null,2);alert((d&&d.success)?'تم الإرسال/الجدولة':'فشل الإرسال')}load();</script></body></html>
+HTML
+chmod 644 "$WWW_DIR/email-report-customizer.py" "$WWW_DIR/email-report-customizer.html"
+
+say "4) Clear cache/restart"
+docker exec "$BACKEND" bash -lc "find /home/frappe/frappe-bench/apps/restaurant_ops -name '*.pyc' -delete; find /home/frappe/frappe-bench/apps/restaurant_ops -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true"
+docker exec "$BACKEND" bench --site "$SITE" clear-cache || true
+docker exec "$BACKEND" bench --site "$SITE" clear-website-cache || true
+docker compose restart backend frontend websocket queue-short queue-long scheduler
+sleep 10
+BACKEND="$(docker compose ps -q backend)"
+
+say "5) Validation"
+echo "--- customizer settings ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.email_report.get_email_customizer_settings || true
+
+echo "--- center preview ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.email_report.preview_email_report --kwargs '{"report_type":"center"}' || true
+
+echo "--- upper preview ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.email_report.preview_email_report --kwargs '{"report_type":"upper"}' || true
+
+echo "--- Page HTTP status ---"
+for page in email-report-customizer settings call-report break-admin sales-report admin-desk; do
+  code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$page" || true)"
+  echo "$page => $code"
+done
+
+say "6) Health Check مهم: Elastix/CDR/AMI + Queue + Call Report"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics || true
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.queue_api.get_queue_status || true
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' || true
+
+say "✅ Email report final customizer applied"
+echo "افتح /email-report-customizer كـ System Manager. أي Save هناك هيسمع في Preview و send_report_now الفعلي."
+echo "Backup: $BACKUP_DIR"

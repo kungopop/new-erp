@@ -1,0 +1,258 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# quality-desk-open-desk-button
+# Adds robust Desk navigation from /quality-desk:
+# - Top button: opens /app/call-center-complaint list.
+# - Modal button: opens current complaint in /app/call-center-complaint/<COMP...>.
+# - Replaces old "فتح صفحة كاملة" behavior to open Desk complaint form.
+# - Fixes custom save handler to identify current complaint by modal title if JS local variable is not global.
+# - Keeps normal login redirect to /quality-desk, but direct /app/call-center-complaint/* remains allowed.
+
+ROOT="/opt/frappe_crm"
+SITE="crm.local"
+APP_HOST="$ROOT/apps/restaurant_ops"
+APP_DIR="$APP_HOST/restaurant_ops"
+WWW_DIR="$APP_DIR/www"
+PUBLIC_JS_DIR="$APP_DIR/public/js"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/QUALITY_DESK_OPEN_DESK_BUTTON_BEFORE_$TS"
+
+say(){ echo -e "\n============================================================\n$1\n============================================================"; }
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo "❌ شغّل كـ root: sudo -i ثم ./quality-desk-open-desk-button"
+  exit 1
+fi
+
+say "1) Backup قبل تعديل أزرار Quality Desk"
+cd "$ROOT"
+BACKEND="$(docker compose ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ لم أجد backend container. شغّل: cd /opt/frappe_crm && docker compose up -d"
+  exit 1
+fi
+mkdir -p "$BACKUP_DIR"
+cp -a "$APP_HOST" "$BACKUP_DIR/restaurant_ops"
+[[ -f "$ROOT/docker-compose.yml" ]] && cp -a "$ROOT/docker-compose.yml" "$BACKUP_DIR/docker-compose.yml"
+echo "✅ Backup: $BACKUP_DIR"
+
+say "2) تأكيد redirect safe لصفحات الشكاوى داخل Desk"
+mkdir -p "$PUBLIC_JS_DIR"
+cat > "$PUBLIC_JS_DIR/desk_redirect.js" <<'JS'
+// ROSHDY SAFE DESK REDIRECT
+// Normal custom-role login redirect stays, but real Desk complaint pages are allowed.
+(function(){
+  function allowedDeskRoute(){
+    var p = window.location.pathname || '';
+    return p.indexOf('/app/call-center-complaint') === 0 ||
+           p.indexOf('/app/file') === 0 ||
+           p.indexOf('/app/comment') === 0 ||
+           p.indexOf('/app/communication') === 0;
+  }
+  if (allowedDeskRoute()) return;
+  function shouldRedirectFromThisDeskPage(){
+    var p = window.location.pathname || '';
+    return p === '/app' || p === '/app/' || p === '/app/home' || p.indexOf('/app/workspace') === 0;
+  }
+  function go(){
+    if (!shouldRedirectFromThisDeskPage()) return;
+    if (!window.frappe || !frappe.call) return;
+    frappe.call({
+      method: 'restaurant_ops.api.login_redirect.get_user_redirect',
+      callback: function(r){
+        var t = r && r.message && r.message.redirect;
+        if (!t || t === '/app') return;
+        if ((window.location.pathname || '') !== t) window.location.replace(t);
+      }
+    });
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', function(){ setTimeout(go, 300); });
+  else setTimeout(go, 300);
+})();
+JS
+cp -a "$PUBLIC_JS_DIR/desk_redirect.js" "$PUBLIC_JS_DIR/desk_redirect_final.js"
+chmod 644 "$PUBLIC_JS_DIR/desk_redirect.js" "$PUBLIC_JS_DIR/desk_redirect_final.js"
+
+say "3) Inject robust Desk buttons into quality-desk.html"
+python3 - <<'PY'
+from pathlib import Path
+import re
+p = Path('/opt/frappe_crm/apps/restaurant_ops/restaurant_ops/www/quality-desk.html')
+if not p.exists():
+    raise SystemExit('quality-desk.html not found')
+s = p.read_text(errors='ignore')
+# Remove previous copy if rerun.
+s = re.sub(r'<!-- ROSHDY_QUALITY_OPEN_DESK_BUTTON_START -->[\s\S]*?<!-- ROSHDY_QUALITY_OPEN_DESK_BUTTON_END -->', '', s, flags=re.I)
+block = r'''
+<!-- ROSHDY_QUALITY_OPEN_DESK_BUTTON_START -->
+<script id="quality-open-desk-button-js">
+(function(){
+  function method(parts){ return parts.join(''); }
+  function esc(x){ return String(x==null?'':x).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]}); }
+  function complaintNameFromText(t){
+    t = String(t || '');
+    var m = t.match(/COMP[-A-Za-z0-9_.]+/);
+    return m ? m[0] : '';
+  }
+  function currentComplaintName(){
+    if (window.quality_current_name) return window.quality_current_name;
+    var title = document.getElementById('m_title');
+    var n = complaintNameFromText(title ? title.textContent : '');
+    if (n) return n;
+    var modal = document.getElementById('modal');
+    n = complaintNameFromText(modal ? modal.textContent : '');
+    return n || '';
+  }
+  function openDeskList(){ window.open('/app/call-center-complaint', '_blank'); }
+  function openDeskComplaint(name){
+    name = name || currentComplaintName();
+    if (!name) { alert('اختار شكوى الأول'); return; }
+    window.open('/app/call-center-complaint/' + encodeURIComponent(name), '_blank');
+  }
+  function addTopButton(){
+    if (document.getElementById('qualityDeskListBtn')) return;
+    var top = document.querySelector('.top div') || document.querySelector('.top') || document.body;
+    var a = document.createElement('a');
+    a.id = 'qualityDeskListBtn';
+    a.href = '/app/call-center-complaint';
+    a.target = '_blank';
+    a.textContent = '📋 سجل الشكاوى في Desk';
+    a.style.cssText = 'color:#fff;text-decoration:none;border:1px solid #64748b;border-radius:10px;padding:8px 12px;margin:2px;background:#7c3aed;display:inline-block';
+    top.insertBefore(a, top.firstChild);
+  }
+  function addModalButton(){
+    if (document.getElementById('qualityOpenDeskComplaintBtn')) return;
+    var body = document.querySelector('.modalbody') || document.querySelector('.modalbox') || document.getElementById('modal');
+    if (!body) return;
+    var btn = document.createElement('button');
+    btn.id = 'qualityOpenDeskComplaintBtn';
+    btn.type = 'button';
+    btn.className = 'btn light';
+    btn.textContent = 'فتح الشكوى في Desk';
+    btn.style.margin = '3px';
+    btn.addEventListener('click', function(ev){ ev.preventDefault(); ev.stopPropagation(); openDeskComplaint(); });
+    var saveBtn = Array.prototype.slice.call(body.querySelectorAll('button')).find(function(b){return (b.textContent||'').indexOf('حفظ مراجعة الجودة') >= 0;});
+    if (saveBtn && saveBtn.parentNode) saveBtn.parentNode.insertBefore(btn, saveBtn.nextSibling);
+    else body.appendChild(btn);
+  }
+  function hookOpenComplaint(){
+    var old = window.openComplaint;
+    if (typeof old === 'function' && !old.__roshdy_hooked) {
+      var wrapped = async function(name){
+        window.quality_current_name = name;
+        var r = await old.apply(this, arguments);
+        setTimeout(function(){ window.quality_current_name = name || currentComplaintName(); addModalButton(); }, 150);
+        return r;
+      };
+      wrapped.__roshdy_hooked = true;
+      window.openComplaint = wrapped;
+    }
+  }
+  async function api(methodName,args){
+    args = args || {};
+    try{
+      var r = await fetch('/api/method/' + methodName, {method:'POST', credentials:'same-origin', headers:{'Content-Type':'application/json','Accept':'application/json','X-Frappe-CSRF-Token':(window.csrf_token||'')}, body:JSON.stringify(args)});
+      var j = await r.json();
+      if (j && j.message) return j.message;
+    }catch(e){}
+    var qs = new URLSearchParams(); Object.keys(args).forEach(function(k){ if(args[k]!==undefined&&args[k]!==null) qs.append(k,args[k]); });
+    var r2 = await fetch('/api/method/' + methodName + '?' + qs.toString(), {credentials:'same-origin', cache:'no-store'});
+    var j2 = await r2.json(); return j2.message;
+  }
+  function normStatus(s){
+    s = String(s||'').trim();
+    var m = {'مسودة':'Draft','Draft':'Draft','مفتوح':'Open','مفتوحة':'Open','Open':'Open','قيد المراجعة':'Under Review','قيد مراجعه':'Under Review','Under Review':'Under Review','تم الحل':'Resolved','محلولة':'Resolved','Resolved':'Resolved','مغلق':'Closed','مغلقة':'Closed','Closed':'Closed'};
+    return m[s] || s || 'Under Review';
+  }
+  window.saveComplaint = async function(){
+    var name = currentComplaintName();
+    if (!name) { alert('اختار شكوى الأول'); return; }
+    var btn = document.getElementById('qualitySaveBtn') || Array.prototype.slice.call(document.querySelectorAll('button')).find(function(b){return (b.textContent||'').indexOf('حفظ مراجعة الجودة')>=0});
+    var dbg = document.getElementById('m_debug');
+    if(btn){ btn.disabled = true; btn.textContent = 'جاري الحفظ...'; }
+    if(dbg) dbg.textContent = 'Saving ' + name + ' ...';
+    var args = {
+      name: name,
+      assigned_quality_inspector: (document.getElementById('m_assigned')||{}).value || '',
+      investigation_analysis: (document.getElementById('m_analysis')||{}).value || '',
+      corrective_action: (document.getElementById('m_action')||{}).value || '',
+      status: normStatus((document.getElementById('m_status')||{}).value || 'Under Review'),
+      closing_notes: (document.getElementById('m_closing')||{}).value || ''
+    };
+    try{
+      var d = await api(method(['restaurant','_ops.api.quality','_api.update_quality_review']), args);
+      if(dbg) dbg.textContent = JSON.stringify(d, null, 2);
+      if(d && d.success){
+        alert('تم حفظ مراجعة الجودة بنجاح');
+        if (typeof window.load === 'function') await window.load();
+      } else {
+        alert((d && d.message) || 'فشل حفظ مراجعة الجودة');
+      }
+    }catch(e){
+      if(dbg) dbg.textContent = String(e && (e.stack || e.message) || e);
+      alert('Error: ' + (e.message || e));
+    }finally{
+      if(btn){ btn.disabled = false; btn.textContent = 'حفظ مراجعة الجودة'; }
+    }
+  };
+  document.addEventListener('click', function(ev){
+    var b = ev.target && ev.target.closest ? ev.target.closest('button,a') : null;
+    if (!b) return;
+    var txt = (b.textContent || '').trim();
+    if (txt.indexOf('فتح صفحة كاملة') >= 0 || txt.indexOf('فتح في Desk') >= 0 || txt.indexOf('فتح الشكوى في Desk') >= 0) {
+      ev.preventDefault(); ev.stopPropagation(); openDeskComplaint(); return false;
+    }
+    if (txt.indexOf('حفظ مراجعة الجودة') >= 0) {
+      ev.preventDefault(); ev.stopPropagation(); window.saveComplaint(); return false;
+    }
+  }, true);
+  window.openDeskComplaint = openDeskComplaint;
+  window.openDeskList = openDeskList;
+  addTopButton();
+  hookOpenComplaint();
+  setInterval(function(){ addTopButton(); addModalButton(); hookOpenComplaint(); }, 1000);
+})();
+</script>
+<!-- ROSHDY_QUALITY_OPEN_DESK_BUTTON_END -->
+'''
+if '</body>' in s:
+    s = s.replace('</body>', block + '\n</body>', 1)
+else:
+    s += '\n' + block
+p.write_text(s)
+print('✅ quality-desk open desk button injected')
+PY
+
+say "4) Clear cache/restart"
+docker exec "$BACKEND" bench --site "$SITE" clear-cache || true
+docker exec "$BACKEND" bench --site "$SITE" clear-website-cache || true
+docker compose restart backend frontend
+sleep 8
+BACKEND="$(docker compose ps -q backend)"
+
+say "5) Validation"
+echo "--- Page HTTP status ---"
+for page in quality-desk app/call-center-complaint call-report admin-desk; do
+  code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$page" || true)"
+  echo "$page => $code"
+done
+
+echo "--- target_for_user quality remains /quality-desk ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.login_redirect.target_for_user --args '["quality.test@roshdy.com"]' || true
+
+say "6) Health Check مهم: Elastix/CDR/AMI + Queue + Call Report"
+echo "--- Asterisk/Elastix diagnostics ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics || true
+
+echo "--- Queue status ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.queue_api.get_queue_status || true
+
+echo "--- Calls report admin sample ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' || true
+
+say "✅ Quality Desk Desk-button fixed يا زعيم"
+echo "افتح /quality-desk واعمل Ctrl+F5."
+echo "هتلاقي زر فوق: سجل الشكاوى في Desk."
+echo "وجوه المودال زر: فتح الشكوى في Desk. هيفتح /app/call-center-complaint/COMP... مباشرة."
+echo "Backup: $BACKUP_DIR"

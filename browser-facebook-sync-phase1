@@ -1,0 +1,391 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# browser-facebook-sync-phase1
+# Phase 1 for unofficial Browser Connector:
+# - Adds active-chat snapshot endpoint to Browser Connector.
+# - Adds sync-active-to-ERP endpoint that stores the currently open Facebook/Instagram/TikTok chat into Social Inbox.
+# - Adds ERP ingest endpoint protected by a shared secret.
+# - Does NOT remove official Meta Graph API connector.
+# - Does NOT touch CDR/Elastix logic.
+
+ROOT="/opt/frappe_crm"
+SITE="crm.local"
+APP_HOST="$ROOT/apps/restaurant_ops"
+APP_DIR="$APP_HOST/restaurant_ops"
+BC_ROOT="/opt/roshdy_browser_connector"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/BROWSER_FACEBOOK_SYNC_PHASE1_BEFORE_$TS"
+API_PORT="33121"
+API_USER="roshdy_browser"
+API_PASS="RoshdyBrowser@123"
+
+say(){ echo -e "\n============================================================\n$1\n============================================================"; }
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo "❌ شغّل كـ root: sudo -i ثم ./browser-facebook-sync-phase1"
+  exit 1
+fi
+
+say "1) Backup قبل Phase 1 Browser Sync"
+cd "$ROOT"
+BACKEND="$(docker compose ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ لم أجد backend container. شغّل: cd /opt/frappe_crm && docker compose up -d"
+  exit 1
+fi
+if [[ ! -d "$BC_ROOT" ]]; then
+  echo "❌ لم أجد $BC_ROOT. شغّل Browser Connector PoC/Fix الأول."
+  exit 1
+fi
+mkdir -p "$BACKUP_DIR"
+cp -a "$BC_ROOT" "$BACKUP_DIR/roshdy_browser_connector"
+cp -a "$APP_HOST" "$BACKUP_DIR/restaurant_ops"
+echo "✅ Backup: $BACKUP_DIR"
+
+SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+[[ -z "$SERVER_IP" ]] && SERVER_IP="10.11.1.66"
+ERP_INGEST_URL="http://$SERVER_IP/api/method/restaurant_ops.api.social_inbox_api.browser_connector_ingest"
+
+say "2) Shared secret + env"
+cd "$BC_ROOT"
+if [[ -f .env ]] && grep -q '^BROWSER_CONNECTOR_SECRET=' .env; then
+  SHARED_SECRET="$(grep '^BROWSER_CONNECTOR_SECRET=' .env | tail -n1 | cut -d= -f2-)"
+else
+  SHARED_SECRET="$(openssl rand -hex 24 2>/dev/null || date +%s%N | sha256sum | cut -c1-48)"
+  echo "BROWSER_CONNECTOR_SECRET=$SHARED_SECRET" >> .env
+fi
+
+grep -q '^ERP_INGEST_URL=' .env && sed -i "s|^ERP_INGEST_URL=.*|ERP_INGEST_URL=$ERP_INGEST_URL|" .env || echo "ERP_INGEST_URL=$ERP_INGEST_URL" >> .env
+grep -q '^API_USER=' .env && sed -i "s/^API_USER=.*/API_USER=$API_USER/" .env || echo "API_USER=$API_USER" >> .env
+grep -q '^API_PASS=' .env && sed -i "s/^API_PASS=.*/API_PASS=$API_PASS/" .env || echo "API_PASS=$API_PASS" >> .env
+chmod 600 .env
+
+echo "ERP_INGEST_URL=$ERP_INGEST_URL"
+echo "BROWSER_CONNECTOR_SECRET length=${#SHARED_SECRET}"
+
+say "3) Patch ERP Social Inbox API: browser_connector_ingest"
+cat >> "$APP_DIR/api/social_inbox_api.py" <<'PY'
+
+# ===== ROSHDY BROWSER CONNECTOR INGEST START =====
+def _browser_secret():
+    try:
+        return frappe.conf.get("browser_connector_secret") or ""
+    except Exception:
+        return ""
+
+
+def _browser_account(channel_type):
+    channel_type = channel_type if channel_type in ("Facebook", "Instagram", "TikTok") else "Facebook"
+    name = frappe.db.get_value("Social Channel Account", {"channel_type": channel_type, "provider": "Browser Connector"}, "name")
+    if name:
+        doc = frappe.get_doc("Social Channel Account", name)
+    else:
+        doc = frappe.get_doc({
+            "doctype": "Social Channel Account",
+            "account_label": channel_type + " Browser Connector",
+            "channel_type": channel_type,
+            "provider": "Browser Connector",
+            "device_id": "browser-" + channel_type.lower(),
+            "phone_label": channel_type,
+            "status": "Connected via Browser Connector",
+            "active": 1,
+            "admin_only_start_chat": 1,
+            "allowed_roles": "Social Inbox Admin\nSocial Inbox Supervisor\nSocial Inbox Agent\nCall Center Admin",
+        }).insert(ignore_permissions=True)
+        frappe.db.commit()
+    return doc
+
+
+def _browser_hash(*parts):
+    import hashlib
+    raw = "|".join([str(p or "") for p in parts])
+    return hashlib.sha256(raw.encode("utf-8", "ignore")).hexdigest()
+
+
+@frappe.whitelist(allow_guest=True, methods=["POST"])
+def browser_connector_ingest():
+    """Receive scraped active chat snapshot from the isolated Browser Connector."""
+    secret = frappe.get_request_header("X-Roshdy-Connector-Secret") or ""
+    expected = _browser_secret()
+    if not expected or secret != expected:
+        return {"success": False, "message": "Invalid connector secret"}
+    import json
+    try:
+        data = json.loads((frappe.request.get_data() or b"{}").decode("utf-8", "replace"))
+    except Exception as e:
+        return {"success": False, "message": "Invalid JSON", "error": str(e)}
+
+    channel = data.get("channel_type") or data.get("platform") or "Facebook"
+    if str(channel).lower().startswith("insta"):
+        channel = "Instagram"
+    elif str(channel).lower().startswith("tiktok"):
+        channel = "TikTok"
+    else:
+        channel = "Facebook"
+
+    account = _browser_account(channel)
+    customer_name = data.get("customer_name") or "Unknown"
+    external_chat_id = data.get("external_chat_id") or data.get("profile_url") or _browser_hash(channel, customer_name)[:18]
+    profile_url = data.get("profile_url") or ""
+
+    conv_name = frappe.db.get_value("Social Conversation", {"channel_account": account.name, "external_chat_id": external_chat_id}, "name")
+    if conv_name:
+        conv = frappe.get_doc("Social Conversation", conv_name)
+    else:
+        conv = frappe.get_doc({
+            "doctype": "Social Conversation",
+            "channel_account": account.name,
+            "channel_type": channel,
+            "external_chat_id": external_chat_id,
+            "customer_name": customer_name,
+            "customer_phone": "",
+            "normalized_phone": "",
+            "status": "Open",
+            "unread_count": 0,
+            "tags": "browser_connector" + ("\nprofile_url=" + profile_url if profile_url else ""),
+        }).insert(ignore_permissions=True)
+
+    stored = 0
+    messages = data.get("messages") or []
+    for m in messages:
+        body = (m.get("body") or "").strip()
+        if not body:
+            continue
+        direction = m.get("direction") or "inbound"
+        msg_id = m.get("id") or _browser_hash(channel, external_chat_id, direction, body, m.get("created_time") or "")
+        if frappe.db.exists("Social Message", {"channel_account": account.name, "external_message_id": msg_id}):
+            continue
+        msg = frappe.get_doc({
+            "doctype": "Social Message",
+            "conversation": conv.name,
+            "channel_account": account.name,
+            "external_message_id": msg_id,
+            "event_type": "browser.scrape",
+            "direction": direction,
+            "sender_id": m.get("sender_id") or external_chat_id,
+            "sender_name": m.get("sender_name") or (customer_name if direction == "inbound" else "Page/Admin"),
+            "message_type": m.get("message_type") or "text",
+            "body": body,
+            "message_time": m.get("created_time") or now_datetime(),
+            "raw_payload": json.dumps(m, ensure_ascii=False)[:50000],
+        }).insert(ignore_permissions=True)
+        stored += 1
+        conv.last_message = body[:500]
+        conv.last_message_at = msg.message_time
+        if direction == "inbound":
+            conv.unread_count = int(conv.unread_count or 0) + 1
+
+    if customer_name and conv.customer_name != customer_name:
+        conv.customer_name = customer_name
+    conv.status = "Open"
+    conv.save(ignore_permissions=True)
+    account.status = "Synced via Browser Connector"
+    account.save(ignore_permissions=True)
+    frappe.db.commit()
+    return {"success": True, "account": account.name, "conversation": conv.name, "stored_messages": stored, "customer_name": customer_name, "external_chat_id": external_chat_id}
+# ===== ROSHDY BROWSER CONNECTOR INGEST END =====
+PY
+chmod 644 "$APP_DIR/api/social_inbox_api.py"
+
+say "4) Set connector secret in Frappe site_config"
+cd "$ROOT"
+docker exec "$BACKEND" bench --site "$SITE" set-config browser_connector_secret "$SHARED_SECRET"
+
+say "5) Patch Browser Connector app endpoints"
+cd "$BC_ROOT"
+python3 - <<'PY'
+from pathlib import Path
+import re
+p = Path('app/app.py')
+s = p.read_text()
+s = re.sub(r'\n# ===== ROSHDY FB ACTIVE SYNC START =====[\s\S]*?# ===== ROSHDY FB ACTIVE SYNC END =====\n?', '\n', s)
+block = r'''
+# ===== ROSHDY FB ACTIVE SYNC START =====
+import hashlib
+from datetime import datetime
+
+
+def _line_filter(lines):
+    ignore_contains = [
+        'Inbox', 'Respond to messages', 'All messages', 'Messenger', 'Instagram', 'WhatsApp', 'Facebook comments',
+        'Search', 'Unread', 'Priority', 'Ad replies', 'Follow up', 'Connect to Instagram', 'Not now', 'Connect',
+        'View profile', 'Contact details', 'Add details', 'Facebook profile', 'Activity', 'Create order',
+        'Reply in Messenger', 'Automations', 'Available', 'Manage', 'Assign this conversation', 'Learn more',
+        'Public info', 'Local time', 'Works at', 'Studied at', 'Lives in', 'From ', 'Recommended',
+        'Add a personalized message', 'Try it', 'Order status'
+    ]
+    out=[]
+    for x in lines:
+        t=' '.join(str(x or '').split()).strip()
+        if not t or len(t) < 2 or len(t) > 600:
+            continue
+        if any(bad.lower() in t.lower() for bad in ignore_contains):
+            continue
+        # Keep Arabic lines, or relatively message-like text.
+        has_ar = any('\u0600' <= ch <= '\u06ff' for ch in t)
+        if has_ar or len(t) >= 12:
+            out.append(t)
+    # Deduplicate preserving order
+    seen=set(); ded=[]
+    for t in out:
+        if t not in seen:
+            seen.add(t); ded.append(t)
+    return ded[:30]
+
+
+async def _active_snapshot(channel='Facebook'):
+    ctx = await ensure_browser()
+    page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+    title = await page.title()
+    url = page.url
+    lines = []
+    profile_url = ''
+    try:
+        data = await page.evaluate('''() => {
+            const lines = (document.body.innerText || '').split('\n').map(x => x.trim()).filter(Boolean);
+            let profile = '';
+            for (const a of Array.from(document.querySelectorAll('a'))) {
+                const tx = (a.innerText || '').trim();
+                const href = a.href || '';
+                if ((tx.toLowerCase().includes('view profile') || href.includes('facebook.com') || href.includes('instagram.com')) && href && !profile) profile = href;
+            }
+            return {lines, profile};
+        }''')
+        lines = data.get('lines') or []
+        profile_url = data.get('profile') or ''
+    except Exception:
+        try:
+            txt = await page.locator('body').inner_text(timeout=5000)
+            lines = [x.strip() for x in txt.split('\n') if x.strip()]
+        except Exception:
+            lines = []
+
+    customer_name = ''
+    for i, l in enumerate(lines):
+        if l.strip().lower() == 'view profile' and i > 0:
+            customer_name = lines[i-1].strip(); break
+    if not customer_name:
+        for i, l in enumerate(lines):
+            if 'Assign this conversation' in l and i > 0:
+                customer_name = lines[i-1].strip(); break
+    if not customer_name:
+        # pick first plausible name around active inbox: two words, not generic UI
+        for l in lines:
+            if 2 <= len(l.split()) <= 4 and len(l) <= 80 and not any(x in l for x in ['Inbox','Messenger','Instagram','WhatsApp','Search','Manage']):
+                customer_name = l; break
+    if not customer_name:
+        customer_name = 'Unknown Browser Contact'
+
+    filtered = _line_filter(lines)
+    # Remove customer name duplicates from messages
+    bodies = [x for x in filtered if x != customer_name]
+    # If too many UI candidates, prefer Arabic lines.
+    arabic = [x for x in bodies if any('\u0600' <= ch <= '\u06ff' for ch in x)]
+    if arabic:
+        bodies = arabic
+    messages=[]
+    now = datetime.utcnow().isoformat()
+    for b in bodies[:20]:
+        mid = hashlib.sha256((channel+'|'+customer_name+'|'+b).encode('utf-8','ignore')).hexdigest()
+        messages.append({'id': mid, 'direction': 'inbound', 'sender_name': customer_name, 'body': b, 'created_time': now, 'message_type': 'text'})
+    external_chat_id = profile_url or hashlib.sha256((channel+'|'+customer_name).encode()).hexdigest()[:18]
+    return {'success': True, 'channel_type': channel, 'url': url, 'title': title, 'customer_name': customer_name, 'profile_url': profile_url, 'external_chat_id': external_chat_id, 'messages': messages, 'raw_lines_sample': lines[:120]}
+
+
+@app.get('/api/fb/active-snapshot')
+async def fb_active_snapshot(channel: str = 'Facebook'):
+    return await _active_snapshot(channel)
+
+
+@app.get('/api/fb/sync-active-to-erp')
+async def fb_sync_active_to_erp(channel: str = 'Facebook'):
+    import urllib.request, urllib.error
+    snap = await _active_snapshot(channel)
+    secret = os.environ.get('BROWSER_CONNECTOR_SECRET', '')
+    ingest = os.environ.get('ERP_INGEST_URL', '')
+    if not ingest:
+        return {'success': False, 'message': 'ERP_INGEST_URL missing', 'snapshot': snap}
+    body = json.dumps(snap, ensure_ascii=False).encode('utf-8')
+    req = urllib.request.Request(ingest, data=body, method='POST', headers={'Content-Type':'application/json', 'X-Roshdy-Connector-Secret': secret})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            txt = resp.read().decode('utf-8','replace')
+            try:
+                data = json.loads(txt)
+            except Exception:
+                data = {'raw': txt}
+            return {'success': True, 'snapshot': snap, 'erp_response': data}
+    except urllib.error.HTTPError as e:
+        txt = e.read().decode('utf-8','replace')
+        return {'success': False, 'http_status': e.code, 'error': txt, 'snapshot': snap}
+    except Exception as e:
+        return {'success': False, 'message': str(e), 'snapshot': snap}
+# ===== ROSHDY FB ACTIVE SYNC END =====
+'''
+p.write_text(s.rstrip() + '\n\n' + block + '\n')
+print('✅ browser connector active sync endpoints appended')
+
+# Add links to portal HTML by simple replace inside index if possible.
+s = p.read_text()
+s = s.replace("<a href=\"/api/status\" target=\"_blank\">Status JSON</a><a href=\"/api/screenshot\" target=\"_blank\">Screenshot</a><a href=\"/api/dom-hint\" target=\"_blank\">DOM Hint</a>",
+              "<a href=\"/api/status\" target=\"_blank\">Status JSON</a><a href=\"/api/screenshot\" target=\"_blank\">Screenshot</a><a href=\"/api/dom-hint\" target=\"_blank\">DOM Hint</a><a href=\"/api/fb/active-snapshot\" target=\"_blank\">Active Chat Snapshot</a><a href=\"/api/fb/sync-active-to-erp\" target=\"_blank\">Sync Active Chat to ERP</a>")
+p.write_text(s)
+PY
+
+say "6) Rebuild/restart Browser Connector + ERP"
+# Ensure Dockerfile installs playwright + requests not needed (stdlib urllib used), but playwright must exist.
+if ! grep -q 'playwright==1.48.0' Dockerfile; then
+  sed -i 's/pip install --no-cache-dir fastapi "uvicorn\[standard\]"/pip install --no-cache-dir fastapi "uvicorn[standard]" playwright==1.48.0/' Dockerfile || true
+fi
+
+docker compose up -d --build
+sleep 10
+
+echo "--- connector health ---"
+curl -fsS "http://127.0.0.1:33121/health" || true
+echo
+
+cd "$ROOT"
+docker exec "$BACKEND" bash -lc "find /home/frappe/frappe-bench/apps/restaurant_ops -name '*.pyc' -delete; find /home/frappe/frappe-bench/apps/restaurant_ops -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true"
+docker exec "$BACKEND" bench --site "$SITE" clear-cache || true
+docker exec "$BACKEND" bench --site "$SITE" clear-website-cache || true
+docker compose restart backend frontend
+sleep 8
+BACKEND="$(docker compose ps -q backend)"
+
+say "7) Validation"
+echo "--- ERP ingest method import smoke ---"
+docker exec "$BACKEND" bench --site "$SITE" execute frappe.get_attr --args '["restaurant_ops.api.social_inbox_api.browser_connector_ingest"]' >/dev/null && echo "browser_connector_ingest OK" || true
+
+echo "--- Browser connector API statuses ---"
+curl -s -o /dev/null -w "portal => %{http_code}\n" -u "$API_USER:$API_PASS" "http://127.0.0.1:33121/" || true
+curl -s -o /dev/null -w "snapshot => %{http_code}\n" -u "$API_USER:$API_PASS" "http://127.0.0.1:33121/api/fb/active-snapshot" || true
+curl -s -o /dev/null -w "sync => %{http_code}\n" -u "$API_USER:$API_PASS" "http://127.0.0.1:33121/api/fb/sync-active-to-erp" || true
+
+echo "--- Page HTTP status ---"
+for page in browser-connectors social-inbox social-settings admin-desk; do
+  code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$page" || true)"
+  echo "$page => $code"
+done
+
+say "8) Health Check مهم: Elastix/CDR/AMI + Queue + Call Report"
+echo "--- Asterisk/Elastix diagnostics ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics || true
+
+echo "--- Queue status ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.queue_api.get_queue_status || true
+
+echo "--- Calls report admin sample ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' || true
+
+say "✅ Browser Facebook Sync Phase1 installed يا زعيم"
+echo "الخطوات العملية:"
+echo "1) افتح noVNC: http://$SERVER_IP:33120/vnc.html?autoconnect=true&resize=scale"
+echo "2) افتح Facebook Business Inbox وسجل دخول/اختار محادثة."
+echo "3) من المتصفح العادي افتح: http://$SERVER_IP:33121/api/fb/active-snapshot"
+echo "4) لو Snapshot لقط الاسم والرسالة، افتح: http://$SERVER_IP:33121/api/fb/sync-active-to-erp"
+echo "5) افتح /social-inbox واختار حساب Facebook Browser Connector."
+echo "API username: $API_USER"
+echo "API password: $API_PASS"
+echo "Backup: $BACKUP_DIR"

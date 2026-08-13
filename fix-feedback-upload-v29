@@ -1,0 +1,340 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Roshdy V29: Fix Feedback Excel upload
+# --------------------------------------
+# Fixes:
+# - Upload from /feedback-admin not working reliably.
+# - Adds CSRF token to upload request.
+# - Accepts xlsx content even if file extension is .pdf.
+# - Parses headers: name / customer / اسم and phone / mobile / رقم.
+# - Normalizes Egyptian phone numbers when Excel drops leading zero.
+# - Adds clear validation/debug endpoint.
+# Safety:
+# - Backup first.
+# - Does NOT touch report_api.py / Elastix / CDR / AMI.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "❌ docker compose/docker-compose مش موجود"
+  exit 1
+fi
+
+APP_DIR="$ROOT/apps/$APP"
+PKG_DIR="$APP_DIR/$APP"
+API_DIR="$PKG_DIR/api"
+WWW_DIR="$PKG_DIR/www"
+FEEDBACK_API="$API_DIR/feedback_api.py"
+FEEDBACK_ADMIN_HTML="$WWW_DIR/feedback-admin.html"
+FEEDBACK_ADMIN_PY="$WWW_DIR/feedback-admin.py"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/FIX_FEEDBACK_UPLOAD_V29_BEFORE_$TS"
+mkdir -p "$BACKUP_DIR"
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend container مش شغال أو مش لاقيه"
+  exit 1
+fi
+
+bench_exec() {
+  "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"
+}
+
+echo "============================================================"
+echo "🔧 Roshdy V29: Fix Feedback upload"
+echo "📦 Backup: $BACKUP_DIR"
+echo "============================================================"
+
+if [[ ! -f "$FEEDBACK_API" ]]; then
+  echo "❌ feedback_api.py مش موجود. لازم نكمل تركيب موديول الفيدباك الأول."
+  exit 1
+fi
+
+echo "🧯 Step 1: Backup files + bench backup"
+for f in "$FEEDBACK_API" "$FEEDBACK_ADMIN_HTML" "$FEEDBACK_ADMIN_PY"; do
+  [[ -f "$f" ]] && cp -a "$f" "$BACKUP_DIR/$(basename "$f").before" || true
+done
+bench_exec backup --with-files | tee "$BACKUP_DIR/bench_backup_output.txt"
+
+echo "🧩 Step 2: Patch feedback_api upload parser"
+cat >> "$FEEDBACK_API" <<'PYAPI'
+
+# BEGIN ROSHDY FEEDBACK UPLOAD FIX V29
+try:
+    import base64 as _fb29_base64
+    import csv as _fb29_csv
+    import io as _fb29_io
+    import json as _fb29_json
+    import re as _fb29_re
+    import frappe as _fb29_frappe
+    from frappe.utils import today as _fb29_today, now_datetime as _fb29_now_datetime, cstr as _fb29_cstr
+except Exception:
+    pass
+
+
+def _norm_phone(phone):
+    """Normalize phone numbers imported from Excel.
+
+    Excel often drops leading zero from Egyptian mobile numbers.
+    Examples:
+      1014434368  -> 01014434368
+      1159174136  -> 01159174136
+      1558539525  -> 01558539525
+      502548189   -> 0502548189  (landline-like; best effort)
+    """
+    s = _fb29_cstr(phone or "").strip().replace("\xa0", "")
+    # Convert floats like 1014434368.0
+    if _fb29_re.match(r"^\d+\.0$", s):
+        s = s[:-2]
+    # Arabic/Persian digits are rare but support them.
+    trans = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
+    s = s.translate(trans)
+    # Keep plus if at beginning; remove spaces/dashes/brackets.
+    plus = s.startswith("+")
+    digits = _fb29_re.sub(r"\D+", "", s)
+    if not digits:
+        return ""
+    if plus:
+        return "+" + digits
+    # Egypt mobile without leading zero after Excel numeric conversion.
+    if len(digits) == 10 and digits[:2] in ("10", "11", "12", "15"):
+        return "0" + digits
+    # Egypt landline/area number without leading zero, best effort.
+    if len(digits) == 9 and digits[:2] in ("2", "3", "40", "45", "46", "47", "48", "50", "55", "57", "62", "64", "65", "66", "68", "69", "82", "84", "86", "88", "92", "93", "95", "96", "97"):
+        return "0" + digits
+    return digits
+
+
+def _looks_phone(s):
+    digits = _fb29_re.sub(r"\D+", "", _fb29_cstr(s or ""))
+    return len(digits) >= 7
+
+
+def _fb29_cell_text(v):
+    if v is None:
+        return ""
+    # Numeric Excel phone cells should not become scientific/float strings.
+    try:
+        if isinstance(v, float) and v.is_integer():
+            return str(int(v))
+    except Exception:
+        pass
+    return _fb29_cstr(v).strip()
+
+
+def _find_header_map(headers):
+    hmap = {}
+    for i, h in enumerate(headers or []):
+        key = _fb29_cell_text(h).lower().strip()
+        if not key:
+            continue
+        if any(x in key for x in ("phone", "mobile", "tel", "number", "رقم", "موبايل", "تليفون", "هاتف", "تليفون العميل", "رقم العميل")):
+            hmap.setdefault("phone", i)
+        elif any(x in key for x in ("name", "customer", "client", "اسم", "عميل", "اسم العميل", "customer name")):
+            hmap.setdefault("name", i)
+    return hmap
+
+
+def _parse_excel_bytes(content):
+    """Parse xlsx/csv bytes. The extension does not matter."""
+    rows = []
+    # Try xlsx by content first.
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(filename=_fb29_io.BytesIO(content), read_only=True, data_only=True)
+        ws = wb.active
+        iterator = ws.iter_rows(values_only=True)
+        try:
+            first = next(iterator)
+        except StopIteration:
+            return []
+        headers = list(first or [])
+        hmap = _find_header_map(headers)
+        data_iter = iterator if hmap.get("phone") is not None else iter([first] + list(iterator))
+        for row in data_iter:
+            vals = list(row or [])
+            if hmap.get("phone") is not None:
+                phone = vals[hmap["phone"]] if hmap["phone"] < len(vals) else ""
+                name = vals[hmap.get("name")] if hmap.get("name") is not None and hmap.get("name") < len(vals) else ""
+            else:
+                phone = ""; name = ""
+                for v in vals:
+                    txt = _fb29_cell_text(v)
+                    if _looks_phone(txt) and not phone:
+                        phone = txt
+                    elif txt and not name:
+                        name = txt
+            phone = _norm_phone(phone)
+            name = _fb29_cell_text(name)
+            if phone:
+                rows.append({"customer_name": name, "customer_phone": phone})
+        return rows
+    except Exception:
+        pass
+
+    # CSV fallback.
+    try:
+        text = content.decode("utf-8-sig", errors="ignore")
+        reader = _fb29_csv.reader(_fb29_io.StringIO(text))
+        all_rows = list(reader)
+        if not all_rows:
+            return []
+        hmap = _find_header_map(all_rows[0])
+        data_rows = all_rows[1:] if hmap.get("phone") is not None else all_rows
+        for row in data_rows:
+            if hmap.get("phone") is not None:
+                phone = row[hmap["phone"]] if hmap["phone"] < len(row) else ""
+                name = row[hmap.get("name")] if hmap.get("name") is not None and hmap.get("name") < len(row) else ""
+            else:
+                phone = ""; name = ""
+                for v in row:
+                    if _looks_phone(v) and not phone:
+                        phone = v
+                    elif _fb29_cstr(v).strip() and not name:
+                        name = v
+            phone = _norm_phone(phone)
+            if phone:
+                rows.append({"customer_name": _fb29_cstr(name).strip(), "customer_phone": phone})
+    except Exception:
+        pass
+    return rows
+
+
+@_fb29_frappe.whitelist()
+def upload_feedback_excel(feedback_date=None, shift_number=None, filedata=None, filename=None):
+    """Upload Excel/CSV feedback list.
+
+    Supports multipart file upload and base64 filedata fallback.
+    """
+    ensure_feedback_doctype()
+    if not _is_admin():
+        _fb29_frappe.throw("غير مسموح")
+    feedback_date = _fb29_cstr(feedback_date or _fb29_frappe.form_dict.get("feedback_date") or _fb29_today())[:10]
+    shift_number = _fb29_cstr(shift_number or _fb29_frappe.form_dict.get("shift_number") or "").strip()
+    if not shift_number:
+        _fb29_frappe.throw("رقم الوردية مطلوب قبل رفع الملف")
+
+    content = None
+    uploaded_name = filename or ""
+    try:
+        if _fb29_frappe.request and _fb29_frappe.request.files:
+            f = _fb29_frappe.request.files.get("file") or next(iter(_fb29_frappe.request.files.values()))
+            uploaded_name = getattr(f, "filename", "") or uploaded_name
+            content = f.read()
+    except Exception:
+        content = None
+
+    if content is None and filedata:
+        raw = _fb29_cstr(filedata)
+        if "," in raw and raw.split(",", 1)[0].startswith("data:"):
+            raw = raw.split(",", 1)[1]
+        content = _fb29_base64.b64decode(raw)
+
+    if not content:
+        _fb29_frappe.throw("ملف Excel/CSV مطلوب")
+
+    rows = _parse_excel_bytes(content)
+    if not rows:
+        return {"success": False, "message": "لم يتم العثور على أرقام صالحة داخل الملف", "filename": uploaded_name, "parsed": 0}
+
+    batch = "EXCEL-" + _fb29_now_datetime().strftime("%Y%m%d%H%M%S")
+    created = skipped = 0
+    errors = []
+    samples = []
+    for r in rows:
+        try:
+            res = _insert_item(r.get("customer_name"), r.get("customer_phone"), feedback_date, shift_number, source="excel", import_batch=batch, raw_payload=_fb29_json.dumps(r, ensure_ascii=False))
+            if res.get("skipped_duplicate"):
+                skipped += 1
+            else:
+                created += 1
+            if len(samples) < 5:
+                samples.append(r)
+        except Exception as e:
+            errors.append(_fb29_cstr(e))
+    _fb29_frappe.db.commit()
+    return {"success": True, "message": "تم رفع ملف الفيدباك", "filename": uploaded_name, "batch": batch, "parsed": len(rows), "created": created, "skipped_duplicates": skipped, "errors": errors[:20], "sample": samples}
+
+
+@_fb29_frappe.whitelist()
+def debug_feedback_upload_parser_sample():
+    """Parser self-test using the same structure as user's Book1: headers name/phone."""
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["name", "phone"])
+    ws.append(["ا/ قمر محمود", 1014434368])
+    ws.append(["ا/نورين احمد", 1026608655])
+    ws.append(["ا/ امينه مصطفي", 502548189])
+    bio = _fb29_io.BytesIO()
+    wb.save(bio)
+    rows = _parse_excel_bytes(bio.getvalue())
+    return {"success": True, "parsed": len(rows), "rows": rows}
+# END ROSHDY FEEDBACK UPLOAD FIX V29
+PYAPI
+
+# Rewrite feedback-admin page with robust CSRF upload.
+echo "🧩 Step 3: Rewrite feedback-admin page upload JS"
+cat > "$FEEDBACK_ADMIN_HTML" <<'HTML'
+<!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>متابعة الفيدباك</title><style>*{box-sizing:border-box;font-family:Tahoma,Arial}body{margin:0;background:#eef2f7;direction:rtl;color:#111827}.top{background:#20262d;color:white;padding:14px 22px;border-bottom:4px solid #1F4E79;display:flex;justify-content:space-between;align-items:center}.top a{color:#fff;text-decoration:none;border:1px solid #64748b;border-radius:10px;padding:8px 12px}.wrap{padding:22px;max-width:1600px;margin:auto}.panel{background:#fff;border:1px solid #d8dee9;border-radius:16px;box-shadow:0 10px 28px #0001;margin-bottom:16px;overflow:hidden}.head{padding:14px 16px;border-bottom:1px solid #e5e7eb;display:flex;justify-content:space-between;gap:10px;align-items:center}.body{padding:16px}.grid{display:grid;grid-template-columns:repeat(6,1fr);gap:10px}label{font-weight:800;color:#475569;font-size:12px}input,select,textarea{width:100%;border:1px solid #d1d5db;border-radius:10px;padding:9px}.btn{border:0;border-radius:10px;padding:10px 13px;background:#1F4E79;color:#fff;font-weight:800;cursor:pointer;margin:3px}.green{background:#16a34a}.orange{background:#f97316}.red{background:#dc2626}.gray{background:#e5e7eb;color:#111827}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}.card{background:#fff;border:1px solid #ddd;border-right:5px solid #1F4E79;border-radius:12px;padding:12px}.num{font-size:28px;color:#1F4E79;font-weight:bold}.table{width:100%;border-collapse:collapse;min-width:1200px}.table th{background:#111827;color:#fff;padding:9px}.table td{border:1px solid #e5e7eb;padding:8px}.scroll{overflow:auto}.muted{color:#64748b;font-size:13px}.note{background:#fffbeb;border:1px solid #fde68a;border-radius:12px;padding:10px;color:#92400e}.toast{position:fixed;right:18px;bottom:18px;background:#111827;color:#fff;padding:12px 14px;border-radius:12px;display:none;z-index:99;max-width:420px}@media(max-width:900px){.grid{grid-template-columns:1fr 1fr}.wrap{padding:12px}.table{min-width:900px}}</style></head><body><div class="top"><b>📣 متابعة الفيدباك</b><div><a href="/admin-desk">Admin Desk</a> <a href="/feedback">عمل فيدباك</a></div></div><div class="wrap"><div class="panel"><div class="head"><b>إضافة أرقام الفيدباك</b></div><div class="body"><div class="note">ملف Excel يقبل أعمدة <b>name</b> و <b>phone</b> أو بالعربي اسم/رقم. لو Excel شال صفر بداية الرقم، النظام هيحاول يرجعه تلقائيًا.</div><br><div class="grid"><div><label>التاريخ</label><input type="date" id="add_date"></div><div><label>رقم الوردية *</label><input id="add_shift" placeholder="مثال: 1"></div><div><label>اسم العميل</label><input id="m_name"></div><div><label>رقم العميل</label><input id="m_phone"></div><div style="align-self:end"><button class="btn green" onclick="manualAdd()">إضافة يدوي</button></div></div><br><label>إضافة Bulk</label><textarea id="bulk" rows="4" placeholder="مثال: محمد,01000000000&#10;أحمد:0101,0102&#10;0103,0104"></textarea><button class="btn green" onclick="bulkAdd()">إضافة المجموعة</button><hr style="margin:15px 0"><div class="grid"><div><label>رفع Excel/CSV</label><input type="file" id="file"></div><div style="align-self:end"><button class="btn" id="uploadBtn" onclick="uploadExcel()">رفع الملف</button></div><div class="muted" style="grid-column:span 4;align-self:end" id="uploadResult">ارفع ملف xlsx/csv، وحتى لو امتداده pdf لكن محتواه Excel هيتم قراءته.</div></div></div></div><div class="panel"><div class="head"><b>الفلاتر</b><div><button class="btn red" onclick="closeShift()">إغلاق الوردية وإخفاؤها من الموظفين</button><button class="btn gray" onclick="reopenShift()">إعادة إتاحة الوردية</button></div></div><div class="body"><div class="grid"><div><label>من تاريخ</label><input type="date" id="df"></div><div><label>إلى تاريخ</label><input type="date" id="dt"></div><div><label>رقم الوردية</label><input id="shift"></div><div><label>الحالة</label><select id="status"><option>All</option><option>Pending</option><option>Completed</option><option>Closed</option></select></div><div style="align-self:end"><button class="btn green" onclick="load()">تحديث</button><button class="btn orange" onclick="window.print()">PDF/طباعة</button><button class="btn" onclick="csvExport()">CSV</button></div></div></div></div><div class="cards"><div class="card">الإجمالي<div class="num" id="total">0</div></div><div class="card">تم الفيدباك<div class="num" id="completed">0</div></div><div class="card">متبقي<div class="num" id="pending">0</div></div><div class="card">متوسط التقييم<div class="num" id="avg">0</div></div></div><br><div class="panel"><div class="head"><b>حسب الموظف</b></div><div class="body scroll"><table class="table"><thead><tr><th>الموظف</th><th>عدد الفيدباك</th><th>متوسط التقييم</th></tr></thead><tbody id="byagent"></tbody></table></div></div><div class="panel"><div class="head"><b>التفاصيل</b></div><div class="body scroll"><table class="table"><thead><tr><th>التاريخ</th><th>رقم الوردية</th><th>العميل</th><th>الرقم</th><th>الحالة</th><th>متاح</th><th>التقييم</th><th>الرضاء</th><th>الموظف</th><th>التفاصيل</th><th>ملاحظات</th></tr></thead><tbody id="rows"></tbody></table></div></div></div><div class="toast" id="toast"></div><script>const CSRF_TOKEN = '{{ csrf_token }}';function today(){return new Date().toISOString().slice(0,10)}function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function qs(o){let p=new URLSearchParams();Object.keys(o||{}).forEach(k=>{let v=o[k];if(v!==undefined&&v!==null&&v!==''&&v!=='All')p.append(k,v)});return p.toString()}async function api(m,args){let q=qs(args||{});let r=await fetch('/api/method/'+m+(q?'?'+q:''),{method:'GET',credentials:'same-origin',cache:'no-store'});let j=await r.json();if(j.exc)throw j;return j.message||j}function toast(x){let t=document.getElementById('toast');t.textContent=x;t.style.display='block';setTimeout(()=>t.style.display='none',4500)}function requireShift(){if(!add_shift.value.trim()){toast('رقم الوردية مطلوب');add_shift.focus();return false}return true}async function manualAdd(){if(!requireShift())return;let r=await api('restaurant_ops.api.feedback_api.add_feedback_manual',{feedback_date:add_date.value,shift_number:add_shift.value,customer_name:m_name.value,customer_phone:m_phone.value});toast((r&&r.message)||'تم');load()}async function bulkAdd(){if(!requireShift())return;let r=await api('restaurant_ops.api.feedback_api.add_feedback_bulk',{feedback_date:add_date.value,shift_number:add_shift.value,text:bulk.value});toast('تم إضافة '+(r.created||0)+' وتجاهل مكرر '+(r.skipped_duplicates||0));load()}async function uploadExcel(){if(!requireShift())return;let f=document.getElementById('file').files[0];if(!f){toast('اختار ملف');return}let btn=document.getElementById('uploadBtn');btn.disabled=true;btn.textContent='جاري الرفع...';uploadResult.textContent='جاري قراءة الملف ورفعه...';try{let fd=new FormData();fd.append('file',f,f.name);fd.append('feedback_date',add_date.value);fd.append('shift_number',add_shift.value);let r=await fetch('/api/method/restaurant_ops.api.feedback_api.upload_feedback_excel',{method:'POST',body:fd,credentials:'same-origin',headers:{'X-Frappe-CSRF-Token':CSRF_TOKEN||''}});let j=await r.json();if(j.exc)throw j;let m=j.message||{};if(!m.success){toast(m.message||'فشل رفع الملف');uploadResult.textContent=m.message||'فشل رفع الملف';return}let msg='تم قراءة '+(m.parsed||0)+' صف — تم إضافة '+(m.created||0)+' — مكرر '+(m.skipped_duplicates||0);toast(msg);uploadResult.textContent=msg+(m.sample?' | عينة: '+JSON.stringify(m.sample):'');load()}catch(e){console.error(e);toast('فشل رفع الملف. راجع الكونسول أو الصلاحيات.');uploadResult.textContent='فشل رفع الملف: '+(e.message||'Error')}finally{btn.disabled=false;btn.textContent='رفع الملف'}}async function closeShift(){if(!shift.value){toast('اكتب رقم الوردية في الفلتر');return}let r=await api('restaurant_ops.api.feedback_api.close_feedback_shift',{feedback_date:df.value,shift_number:shift.value});toast((r&&r.message)||'تم');load()}async function reopenShift(){if(!shift.value){toast('اكتب رقم الوردية في الفلتر');return}let r=await api('restaurant_ops.api.feedback_api.reopen_feedback_shift',{feedback_date:df.value,shift_number:shift.value});toast((r&&r.message)||'تم');load()}async function load(){last=await api('restaurant_ops.api.feedback_api.get_feedback_admin_report',{date_from:df.value,date_to:dt.value,shift_number:shift.value,status:status.value});let s=last.summary||{};total.textContent=s.total||0;completed.textContent=s.completed||0;pending.textContent=s.pending||0;avg.textContent=s.avg_rating||0;byagent.innerHTML=(last.by_agent||[]).map(x=>'<tr><td>'+esc(x.agent)+'</td><td>'+x.count+'</td><td>'+x.avg_rating+'</td></tr>').join('')||'<tr><td colspan="3" style="text-align:center">لا توجد بيانات</td></tr>';rows.innerHTML=(last.rows||[]).map(r=>'<tr><td>'+esc(r.feedback_date)+'</td><td>'+esc(r.shift_number)+'</td><td>'+esc(r.customer_name)+'</td><td>'+esc(r.customer_phone)+'</td><td>'+esc(r.status)+'</td><td>'+(r.is_active?'نعم':'لا')+'</td><td>'+esc(r.rating||'')+'</td><td>'+esc(r.satisfaction||'')+'</td><td>'+esc(r.agent_employee_name||r.agent_user||'')+'</td><td>'+esc(r.details||'')+'</td><td>'+esc(r.notes||'')+'</td></tr>').join('')||'<tr><td colspan="11" style="text-align:center">لا توجد بيانات</td></tr>'}function csvExport(){if(!last)return;let headers=['date','shift','customer','phone','status','active','rating','satisfaction','agent','details','notes'];let lines=[headers.join(',')].concat((last.rows||[]).map(r=>[r.feedback_date,r.shift_number,r.customer_name,r.customer_phone,r.status,r.is_active,r.rating||'',r.satisfaction||'',r.agent_employee_name||r.agent_user||'',r.details||'',r.notes||''].map(x=>'"'+String(x||'').replace(/"/g,'""')+'"').join(',')));let blob=new Blob(['\ufeff'+lines.join('\n')],{type:'text/csv;charset=utf-8'});let a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='feedback-report.csv';a.click()}let last=null;df.value=today();dt.value=today();add_date.value=today();load();</script></body></html>
+HTML
+
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+[[ -n "$APP_OWNER" ]] && chown "$APP_OWNER" "$FEEDBACK_API" "$FEEDBACK_ADMIN_HTML" 2>/dev/null || true
+
+echo "🧹 Clear cache + restart app services"
+bench_exec clear-cache || true
+"${COMPOSE[@]}" restart backend frontend websocket queue-short queue-long scheduler >/dev/null
+sleep 8
+bench_exec clear-cache || true
+
+echo "🧪 Validation"
+set +e
+for p in feedback-admin feedback; do
+  code="$(curl -k -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$p" 2>/dev/null || echo 000)"
+  echo "$p => $code" | tee -a "$BACKUP_DIR/page_smoke_checks_v29.txt"
+done
+bench_exec execute restaurant_ops.api.feedback_api.debug_feedback_upload_parser_sample | tee "$BACKUP_DIR/debug_feedback_upload_parser_sample.txt"
+V1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.feedback_api.debug_feedback_status | tee "$BACKUP_DIR/debug_feedback_status.txt"
+V2=${PIPESTATUS[0]}
+set -e
+
+if [[ $V1 -ne 0 || $V2 -ne 0 ]]; then
+  echo "❌ Validation failed. راجع: $BACKUP_DIR"
+  exit 1
+fi
+
+echo "🏥 Health Check - Elastix/CDR/AMI + Queue + Call Report"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$BACKUP_DIR/health_asterisk_bridge.txt"
+H1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status | tee "$BACKUP_DIR/health_queue_status.txt"
+H2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' | tee "$BACKUP_DIR/health_call_report.txt"
+H3=${PIPESTATUS[0]}
+set -e
+
+if [[ $H1 -ne 0 || $H2 -ne 0 || $H3 -ne 0 ]]; then
+  echo "⚠️ Health returned non-zero. راجع: $BACKUP_DIR"
+else
+  echo "✅ Health checks OK"
+fi
+
+echo "============================================================"
+echo "✅ DONE V29"
+echo "📦 Backup folder: $BACKUP_DIR"
+echo "📤 Feedback Excel upload fixed"
+echo "📌 Parser supports user's Book1 format: headers name / phone"
+echo "🛡️ report_api.py / Elastix / CDR / AMI untouched"
+echo "============================================================"

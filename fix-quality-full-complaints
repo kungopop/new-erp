@@ -1,0 +1,451 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# fix-quality-full-complaints
+# Quality Desk final UX fix:
+# - Quality users see and handle full complaint details + attachments, not calls/CDR/customer lookup.
+# - Adds full complaint page /quality-complaint?name=COMP-...
+# - Keeps /quality-desk with date/month filters, stats, modal, print/PDF report.
+# - Fixes Frappe Desk opening by patching DocType JSON + DB permissions and ensuring Desk User role.
+# - Does NOT touch report_api / CDR / Elastix logic except health checks.
+
+ROOT="/opt/frappe_crm"
+SITE="crm.local"
+APP_HOST="$ROOT/apps/restaurant_ops"
+APP_DIR="$APP_HOST/restaurant_ops"
+WWW_DIR="$APP_DIR/www"
+TS="$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="$ROOT/backups/FIX_QUALITY_FULL_COMPLAINTS_BEFORE_$TS"
+
+say(){ echo -e "\n============================================================\n$1\n============================================================"; }
+
+if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+  echo "❌ شغّل كـ root: sudo -i ثم ./fix-quality-full-complaints"
+  exit 1
+fi
+
+say "1) Backup قبل إصلاح Quality Full Complaint"
+cd "$ROOT"
+BACKEND="$(docker compose ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ لم أجد backend container. شغّل: cd /opt/frappe_crm && docker compose up -d"
+  exit 1
+fi
+mkdir -p "$BACKUP_DIR"
+cp -a "$APP_HOST" "$BACKUP_DIR/restaurant_ops"
+[[ -f "$ROOT/docker-compose.yml" ]] && cp -a "$ROOT/docker-compose.yml" "$BACKUP_DIR/docker-compose.yml"
+echo "✅ Backup: $BACKUP_DIR"
+
+say "2) Patch DocType JSON permissions for Call Center Complaint"
+python3 - <<'PY'
+from pathlib import Path
+import json
+p = Path('/opt/frappe_crm/apps/restaurant_ops/restaurant_ops/restaurant_operations/doctype/call_center_complaint/call_center_complaint.json')
+if not p.exists():
+    print('⚠️ call_center_complaint.json not found')
+    raise SystemExit
+j = json.loads(p.read_text())
+perms = j.get('permissions') or []
+# Remove all previous Quality rows, especially bad permlevel 2 rows.
+perms = [x for x in perms if x.get('role') != 'Complaint_Quality_User']
+# Quality can read/write base + quality section, report/export. No finance permlevel 2 row.
+perms.append({'role':'Complaint_Quality_User','permlevel':0,'select':1,'read':1,'write':1,'create':0,'delete':0,'submit':0,'cancel':0,'amend':0,'report':1,'export':1,'import':0,'share':0,'print':1,'email':0})
+perms.append({'role':'Complaint_Quality_User','permlevel':1,'select':1,'read':1,'write':1,'create':0,'delete':0,'submit':0,'cancel':0,'amend':0,'report':1,'export':1,'import':0,'share':0,'print':1,'email':0})
+j['permissions'] = perms
+p.write_text(json.dumps(j, ensure_ascii=False, indent=1, sort_keys=True) + '\n')
+print('✅ JSON permissions patched: Quality level 0/1 only')
+PY
+
+say "3) Write DB permission fixer"
+mkdir -p "$APP_DIR/scripts" "$APP_DIR/api" "$WWW_DIR"
+cat > "$APP_DIR/scripts/fix_quality_full_permissions.py" <<'PY'
+import frappe
+
+
+def ensure_role(role):
+    if not frappe.db.exists('Role', role):
+        frappe.get_doc({'doctype':'Role','role_name':role,'desk_access':1}).insert(ignore_permissions=True)
+    else:
+        doc=frappe.get_doc('Role', role)
+        if not doc.desk_access:
+            doc.desk_access=1
+            doc.save(ignore_permissions=True)
+
+
+def append_perm(doc, role, permlevel, read=0, write=0, create=0, delete=0, report=0, export=0, select=0, print_=0):
+    doc.append('permissions', {
+        'role': role,
+        'permlevel': int(permlevel),
+        'select': int(select),
+        'read': int(read),
+        'write': int(write),
+        'create': int(create),
+        'delete': int(delete),
+        'submit': 0,
+        'cancel': 0,
+        'amend': 0,
+        'report': int(report),
+        'export': int(export),
+        'import': 0,
+        'share': 0,
+        'print': int(print_ or read),
+        'email': 0,
+    })
+
+
+def add_desk_user_to_quality_users():
+    users = frappe.get_all('Has Role', filters={'role':'Complaint_Quality_User', 'parenttype':'User'}, pluck='parent')
+    for u in users:
+        if u in ('Administrator','Guest'):
+            continue
+        try:
+            user = frappe.get_doc('User', u)
+            user.user_type = 'System User'
+            user.enabled = 1
+            user.save(ignore_permissions=True)
+            if not frappe.db.exists('Has Role', {'parent':u, 'parenttype':'User', 'role':'Desk User'}):
+                user.add_roles('Desk User')
+            print('✅ ensured Desk User for', u)
+        except Exception as e:
+            print('⚠️ user role skip', u, e)
+
+
+def fix_call_center_complaint():
+    dt='Call Center Complaint'
+    if not frappe.db.exists('DocType', dt):
+        print('⚠️ missing', dt); return
+    doc=frappe.get_doc('DocType', dt)
+    # Remove all Quality rows and re-add clean rows. Important: no level 2 row.
+    doc.permissions=[p for p in doc.permissions if p.role!='Complaint_Quality_User']
+    append_perm(doc, 'Complaint_Quality_User', 0, select=1, read=1, write=1, create=0, delete=0, report=1, export=1, print_=1)
+    append_perm(doc, 'Complaint_Quality_User', 1, select=1, read=1, write=1, create=0, delete=0, report=1, export=1, print_=1)
+    doc.save(ignore_permissions=True)
+    frappe.clear_cache(doctype=dt)
+    print('✅ Call Center Complaint quality permissions fixed')
+
+
+def fix_file_permissions():
+    # Let quality users read attachments through normal logged-in file URLs.
+    dt='File'
+    if not frappe.db.exists('DocType', dt):
+        return
+    doc=frappe.get_doc('DocType', dt)
+    doc.permissions=[p for p in doc.permissions if not (p.role=='Complaint_Quality_User' and int(p.permlevel or 0)==0)]
+    append_perm(doc, 'Complaint_Quality_User', 0, select=1, read=1, write=0, create=0, delete=0, report=0, export=0, print_=0)
+    try:
+        doc.save(ignore_permissions=True)
+        frappe.clear_cache(doctype=dt)
+        print('✅ File read permission for Quality')
+    except Exception as e:
+        print('⚠️ File permission skip', e)
+
+
+def run():
+    ensure_role('Complaint_Quality_User')
+    fix_call_center_complaint()
+    fix_file_permissions()
+    add_desk_user_to_quality_users()
+    frappe.db.commit()
+    return {'success': True}
+PY
+chmod 644 "$APP_DIR/scripts/fix_quality_full_permissions.py"
+
+say "4) Write full quality_api.py"
+cat > "$APP_DIR/api/quality_api.py" <<'PY'
+import json
+from datetime import datetime, time
+
+import frappe
+from frappe.utils import now_datetime, getdate, add_days
+
+QUALITY_ROLES = {'Complaint_Quality_User', 'Call Center Admin', 'System Manager'}
+OPEN_STATUSES = {'Draft', 'Open'}
+UNDER_REVIEW_STATUSES = {'Under Review'}
+RESOLVED_STATUSES = {'Resolved', 'Closed'}
+URGENT_PRIORITIES = {'High', 'Urgent'}
+FINANCE_FIELDS = {'has_financial_impact', 'compensation_amount', 'finance_status'}
+
+
+def _roles():
+    try:
+        return set(frappe.get_roles(frappe.session.user))
+    except Exception:
+        return set()
+
+
+def _allowed():
+    user = frappe.session.user
+    return user == 'Administrator' or bool(_roles() & QUALITY_ROLES)
+
+
+def _employee_name():
+    try:
+        emp = frappe.db.get_value('Employee', {'user_id': frappe.session.user}, 'employee_name')
+        return emp or frappe.db.get_value('User', frappe.session.user, 'full_name') or frappe.session.user
+    except Exception:
+        return frappe.session.user
+
+
+def _meta_fields():
+    return {df.fieldname for df in frappe.get_meta('Call Center Complaint').fields}
+
+
+def _pick_fields(candidates):
+    available = _meta_fields()
+    return [f for f in candidates if f in available]
+
+
+def _default_dates(date_from=None, date_to=None):
+    today = getdate()
+    if not date_from:
+        date_from = today.replace(day=1)
+    else:
+        date_from = getdate(date_from)
+    if not date_to:
+        date_to = today
+    else:
+        date_to = getdate(date_to)
+    return date_from, date_to
+
+
+def _dt_bounds(date_from=None, date_to=None):
+    df, dt = _default_dates(date_from, date_to)
+    start = datetime.combine(df, time.min)
+    end = datetime.combine(add_days(dt, 1), time.min)
+    return start, end, df, dt
+
+
+def _where(date_from=None, date_to=None, status='All', priority='All', search='', assigned='All'):
+    start, end, df, dt = _dt_bounds(date_from, date_to)
+    date_expr = 'COALESCE(complaint_datetime, creation)' if 'complaint_datetime' in _meta_fields() else 'creation'
+    where = [f'{date_expr} >= %s', f'{date_expr} < %s']
+    vals = [start, end]
+    if status and status != 'All':
+        where.append('status=%s'); vals.append(status)
+    if priority and priority != 'All':
+        where.append('complaint_priority=%s'); vals.append(priority)
+    if search:
+        like = '%' + str(search).strip() + '%'
+        parts = []
+        for f in ['name','customer_name','phone_number','complaint_details','complaint_category']:
+            if f == 'name' or f in _meta_fields():
+                parts.append(f'{f} like %s'); vals.append(like)
+        if parts:
+            where.append('(' + ' or '.join(parts) + ')')
+    if assigned == 'mine' and 'assigned_quality_inspector' in _meta_fields():
+        where.append('assigned_quality_inspector=%s'); vals.append(frappe.session.user)
+    elif assigned == 'unassigned' and 'assigned_quality_inspector' in _meta_fields():
+        where.append("(assigned_quality_inspector is null or assigned_quality_inspector='')")
+    return ' and '.join(where), vals, df, dt, date_expr
+
+
+def _fetch_rows(date_from=None, date_to=None, status='All', priority='All', search='', assigned='All', limit=5000, offset=0):
+    base_fields = ['name','customer_name','phone_number','complaint_source','complaint_category','complaint_priority','status','assigned_quality_inspector','investigation_analysis','corrective_action','complaint_details','complaint_datetime','creation','modified','closing_notes','resolved_by','resolved_at','opened_by_agent','shift','shift_leader','call_record_link']
+    fields = ['name'] + _pick_fields([f for f in base_fields if f != 'name'])
+    where, vals, df, dt, date_expr = _where(date_from, date_to, status, priority, search, assigned)
+    limit=max(1,min(int(limit or 5000),10000)); offset=max(0,int(offset or 0))
+    sql=f"select {', '.join(fields)} from `tabCall Center Complaint` where {where} order by {date_expr} desc limit {limit} offset {offset}"
+    rows=frappe.db.sql(sql, vals, as_dict=True)
+    for r in rows:
+        r['dt']=str(r.get('complaint_datetime') or r.get('creation') or '')
+        r['can_update_quality']=True
+    return rows, df, dt
+
+
+def _stats(rows):
+    total=len(rows)
+    resolved=sum(1 for r in rows if (r.get('status') or '') in RESOLVED_STATUSES)
+    under_review=sum(1 for r in rows if (r.get('status') or '') in UNDER_REVIEW_STATUSES)
+    open_count=sum(1 for r in rows if (r.get('status') or '') in OPEN_STATUSES)
+    urgent=sum(1 for r in rows if (r.get('complaint_priority') or '') in URGENT_PRIORITIES and (r.get('status') or '') not in RESOLVED_STATUSES)
+    reviewed=sum(1 for r in rows if (r.get('investigation_analysis') or r.get('corrective_action') or (r.get('status') or '') in RESOLVED_STATUSES))
+    unassigned=sum(1 for r in rows if not r.get('assigned_quality_inspector'))
+    mine=sum(1 for r in rows if r.get('assigned_quality_inspector') == frappe.session.user)
+    by_status={}; by_priority={}; by_category={}
+    for r in rows:
+        by_status[r.get('status') or 'غير محدد']=by_status.get(r.get('status') or 'غير محدد',0)+1
+        by_priority[r.get('complaint_priority') or 'غير محدد']=by_priority.get(r.get('complaint_priority') or 'غير محدد',0)+1
+        by_category[r.get('complaint_category') or 'غير محدد']=by_category.get(r.get('complaint_category') or 'غير محدد',0)+1
+    return {'total':total,'open':open_count,'under_review':under_review,'resolved':resolved,'urgent':urgent,'reviewed':reviewed,'unassigned':unassigned,'mine':mine,'by_status':by_status,'by_priority':by_priority,'by_category':by_category}
+
+
+@frappe.whitelist(allow_guest=False)
+def get_quality_dashboard(date_from=None, date_to=None, status='All', priority='All', search='', assigned='All', page=1, page_size=200):
+    if not _allowed(): return {'success':False,'message':'Permission denied'}
+    rows_all, df, dt = _fetch_rows(date_from,date_to,status,priority,search,assigned,limit=10000)
+    page=max(1,int(page or 1)); page_size=max(10,min(int(page_size or 200),500))
+    start=(page-1)*page_size; rows=rows_all[start:start+page_size]
+    return {'success':True,'employee_name':_employee_name(),'user':frappe.session.user,'date_from':str(df),'date_to':str(dt),'stats':_stats(rows_all),'rows':rows,'total_rows':len(rows_all),'page':page,'page_size':page_size,'total_complaints':len(rows_all),'my_count':len(rows),'my_complaints':rows}
+
+
+@frappe.whitelist(allow_guest=False)
+def get_quality_stats(date_from=None, date_to=None):
+    d=get_quality_dashboard(date_from=date_from,date_to=date_to,page_size=5000)
+    if not d.get('success'): return d
+    st=d.get('stats') or {}
+    return {'success':True,'employee_name':d.get('employee_name'),'total_complaints':st.get('total',0),'resolved_complaints':st.get('resolved',0),'open_complaints':st.get('open',0)+st.get('under_review',0),'urgent_complaints':st.get('urgent',0),'stats':st,'date_from':d.get('date_from'),'date_to':d.get('date_to')}
+
+
+def _file_rows(name):
+    try:
+        return frappe.get_all('File', filters={'attached_to_doctype':'Call Center Complaint','attached_to_name':name}, fields=['name','file_name','file_url','is_private','file_size','creation','owner'], order_by='creation asc', limit_page_length=200)
+    except Exception:
+        return []
+
+
+def _comment_rows(name):
+    try:
+        return frappe.get_all('Comment', filters={'reference_doctype':'Call Center Complaint','reference_name':name}, fields=['name','comment_type','content','owner','creation'], order_by='creation asc', limit_page_length=200)
+    except Exception:
+        return []
+
+
+@frappe.whitelist(allow_guest=False)
+def get_complaint_full(name):
+    if not _allowed(): return {'success':False,'message':'Permission denied'}
+    if not frappe.db.exists('Call Center Complaint', name): return {'success':False,'message':'Complaint not found'}
+    doc=frappe.get_doc('Call Center Complaint', name)
+    data=doc.as_dict()
+    # Hide finance fields from pure quality users unless admin roles.
+    roles=_roles()
+    if frappe.session.user!='Administrator' and not (roles & {'System Manager','Call Center Admin','Complaint_Finance_User'}):
+        for f in FINANCE_FIELDS:
+            data.pop(f, None)
+    return {'success':True,'complaint':data,'attachments':_file_rows(name),'comments':_comment_rows(name)}
+
+
+@frappe.whitelist(allow_guest=False)
+def get_complaint(name):
+    return get_complaint_full(name)
+
+
+@frappe.whitelist(allow_guest=False)
+def update_quality_review(name, assigned_quality_inspector=None, investigation_analysis='', corrective_action='', status='', closing_notes=''):
+    if not _allowed(): return {'success':False,'message':'Permission denied'}
+    if not frappe.db.exists('Call Center Complaint', name): return {'success':False,'message':'Complaint not found'}
+    doc=frappe.get_doc('Call Center Complaint', name)
+    meta=_meta_fields()
+    if 'assigned_quality_inspector' in meta and assigned_quality_inspector is not None:
+        doc.assigned_quality_inspector=assigned_quality_inspector or frappe.session.user
+    if 'investigation_analysis' in meta and investigation_analysis is not None:
+        doc.investigation_analysis=investigation_analysis or ''
+    if 'corrective_action' in meta and corrective_action is not None:
+        doc.corrective_action=corrective_action or ''
+    if status:
+        if status not in {'Draft','Open','Under Review','Closed','Resolved'}: return {'success':False,'message':'Invalid status'}
+        doc.status=status
+        if status in RESOLVED_STATUSES:
+            if 'resolved_by' in meta: doc.resolved_by=frappe.session.user
+            if 'resolved_at' in meta: doc.resolved_at=now_datetime()
+    if 'closing_notes' in meta and closing_notes is not None:
+        doc.closing_notes=closing_notes or ''
+    doc.save(ignore_permissions=True)
+    frappe.db.commit()
+    return {'success':True,'message':'تم حفظ مراجعة الجودة','name':doc.name,'status':doc.status}
+
+
+def _esc(x):
+    import html
+    return html.escape(str(x if x is not None else ''))
+
+
+@frappe.whitelist(allow_guest=False)
+def export_complaint_html(name):
+    d=get_complaint_full(name)
+    if not d.get('success'): return d
+    c=d.get('complaint') or {}; files=d.get('attachments') or []
+    rows=''.join([f"<tr><td>{_esc(k)}</td><td>{_esc(v)}</td></tr>" for k,v in c.items() if k not in ('doctype','idx','docstatus') and v not in (None,'')])
+    att=''.join([f"<li><a href='{_esc(f.get('file_url'))}'>{_esc(f.get('file_name'))}</a></li>" for f in files]) or '<li>لا توجد مرفقات</li>'
+    html=f"""<!doctype html><html lang='ar' dir='rtl'><head><meta charset='utf-8'><title>{_esc(name)}</title><style>body{{font-family:Tahoma,Arial;padding:25px;direction:rtl}}h1{{color:#1F4E79}}table{{width:100%;border-collapse:collapse}}td,th{{border:1px solid #ddd;padding:8px;text-align:right}}th{{background:#111827;color:white}}@media print{{button{{display:none}}}}</style></head><body><button onclick='window.print()'>طباعة / حفظ PDF</button><h1>تفاصيل الشكوى {_esc(name)}</h1><table><tbody>{rows}</tbody></table><h3>المرفقات</h3><ul>{att}</ul><script>window.print()</script></body></html>"""
+    return {'success':True,'html':html}
+
+
+@frappe.whitelist(allow_guest=False)
+def export_quality_report_html(date_from=None, date_to=None, status='All', priority='All', search='', assigned='All'):
+    if not _allowed(): return {'success':False,'message':'Permission denied'}
+    d=get_quality_dashboard(date_from,date_to,status,priority,search,assigned,page_size=5000)
+    if not d.get('success'): return d
+    st=d.get('stats') or {}; rows=d.get('rows') or []
+    tr=''.join(["<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(_esc(r.get('name')),_esc(r.get('dt')),_esc(r.get('customer_name')),_esc(r.get('phone_number')),_esc(r.get('complaint_category')),_esc(r.get('complaint_priority')),_esc(r.get('status'))) for r in rows])
+    html=f"""<!doctype html><html lang='ar' dir='rtl'><head><meta charset='utf-8'><title>تقرير الجودة</title><style>body{{font-family:Tahoma,Arial;padding:25px;direction:rtl}}h1{{color:#1F4E79}}.cards{{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin:15px 0}}.card{{border:1px solid #ddd;border-radius:10px;padding:10px;text-align:center}}.num{{font-size:24px;font-weight:bold;color:#1F4E79}}table{{width:100%;border-collapse:collapse;margin-top:15px}}th{{background:#111827;color:#fff}}td,th{{border:1px solid #ddd;padding:7px;text-align:right;font-size:12px}}@media print{{button{{display:none}}}}</style></head><body><button onclick='window.print()'>طباعة / حفظ PDF</button><h1>تقرير الجودة ومتابعة الشكاوى</h1><p>الفترة من {_esc(d.get('date_from'))} إلى {_esc(d.get('date_to'))} — المستخدم: {_esc(frappe.session.user)}</p><div class='cards'><div class='card'>الإجمالي<div class='num'>{st.get('total',0)}</div></div><div class='card'>مفتوحة<div class='num'>{st.get('open',0)}</div></div><div class='card'>قيد المراجعة<div class='num'>{st.get('under_review',0)}</div></div><div class='card'>تم حلها<div class='num'>{st.get('resolved',0)}</div></div><div class='card'>عاجلة<div class='num'>{st.get('urgent',0)}</div></div></div><table><thead><tr><th>رقم</th><th>التاريخ</th><th>العميل</th><th>الهاتف</th><th>الفئة</th><th>الأولوية</th><th>الحالة</th></tr></thead><tbody>{tr}</tbody></table><script>window.print()</script></body></html>"""
+    return {'success':True,'html':html}
+PY
+
+say "4) Rewrite quality-desk and quality-complaint pages"
+cat > "$WWW_DIR/quality-desk.py" <<'PY'
+import frappe
+no_cache = 1
+
+def get_context(context):
+    if frappe.session.user == 'Guest':
+        frappe.local.flags.redirect_location = '/login?redirect-to=/quality-desk'
+        raise frappe.Redirect
+    roles = frappe.get_roles(frappe.session.user)
+    if frappe.session.user != 'Administrator' and 'Complaint_Quality_User' not in roles and 'Call Center Admin' not in roles and 'System Manager' not in roles:
+        frappe.throw('Not permitted', frappe.PermissionError)
+    return context
+PY
+
+cat > "$WWW_DIR/quality-complaint.py" <<'PY'
+import frappe
+no_cache = 1
+
+def get_context(context):
+    if frappe.session.user == 'Guest':
+        frappe.local.flags.redirect_location = '/login?redirect-to=/quality-desk'
+        raise frappe.Redirect
+    roles = frappe.get_roles(frappe.session.user)
+    if frappe.session.user != 'Administrator' and 'Complaint_Quality_User' not in roles and 'Call Center Admin' not in roles and 'System Manager' not in roles:
+        frappe.throw('Not permitted', frappe.PermissionError)
+    return context
+PY
+
+cat > "$WWW_DIR/quality-desk.html" <<'HTML'
+<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Quality Desk</title><style>*{box-sizing:border-box;font-family:'Segoe UI',Tahoma,Arial}body{margin:0;background:#eef2f7;color:#111827;direction:rtl}.top{background:#20262d;color:#fff;padding:14px 22px;display:flex;justify-content:space-between;align-items:center;border-bottom:4px solid #6f42c1}.top a,.top button{color:#fff;text-decoration:none;border:1px solid #64748b;border-radius:10px;padding:8px 12px;margin:2px;background:#1F4E79;cursor:pointer}.wrap{padding:22px;max-width:1600px;margin:auto}.title{text-align:center;color:#1F4E79;margin:12px 0 22px}.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:16px}.stat{background:#fff;border:1px solid #d8dee9;border-right:5px solid #6f42c1;border-radius:14px;padding:14px;box-shadow:0 6px 18px #0001}.stat .lbl{color:#64748b;font-weight:800;font-size:13px}.stat .num{font-size:30px;font-weight:900;color:#1F4E79}.panel{background:#fff;border:1px solid #d8dee9;border-radius:16px;box-shadow:0 10px 28px #0001;margin-bottom:16px;overflow:hidden}.head{padding:14px 16px;border-bottom:1px solid #e5e7eb;display:flex;justify-content:space-between;gap:10px;align-items:center}.body{padding:16px}.grid{display:grid;grid-template-columns:repeat(6,1fr);gap:10px}label{font-weight:800;color:#475569;font-size:12px}input,select,textarea{width:100%;border:1px solid #d1d5db;border-radius:11px;padding:9px}.btn{border:0;border-radius:11px;padding:10px 13px;background:#1F4E79;color:white;font-weight:800;cursor:pointer;text-decoration:none}.btn.green{background:#16a34a}.btn.orange{background:#f97316}.btn.red{background:#dc2626}.btn.light{background:white;color:#111827;border:1px solid #d1d5db}.tablewrap{overflow:auto}.table{width:100%;border-collapse:collapse;min-width:1100px}.table th{background:#111827;color:#fff;padding:10px;text-align:right}.table td{border:1px solid #e5e7eb;padding:9px;font-size:13px}.tag{border-radius:999px;padding:3px 8px;font-size:12px;font-weight:800}.open{background:#fee2e2;color:#991b1b}.review{background:#fef3c7;color:#92400e}.done{background:#dcfce7;color:#166534}.muted{color:#64748b;font-size:12px}.modal{display:none;position:fixed;inset:0;background:#0008;z-index:99999;align-items:center;justify-content:center;padding:20px}.modal.show{display:flex}.modalbox{background:#fff;border-radius:18px;max-width:1100px;width:100%;max-height:94vh;overflow:auto}.modalhead{padding:14px 18px;background:#20262d;color:#fff;display:flex;justify-content:space-between}.modalbody{padding:18px}.cols{display:grid;grid-template-columns:1fr 1fr;gap:12px}.info{border:1px solid #e5e7eb;background:#f8fafc;border-radius:12px;padding:12px;margin:8px 0}.att{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px}.att a{display:block;border:1px solid #ddd;border-radius:10px;padding:8px;text-decoration:none;color:#1F4E79;background:#fff}.att img{max-width:100%;max-height:120px;display:block;margin:auto}@media(max-width:1000px){.grid{grid-template-columns:1fr 1fr}.cols{grid-template-columns:1fr}.top{display:block}}</style></head><body><div class="top"><b>⭐ ديسك الجودة ومتابعة الشكاوى</b><div><a href="/roshdy-logout">خروج</a></div></div><div class="wrap"><h2 class="title" id="welcome">جاري التحميل...</h2><div class="stats"><div class="stat"><div class="lbl">إجمالي الفترة</div><div class="num" id="st_total">0</div></div><div class="stat"><div class="lbl">مفتوحة</div><div class="num" id="st_open">0</div></div><div class="stat"><div class="lbl">قيد المراجعة</div><div class="num" id="st_review">0</div></div><div class="stat"><div class="lbl">تم حلها/إغلاقها</div><div class="num" id="st_resolved">0</div></div><div class="stat"><div class="lbl">عاجلة/High</div><div class="num" id="st_urgent">0</div></div><div class="stat"><div class="lbl">تمت مراجعتها</div><div class="num" id="st_reviewed">0</div></div></div><div class="panel"><div class="head"><b>فلاتر التقرير</b><button class="btn light" onclick="thisMonth()">الشهر الحالي</button></div><div class="body"><div class="grid"><div><label>من تاريخ</label><input type="date" id="date_from"></div><div><label>إلى تاريخ</label><input type="date" id="date_to"></div><div><label>الحالة</label><select id="status"><option>All</option><option>Draft</option><option>Open</option><option>Under Review</option><option>Resolved</option><option>Closed</option></select></div><div><label>الأولوية</label><select id="priority"><option>All</option><option>Low</option><option>Medium</option><option>High</option><option>Urgent</option></select></div><div><label>بحث</label><input id="search" placeholder="رقم/عميل/تفاصيل"></div><div><label>الإسناد</label><select id="assigned"><option value="All">الكل</option><option value="mine">المسند لي</option><option value="unassigned">غير مسند</option></select></div></div><br><button class="btn green" onclick="load()">تحديث</button> <button class="btn orange" onclick="printReport()">طباعة / PDF</button></div></div><div class="panel"><div class="head"><b>الشكاوى</b><span class="muted" id="rowsInfo"></span></div><div class="body tablewrap"><table class="table"><thead><tr><th>رقم</th><th>التاريخ</th><th>العميل</th><th>الهاتف</th><th>الفئة</th><th>الأولوية</th><th>الحالة</th><th>المفتش</th><th>فتح</th></tr></thead><tbody id="tb"><tr><td colspan="9">جاري التحميل...</td></tr></tbody></table></div></div></div><div class="modal" id="modal"><div class="modalbox"><div class="modalhead"><b id="m_title">شكوى</b><button class="btn red" onclick="closeModal()">X</button></div><div class="modalbody"><div id="m_info" class="info"></div><div id="m_attach" class="info"></div><br><div class="cols"><div><label>الحالة</label><select id="m_status"><option>Draft</option><option>Open</option><option>Under Review</option><option>Resolved</option><option>Closed</option></select></div><div><label>مسؤول الجودة</label><input id="m_assigned" placeholder="email أو اتركها للمستخدم الحالي"></div></div><br><label>تحليل التحقيق</label><textarea id="m_analysis" rows="5"></textarea><br><label>الإجراء التصحيحي</label><textarea id="m_action" rows="3"></textarea><br><label>ملاحظات الإغلاق</label><textarea id="m_closing" rows="3"></textarea><br><button class="btn green" onclick="saveComplaint()">حفظ مراجعة الجودة</button> <button class="btn light" onclick="openFullPage()">فتح صفحة كاملة</button> <button class="btn orange" onclick="printComplaint()">طباعة الشكوى PDF</button><pre id="m_debug" class="muted"></pre></div></div></div><script>let current=null;function M(a){return a.join('')}async function api(method,args){let qs=new URLSearchParams();args=args||{};Object.keys(args).forEach(k=>{if(args[k]!==undefined&&args[k]!==null)qs.append(k,args[k])});let r=await fetch('/api/method/'+method+(qs.toString()?'?'+qs.toString():''),{credentials:'same-origin',cache:'no-store'});let j=await r.json();return j.message}function esc(x){return String(x||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function todayISO(d){return d.toISOString().slice(0,10)}function thisMonth(){let d=new Date();date_from.value=todayISO(new Date(d.getFullYear(),d.getMonth(),1));date_to.value=todayISO(d);load()}function tagStatus(s){let cls=(s==='Resolved'||s==='Closed')?'done':(s==='Under Review'?'review':'open');return '<span class="tag '+cls+'">'+esc(s||'')+'</span>'}async function load(){let d=await api(M(['restaurant','_ops.api.quality','_api.get_quality_dashboard']),{date_from:date_from.value,date_to:date_to.value,status:status.value,priority:priority.value,search:search.value,assigned:assigned.value,page_size:500});if(!d||!d.success){tb.innerHTML='<tr><td colspan="9">'+esc((d&&d.message)||'تعذر التحميل')+'</td></tr>';return}welcome.textContent='⭐ ديسك الجودة — أهلاً '+(d.employee_name||'');let s=d.stats||{};st_total.textContent=s.total||0;st_open.textContent=s.open||0;st_review.textContent=s.under_review||0;st_resolved.textContent=s.resolved||0;st_urgent.textContent=s.urgent||0;st_reviewed.textContent=s.reviewed||0;rowsInfo.textContent='الفترة '+d.date_from+' إلى '+d.date_to+' — عدد '+(d.total_rows||0);let rows=d.rows||[];tb.innerHTML=rows.length?rows.map(r=>'<tr><td>'+esc(r.name)+'</td><td>'+esc(r.dt)+'</td><td>'+esc(r.customer_name)+'</td><td>'+esc(r.phone_number)+'</td><td>'+esc(r.complaint_category)+'</td><td>'+esc(r.complaint_priority)+'</td><td>'+tagStatus(r.status)+'</td><td>'+esc(r.assigned_quality_inspector)+'</td><td><button class="btn" onclick="openComplaint(\''+esc(r.name)+'\')">فتح/مراجعة</button></td></tr>').join(''):'<tr><td colspan="9">لا توجد شكاوى في الفترة</td></tr>'}function fileHtml(f){let url=f.file_url||'';let name=f.file_name||url;let img=/\.(png|jpg|jpeg|gif|webp)$/i.test(url);return '<a href="'+esc(url)+'" target="_blank">'+(img?'<img src="'+esc(url)+'">':'📎')+'<br>'+esc(name)+'</a>'}async function openComplaint(name){let d=await api(M(['restaurant','_ops.api.quality','_api.get_complaint_full']),{name:name});if(!d||!d.success){alert((d&&d.message)||'تعذر الفتح');return}current=d.complaint;m_title.textContent='شكوى '+current.name;m_info.innerHTML='<b>العميل:</b> '+esc(current.customer_name)+' — <b>الهاتف:</b> '+esc(current.phone_number)+'<br><b>الفئة:</b> '+esc(current.complaint_category)+' — <b>الأولوية:</b> '+esc(current.complaint_priority)+' — <b>الحالة:</b> '+esc(current.status)+'<br><b>المصدر:</b> '+esc(current.complaint_source)+' — <b>التاريخ:</b> '+esc(current.complaint_datetime||current.creation)+'<br><b>التفاصيل:</b><br><div style="white-space:pre-wrap">'+esc(current.complaint_details)+'</div>';let files=d.attachments||[];m_attach.innerHTML='<b>المرفقات والصور:</b><div class="att">'+(files.length?files.map(fileHtml).join(''):'<span class="muted">لا توجد مرفقات</span>')+'</div>';m_status.value=current.status||'Open';m_assigned.value=current.assigned_quality_inspector||'';m_analysis.value=current.investigation_analysis||'';m_action.value=current.corrective_action||'';m_closing.value=current.closing_notes||'';m_debug.textContent='';modal.classList.add('show')}function closeModal(){modal.classList.remove('show')}async function saveComplaint(){if(!current)return;let d=await api(M(['restaurant','_ops.api.quality','_api.update_quality_review']),{name:current.name,assigned_quality_inspector:m_assigned.value,investigation_analysis:m_analysis.value,corrective_action:m_action.value,status:m_status.value,closing_notes:m_closing.value});m_debug.textContent=JSON.stringify(d,null,2);if(d&&d.success){await load();}}function openFullPage(){if(current)window.open('/quality-complaint?name='+encodeURIComponent(current.name),'_blank')}async function printComplaint(){if(!current)return;let d=await api(M(['restaurant','_ops.api.quality','_api.export_complaint_html']),{name:current.name});if(d&&d.success){let w=window.open('','_blank');w.document.write(d.html);w.document.close()}else alert((d&&d.message)||'تعذر الطباعة')}async function printReport(){let d=await api(M(['restaurant','_ops.api.quality','_api.export_quality_report_html']),{date_from:date_from.value,date_to:date_to.value,status:status.value,priority:priority.value,search:search.value,assigned:assigned.value});if(d&&d.success){let w=window.open('','_blank');w.document.write(d.html);w.document.close()}else alert((d&&d.message)||'تعذر الطباعة')}thisMonth();</script></body></html>
+HTML
+
+cat > "$WWW_DIR/quality-complaint.html" <<'HTML'
+<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>تفاصيل الشكوى</title><style>*{box-sizing:border-box;font-family:Tahoma,Arial}body{margin:0;background:#eef2f7;direction:rtl;color:#111827}.top{background:#20262d;color:#fff;padding:14px 22px;border-bottom:4px solid #6f42c1;display:flex;justify-content:space-between}.top a{color:#fff;text-decoration:none;border:1px solid #64748b;border-radius:10px;padding:8px 12px}.wrap{padding:22px;max-width:1200px;margin:auto}.card{background:#fff;border:1px solid #d8dee9;border-radius:16px;padding:16px;margin:12px 0;box-shadow:0 10px 28px #0001}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}.kv{border:1px solid #e5e7eb;border-radius:10px;padding:10px;background:#f8fafc}.kv b{color:#1F4E79}.att{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px}.att a{display:block;border:1px solid #ddd;border-radius:10px;padding:8px;text-decoration:none;color:#1F4E79;background:#fff}.att img{max-width:100%;max-height:160px;display:block;margin:auto}.btn{display:inline-block;border:0;border-radius:11px;padding:10px 13px;background:#1F4E79;color:white;font-weight:800;cursor:pointer;text-decoration:none}@media print{.top,.noprint{display:none}}</style></head><body><div class="top"><b>تفاصيل الشكوى للجودة</b><div><a href="/quality-desk">Quality Desk</a></div></div><div class="wrap"><button class="btn noprint" onclick="window.print()">طباعة / PDF</button><div id="content" class="card">جاري التحميل...</div></div><script>function M(a){return a.join('')}async function api(method,args){let qs=new URLSearchParams();args=args||{};Object.keys(args).forEach(k=>{if(args[k]!==undefined&&args[k]!==null)qs.append(k,args[k])});let r=await fetch('/api/method/'+method+(qs.toString()?'?'+qs.toString():''),{credentials:'same-origin',cache:'no-store'});let j=await r.json();return j.message}function esc(x){return String(x||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function fileHtml(f){let url=f.file_url||'';let name=f.file_name||url;let img=/\.(png|jpg|jpeg|gif|webp)$/i.test(url);return '<a href="'+esc(url)+'" target="_blank">'+(img?'<img src="'+esc(url)+'">':'📎')+'<br>'+esc(name)+'</a>'}async function load(){let name=new URLSearchParams(location.search).get('name');if(!name){content.textContent='No complaint name';return}let d=await api(M(['restaurant','_ops.api.quality','_api.get_complaint_full']),{name:name});if(!d||!d.success){content.textContent=(d&&d.message)||'تعذر التحميل';return}let c=d.complaint||{};let html='<h2>'+esc(c.name)+'</h2><div class="grid">';['customer_name','phone_number','complaint_source','complaint_category','complaint_priority','status','complaint_datetime','opened_by_agent','shift','shift_leader','assigned_quality_inspector','resolved_by','resolved_at'].forEach(k=>{if(c[k])html+='<div class="kv"><b>'+esc(k)+'</b><br>'+esc(c[k])+'</div>'});html+='</div><div class="card"><h3>تفاصيل الشكوى</h3><div style="white-space:pre-wrap">'+esc(c.complaint_details)+'</div></div><div class="card"><h3>تحليل الجودة</h3><b>تحليل التحقيق:</b><div style="white-space:pre-wrap">'+esc(c.investigation_analysis)+'</div><br><b>الإجراء التصحيحي:</b><div style="white-space:pre-wrap">'+esc(c.corrective_action)+'</div><br><b>ملاحظات الإغلاق:</b><div style="white-space:pre-wrap">'+esc(c.closing_notes)+'</div></div><div class="card"><h3>المرفقات</h3><div class="att">'+((d.attachments||[]).length?(d.attachments||[]).map(fileHtml).join(''):'لا توجد مرفقات')+'</div></div>';content.innerHTML=html}load();</script></body></html>
+HTML
+chmod 644 "$WWW_DIR/quality-desk.py" "$WWW_DIR/quality-desk.html" "$WWW_DIR/quality-complaint.py" "$WWW_DIR/quality-complaint.html"
+
+say "5) Execute permissions fix + migrate + restart"
+docker exec "$BACKEND" bash -lc "find /home/frappe/frappe-bench/apps/restaurant_ops -name '*.pyc' -delete; find /home/frappe/frappe-bench/apps/restaurant_ops -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.scripts.fix_quality_full_permissions.run
+docker exec "$BACKEND" bench --site "$SITE" migrate
+docker exec "$BACKEND" bench --site "$SITE" clear-cache || true
+docker exec "$BACKEND" bench --site "$SITE" clear-website-cache || true
+docker compose restart backend frontend websocket queue-short queue-long scheduler
+sleep 10
+BACKEND="$(docker compose ps -q backend)"
+
+say "6) Validation"
+echo "--- quality dashboard api ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.quality_api.get_quality_dashboard --kwargs '{"page_size":5}' || true
+
+echo "--- permissions check ---"
+docker exec "$BACKEND" bench --site "$SITE" execute frappe.db.sql --args '["select role, permlevel, `select`, `read`, `write`, `create`, `delete`, report, export from `tabDocPerm` where parent=\"Call Center Complaint\" and role=\"Complaint_Quality_User\" order by permlevel"]' || true
+
+echo "--- bad level 2 check ---"
+docker exec "$BACKEND" bench --site "$SITE" execute frappe.db.sql --args '["select name, role, permlevel from `tabDocPerm` where parent=\"Call Center Complaint\" and role=\"Complaint_Quality_User\" and permlevel=2"]' || true
+
+echo "--- Page HTTP status ---"
+for page in quality-desk quality-complaint call-report admin-desk; do
+  code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1/$page" || true)"
+  echo "$page => $code"
+done
+
+say "7) Health Check مهم: Elastix/CDR/AMI + Queue + Call Report"
+echo "--- Asterisk/Elastix diagnostics ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics || true
+
+echo "--- Queue status ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.queue_api.get_queue_status || true
+
+echo "--- Calls report admin sample ---"
+docker exec "$BACKEND" bench --site "$SITE" execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' || true
+
+say "✅ Quality Full Complaints fixed يا زعيم"
+echo "افتح: http://$(hostname -I | awk '{print $1}')/quality-desk"
+echo "دلوقتي الجودة هتشوف تفاصيل الشكوى والمرفقات والصور وتطبع PDF، بدون أي اعتماد على Call Report."
+echo "Backup: $BACKUP_DIR"

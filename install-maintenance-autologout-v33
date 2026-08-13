@@ -1,0 +1,419 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Roshdy V33: Maintenance + Auto Logout tools
+# ----------------------------------------------------------------------
+# Installs safe maintenance scripts on ERP server:
+#
+# 1) /opt/frappe_crm/scripts/roshdy_clean_queue_journey_cache
+#    - Cleans queue_journey/runs heavy cache folders.
+#    - Keeps latest.json and daily queue_journey_YYYY-MM-DD_YYYY-MM-DD.json files.
+#    - Also patches queue journey fetch script to auto-delete run temp folders after each successful fetch.
+#
+# 2) /opt/frappe_crm/scripts/roshdy_safe_server_cleanup
+#    - Safe server cleanup: apt cache, journal old logs, Docker build cache/dangling images,
+#      Python __pycache__, Frappe clear-cache, queue journey runs cleanup.
+#    - Does NOT prune Docker volumes.
+#
+# 3) /opt/frappe_crm/scripts/roshdy_auto_logout_now
+#    - Forces logout for selected operational roles and releases their active Extension Sessions.
+#    - Cron runs at 07:00 and 20:00 daily.
+#
+# Safety:
+# - Backup first.
+# - Does NOT touch report_api.py / Elastix / CDR / AMI config.
+# - Does NOT delete DB backups.
+# - Server cleanup avoids Docker volumes.
+
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+APP="restaurant_ops"
+LOGOUT_ROLES="${LOGOUT_ROLES:-Restaurant Agent}"
+AUTO_LOGOUT_TIMES="${AUTO_LOGOUT_TIMES:-0 7 * * *,0 20 * * *}"
+KEEP_JOURNEY_RUNS_DAYS="${KEEP_JOURNEY_RUNS_DAYS:-1}"
+KEEP_JOURNEY_DAILY_DAYS="${KEEP_JOURNEY_DAILY_DAYS:-14}"
+TS="$(date +%Y%m%d_%H%M%S)"
+
+cd "$ROOT"
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE=(docker-compose)
+else
+  echo "❌ docker compose/docker-compose مش موجود"
+  exit 1
+fi
+
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -z "$BACKEND" ]]; then
+  echo "❌ backend container مش شغال أو مش لاقيه"
+  exit 1
+fi
+
+APP_DIR="$ROOT/apps/$APP"
+PKG_DIR="$APP_DIR/$APP"
+SCRIPTS_DIR="$ROOT/scripts"
+APP_SCRIPTS_DIR="$PKG_DIR/scripts"
+LOG_DIR="$ROOT/logs"
+JOURNEY_DIR="$ROOT/sites/$SITE/private/files/queue_journey"
+FETCH_SCRIPT="$SCRIPTS_DIR/roshdy_queue_journey_fetch_parse"
+BACKUP_DIR="$ROOT/backups/INSTALL_MAINTENANCE_AUTOLOGOUT_V33_BEFORE_$TS"
+mkdir -p "$BACKUP_DIR" "$SCRIPTS_DIR" "$APP_SCRIPTS_DIR" "$LOG_DIR" "$JOURNEY_DIR"
+
+bench_exec() { "${COMPOSE[@]}" exec -T backend bench --site "$SITE" "$@"; }
+
+echo "============================================================"
+echo "🧰 Roshdy V33: Maintenance + Auto Logout installer"
+echo "📦 Backup: $BACKUP_DIR"
+echo "👥 Auto logout roles: $LOGOUT_ROLES"
+echo "============================================================"
+
+# Backup relevant scripts/crons/modules.
+for f in \
+  "$SCRIPTS_DIR/roshdy_clean_queue_journey_cache" \
+  "$SCRIPTS_DIR/roshdy_safe_server_cleanup" \
+  "$SCRIPTS_DIR/roshdy_auto_logout_now" \
+  "$FETCH_SCRIPT" \
+  "$APP_SCRIPTS_DIR/auto_logout_sessions.py" \
+  /etc/cron.d/roshdy_auto_logout \
+  /etc/cron.d/roshdy_queue_journey_cleanup; do
+  [[ -e "$f" ]] && cp -a "$f" "$BACKUP_DIR/$(basename "$f").before" || true
+done
+bench_exec backup --with-files | tee "$BACKUP_DIR/bench_backup_output.txt"
+
+# -----------------------------------------------------------------------------
+# 1) Queue journey cache cleaner
+# -----------------------------------------------------------------------------
+echo "🧩 Installing queue journey cache cleaner"
+cat > "$SCRIPTS_DIR/roshdy_clean_queue_journey_cache" <<'CLEANQ'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+KEEP_RUNS_DAYS="${KEEP_RUNS_DAYS:-1}"
+KEEP_DAILY_DAYS="${KEEP_DAILY_DAYS:-14}"
+DRY_RUN="${DRY_RUN:-0}"
+JOURNEY_DIR="$ROOT/sites/$SITE/private/files/queue_journey"
+CONTAINER_JOURNEY_DIR="/home/frappe/frappe-bench/sites/$SITE/private/files/queue_journey"
+cd "$ROOT"
+if docker compose version >/dev/null 2>&1; then COMPOSE=(docker compose); else COMPOSE=(docker-compose); fi
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+
+echo "============================================================"
+echo "🧹 Queue Journey cache cleanup"
+echo "📁 Host dir: $JOURNEY_DIR"
+echo "📁 Container dir: $CONTAINER_JOURNEY_DIR"
+echo "Keep runs days: $KEEP_RUNS_DAYS | Keep daily JSON days: $KEEP_DAILY_DAYS | DRY_RUN=$DRY_RUN"
+echo "============================================================"
+
+run_cmd(){ echo "+ $*"; [[ "$DRY_RUN" == "1" ]] || eval "$@"; }
+
+if [[ -d "$JOURNEY_DIR/runs" ]]; then
+  echo "Before host size:"
+  du -sh "$JOURNEY_DIR" || true
+  if [[ "$DRY_RUN" == "1" ]]; then
+    find "$JOURNEY_DIR/runs" -mindepth 1 -maxdepth 1 -type d -mtime +"$KEEP_RUNS_DAYS" -print
+  else
+    find "$JOURNEY_DIR/runs" -mindepth 1 -maxdepth 1 -type d -mtime +"$KEEP_RUNS_DAYS" -exec rm -rf --one-file-system {} +
+  fi
+fi
+
+# Remove old daily JSON files, keep latest.* and recent exact files.
+if [[ -d "$JOURNEY_DIR" ]]; then
+  if [[ "$DRY_RUN" == "1" ]]; then
+    find "$JOURNEY_DIR" -maxdepth 1 -type f -name 'queue_journey_*.json' -mtime +"$KEEP_DAILY_DAYS" -print
+  else
+    find "$JOURNEY_DIR" -maxdepth 1 -type f -name 'queue_journey_*.json' -mtime +"$KEEP_DAILY_DAYS" -delete
+  fi
+  echo "After host size:"
+  du -sh "$JOURNEY_DIR" || true
+fi
+
+# Container cleanup mirrors host cleanup, but never fail if chmod/permissions differ.
+if [[ -n "$BACKEND" ]]; then
+  "${COMPOSE[@]}" exec -T backend bash -lc "if [ -d '$CONTAINER_JOURNEY_DIR/runs' ]; then find '$CONTAINER_JOURNEY_DIR/runs' -mindepth 1 -maxdepth 1 -type d -mtime +$KEEP_RUNS_DAYS -exec rm -rf {} + 2>/dev/null || true; fi; find '$CONTAINER_JOURNEY_DIR' -maxdepth 1 -type f -name 'queue_journey_*.json' -mtime +$KEEP_DAILY_DAYS -delete 2>/dev/null || true" || true
+fi
+
+echo "✅ Queue journey cache cleanup done"
+CLEANQ
+chmod +x "$SCRIPTS_DIR/roshdy_clean_queue_journey_cache"
+
+# Patch fetch script to delete its run directory after successful sync and run cleanup.
+echo "🧩 Patching queue journey fetch script to avoid run-folder growth"
+if [[ -f "$FETCH_SCRIPT" ]]; then
+  cp -a "$FETCH_SCRIPT" "$BACKUP_DIR/roshdy_queue_journey_fetch_parse.before_patch_cleanup"
+  if ! grep -q 'ROSHDY_FETCH_AUTO_CLEAN_V33' "$FETCH_SCRIPT"; then
+    cat >> "$FETCH_SCRIPT" <<'FETCHCLEAN'
+
+# ROSHDY_FETCH_AUTO_CLEAN_V33
+# If this script reached the end successfully, remove the heavy temporary run folder.
+# Keep latest.json/latest_summary.txt/exact daily JSON only.
+if [[ -n "${RUN_DIR:-}" && -d "${RUN_DIR:-}" ]]; then
+  rm -rf --one-file-system "$RUN_DIR" 2>/dev/null || true
+fi
+# Also prune old run folders quietly.
+if [[ -n "${HOST_OUT_BASE:-}" && -d "${HOST_OUT_BASE:-}/runs" ]]; then
+  find "$HOST_OUT_BASE/runs" -mindepth 1 -maxdepth 1 -type d -mtime +1 -exec rm -rf --one-file-system {} + 2>/dev/null || true
+fi
+FETCHCLEAN
+  fi
+fi
+
+# Daily queue journey cleanup cron.
+cat > /etc/cron.d/roshdy_queue_journey_cleanup <<EOF
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+17 3 * * * root KEEP_RUNS_DAYS=$KEEP_JOURNEY_RUNS_DAYS KEEP_DAILY_DAYS=$KEEP_JOURNEY_DAILY_DAYS $SCRIPTS_DIR/roshdy_clean_queue_journey_cache >> $LOG_DIR/queue_journey_cleanup.log 2>&1
+EOF
+chmod 0644 /etc/cron.d/roshdy_queue_journey_cleanup
+
+# -----------------------------------------------------------------------------
+# 2) Safe server cleanup
+# -----------------------------------------------------------------------------
+echo "🧩 Installing safe server cleanup"
+cat > "$SCRIPTS_DIR/roshdy_safe_server_cleanup" <<'SERVERCLEAN'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+DRY_RUN="${DRY_RUN:-0}"
+JOURNAL_DAYS="${JOURNAL_DAYS:-7}"
+TMP_DAYS="${TMP_DAYS:-3}"
+DOCKER_CLEAN="${DOCKER_CLEAN:-1}"
+APT_CLEAN="${APT_CLEAN:-1}"
+cd "$ROOT"
+if docker compose version >/dev/null 2>&1; then COMPOSE=(docker compose); else COMPOSE=(docker-compose); fi
+run(){ echo "+ $*"; [[ "$DRY_RUN" == "1" ]] || eval "$@"; }
+
+echo "============================================================"
+echo "🧹 Roshdy safe server cleanup DRY_RUN=$DRY_RUN"
+date
+printf '\nDisk before:\n'; df -h / || true
+printf '\nDocker before:\n'; docker system df || true
+
+echo "\n1) Frappe cache clear"
+BACKEND="$(${COMPOSE[@]} ps -q backend || true)"
+if [[ -n "$BACKEND" ]]; then
+  run "${COMPOSE[*]} exec -T backend bench --site '$SITE' clear-cache || true"
+  run "${COMPOSE[*]} exec -T backend bench --site '$SITE' clear-website-cache || true"
+fi
+
+echo "\n2) Queue Journey run cache"
+run "KEEP_RUNS_DAYS=1 KEEP_DAILY_DAYS=14 '$ROOT/scripts/roshdy_clean_queue_journey_cache' || true"
+
+echo "\n3) Python __pycache__ cleanup in app only"
+run "find '$ROOT/apps' -type d -name '__pycache__' -prune -exec rm -rf {} + 2>/dev/null || true"
+
+if [[ "$APT_CLEAN" == "1" ]]; then
+  echo "\n4) apt cache clean"
+  run "apt-get clean || true"
+  run "apt-get autoclean || true"
+fi
+
+echo "\n5) journal cleanup older than ${JOURNAL_DAYS} days"
+run "journalctl --vacuum-time=${JOURNAL_DAYS}d || true"
+
+echo "\n6) /tmp old files cleanup"
+run "find /tmp -mindepth 1 -maxdepth 1 -type f -mtime +$TMP_DAYS -delete 2>/dev/null || true"
+run "find /tmp -mindepth 1 -maxdepth 1 -type d -name 'ROSHDY_*' -mtime +$TMP_DAYS -exec rm -rf --one-file-system {} + 2>/dev/null || true"
+
+if [[ "$DOCKER_CLEAN" == "1" ]]; then
+  echo "\n7) Docker safe cleanup: builder cache + dangling images only. NO VOLUMES."
+  run "docker builder prune -f || true"
+  run "docker image prune -f || true"
+  run "docker container prune -f || true"
+fi
+
+printf '\nDocker after:\n'; docker system df || true
+printf '\nDisk after:\n'; df -h / || true
+echo "✅ Safe cleanup done"
+SERVERCLEAN
+chmod +x "$SCRIPTS_DIR/roshdy_safe_server_cleanup"
+
+# -----------------------------------------------------------------------------
+# 3) Auto logout module and host runner
+# -----------------------------------------------------------------------------
+echo "🧩 Installing auto logout module"
+cat > "$APP_SCRIPTS_DIR/auto_logout_sessions.py" <<'PYLOGOUT'
+# -*- coding: utf-8 -*-
+import json
+import frappe
+from frappe.utils import now_datetime, cstr
+
+DEFAULT_ROLES = ["Restaurant Agent"]
+EXCLUDE_USERS = {"Administrator", "Guest"}
+EXCLUDE_ROLES = {"System Manager"}
+
+
+def _table_exists(table):
+    try:
+        return bool(frappe.db.sql("show tables like %s", ("tab" + table,)))
+    except Exception:
+        return False
+
+
+def _user_has_any_role(user, roles):
+    try:
+        return bool(set(frappe.get_roles(user)).intersection(set(roles)))
+    except Exception:
+        return False
+
+
+def _user_has_excluded_role(user):
+    try:
+        return bool(set(frappe.get_roles(user)).intersection(EXCLUDE_ROLES))
+    except Exception:
+        return False
+
+
+def _target_users(roles=None):
+    roles = roles or DEFAULT_ROLES
+    users = set()
+    for role in roles:
+        try:
+            for u in frappe.get_all("Has Role", filters={"role": role}, pluck="parent", limit_page_length=10000):
+                if u and u not in EXCLUDE_USERS and not _user_has_excluded_role(u):
+                    users.add(u)
+        except Exception:
+            pass
+    return sorted(users)
+
+
+def _clear_user_sessions(user):
+    removed = {"user": user, "clear_sessions": None, "tabSessions_deleted": 0, "extension_sessions_released": 0, "errors": []}
+    # Frappe native clear_sessions if available.
+    try:
+        import frappe.sessions
+        try:
+            frappe.sessions.clear_sessions(user=user, keep_current=False, force=True)
+        except TypeError:
+            frappe.sessions.clear_sessions(user=user, keep_current=False)
+        removed["clear_sessions"] = True
+    except Exception as e:
+        removed["clear_sessions"] = False
+        removed["errors"].append("clear_sessions: " + cstr(e))
+
+    # DB fallback: tabSessions can exist in many Frappe versions.
+    try:
+        if _table_exists("Sessions"):
+            # Try direct user column.
+            try:
+                deleted = frappe.db.sql("delete from `tabSessions` where user=%s", (user,))
+                removed["tabSessions_deleted"] = removed.get("tabSessions_deleted", 0) + (deleted or 0 if isinstance(deleted, int) else 0)
+            except Exception:
+                # Try sessiondata text contains user.
+                frappe.db.sql("delete from `tabSessions` where sessiondata like %s", ("%" + user + "%",))
+    except Exception as e:
+        removed["errors"].append("tabSessions: " + cstr(e))
+
+    # Redis/session cache best effort.
+    try:
+        frappe.clear_cache(user=user)
+    except Exception:
+        pass
+
+    # Release active Extension Sessions for this user.
+    try:
+        if frappe.db.exists("DocType", "Extension Session"):
+            rows = frappe.get_all("Extension Session", filters={"user": user, "session_status": "active"}, fields=["name"], limit_page_length=1000)
+            for r in rows:
+                updates = {"session_status": "released"}
+                try:
+                    meta = frappe.get_meta("Extension Session")
+                    if meta.has_field("active"):
+                        updates["active"] = 0
+                    if meta.has_field("released_at"):
+                        updates["released_at"] = now_datetime()
+                except Exception:
+                    pass
+                frappe.db.set_value("Extension Session", r.name, updates, update_modified=True)
+                removed["extension_sessions_released"] += 1
+    except Exception as e:
+        removed["errors"].append("Extension Session: " + cstr(e))
+
+    return removed
+
+
+def execute(roles=None, reason="scheduled_auto_logout"):
+    if isinstance(roles, str):
+        try:
+            roles = json.loads(roles)
+        except Exception:
+            roles = [x.strip() for x in roles.split(",") if x.strip()]
+    roles = roles or DEFAULT_ROLES
+    users = _target_users(roles)
+    results = []
+    for user in users:
+        results.append(_clear_user_sessions(user))
+    frappe.db.commit()
+    return {"success": True, "timestamp": now_datetime().strftime("%Y-%m-%d %H:%M:%S"), "reason": reason, "roles": roles, "users_count": len(users), "results": results}
+PYLOGOUT
+
+cat > "$SCRIPTS_DIR/roshdy_auto_logout_now" <<'AUTOLOGOUT'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+ROOT="${ROOT:-/opt/frappe_crm}"
+SITE="${SITE:-crm.local}"
+ROLES="${ROLES:-Restaurant Agent}"
+LOG_DIR="$ROOT/logs"
+mkdir -p "$LOG_DIR"
+cd "$ROOT"
+if docker compose version >/dev/null 2>&1; then COMPOSE=(docker compose); else COMPOSE=(docker-compose); fi
+OUT="$LOG_DIR/auto_logout_$(date +%Y%m%d_%H%M%S).log"
+echo "[$(date '+%F %T')] Auto logout roles=$ROLES" | tee -a "$OUT"
+"${COMPOSE[@]}" exec -T backend bench --site "$SITE" execute restaurant_ops.scripts.auto_logout_sessions.execute --kwargs "{\"roles\":\"$ROLES\",\"reason\":\"scheduled_auto_logout\"}" | tee -a "$OUT"
+echo "[$(date '+%F %T')] Done" | tee -a "$OUT"
+AUTOLOGOUT
+chmod +x "$SCRIPTS_DIR/roshdy_auto_logout_now"
+
+# Install cron for 07:00 and 20:00. Keep it explicit and readable.
+cat > /etc/cron.d/roshdy_auto_logout <<EOF
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Roshdy scheduled auto logout for agents - prevents forgotten open user sessions
+0 7 * * * root ROLES="$LOGOUT_ROLES" $SCRIPTS_DIR/roshdy_auto_logout_now >> $LOG_DIR/auto_logout_cron.log 2>&1
+0 20 * * * root ROLES="$LOGOUT_ROLES" $SCRIPTS_DIR/roshdy_auto_logout_now >> $LOG_DIR/auto_logout_cron.log 2>&1
+EOF
+chmod 0644 /etc/cron.d/roshdy_auto_logout
+
+APP_OWNER="$(stat -c '%u:%g' "$APP_DIR" 2>/dev/null || echo '')"
+[[ -n "$APP_OWNER" ]] && chown "$APP_OWNER" "$APP_SCRIPTS_DIR/auto_logout_sessions.py" 2>/dev/null || true
+
+# -----------------------------------------------------------------------------
+# Validation
+# -----------------------------------------------------------------------------
+echo "🧹 Clear cache"
+bench_exec clear-cache || true
+
+echo "🧪 Validation: auto logout dry call with impossible role (no users affected)"
+bench_exec execute restaurant_ops.scripts.auto_logout_sessions.execute --kwargs '{"roles":"__NO_SUCH_ROLE__","reason":"validation_noop"}' | tee "$BACKUP_DIR/auto_logout_validation_noop.txt"
+
+echo "🧪 Validation: queue journey cleanup dry-run"
+DRY_RUN=1 "$SCRIPTS_DIR/roshdy_clean_queue_journey_cache" | tee "$BACKUP_DIR/queue_journey_cleanup_dry_run.txt"
+
+echo "🏥 Health Check - Elastix/CDR/AMI + Queue + Call Report"
+set +e
+bench_exec execute restaurant_ops.api.asterisk_bridge.run_full_system_diagnostics | tee "$BACKUP_DIR/health_asterisk_bridge.txt"
+H1=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.queue_api.get_queue_status | tee "$BACKUP_DIR/health_queue_status.txt"
+H2=${PIPESTATUS[0]}
+bench_exec execute restaurant_ops.api.report_api.get_calls_report --kwargs '{"page":1,"page_size":5,"view_mode":"admin"}' | tee "$BACKUP_DIR/health_call_report.txt"
+H3=${PIPESTATUS[0]}
+set -e
+
+if [[ $H1 -ne 0 || $H2 -ne 0 || $H3 -ne 0 ]]; then
+  echo "⚠️ Health returned non-zero. راجع: $BACKUP_DIR"
+else
+  echo "✅ Health checks OK"
+fi
+
+echo "============================================================"
+echo "✅ DONE V33"
+echo "📦 Backup: $BACKUP_DIR"
+echo "🧹 Queue cache cleaner: $SCRIPTS_DIR/roshdy_clean_queue_journey_cache"
+echo "🧹 Safe server cleanup: $SCRIPTS_DIR/roshdy_safe_server_cleanup"
+echo "🚪 Auto logout now: $SCRIPTS_DIR/roshdy_auto_logout_now"
+echo "⏰ Auto logout cron: /etc/cron.d/roshdy_auto_logout"
+echo "🧹 Queue cleanup cron: /etc/cron.d/roshdy_queue_journey_cleanup"
+echo "============================================================"
